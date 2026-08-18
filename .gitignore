@@ -1,0 +1,5 @@
+# Local datasets may be large and can contain licensed or sensitive material.
+data/raw/
+
+# Isolated implementation workspaces.
+.worktrees/
