@@ -277,4 +277,3 @@ Benchmark outputs record dataset split hashes, provider/model versions, configur
 - Remote name: `origin`
 
 The design specification is the first committed project artifact. Implementation begins only after the written specification is reviewed and an implementation plan is approved.
-
