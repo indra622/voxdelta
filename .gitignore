@@ -6,3 +6,14 @@ data/raw/
 
 # Agent execution scratch files and review handoffs.
 .superpowers/
+
+# Local credentials must never be committed; safe placeholders stay trackable.
+**/.env
+!**/.env.example
+
+# Python build and tool artifacts.
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
