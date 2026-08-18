@@ -3,3 +3,6 @@ data/raw/
 
 # Isolated implementation workspaces.
 .worktrees/
+
+# Agent execution scratch files and review handoffs.
+.superpowers/
