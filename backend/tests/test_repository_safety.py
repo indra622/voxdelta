@@ -9,7 +9,7 @@ BACKEND = REPOSITORY / "backend"
 
 def check_ignore(path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["git", "check-ignore", "--quiet", str(path)],
+        ["git", "check-ignore", "--no-index", "--quiet", str(path)],
         cwd=REPOSITORY,
         text=True,
         capture_output=True,
@@ -17,7 +17,7 @@ def check_ignore(path: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_local_env_is_ignored_but_example_is_trackable() -> None:
+def test_local_env_is_ignored_but_tracked_example_is_explicitly_unignored() -> None:
     assert check_ignore(BACKEND / ".env").returncode == 0
     assert check_ignore(BACKEND / ".env.example").returncode == 1
 

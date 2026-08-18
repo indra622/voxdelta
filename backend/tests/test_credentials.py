@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import stat
 from pathlib import Path
 from types import ModuleType
@@ -104,14 +105,15 @@ def test_secret_values_are_redacted_from_representations(
     assert all(secret not in combined_repr for secret in raw_secrets)
 
 
-def test_unsafe_env_file_permissions_are_rejected(tmp_path: Path) -> None:
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission modes are required")
+def test_public_loader_rejects_unsafe_env_file_permissions(tmp_path: Path) -> None:
     env_file = tmp_path / "backend" / ".env"
     secret = "must-not-appear-in-error"
     write_env(env_file, f"HUGGINGFACE_TOKEN={secret}\n", mode=0o644)
     module = credentials_module()
 
     with pytest.raises(module.UnsafeEnvFilePermissions) as error:
-        module.check_credentials(env_file)
+        module.load_credentials(env_file)
 
     message = str(error.value)
     assert str(env_file) in message

@@ -83,15 +83,14 @@ def validate_env_file_permissions(env_file: Path) -> None:
 
 
 def load_credentials(env_file: Path | None = None) -> Credentials:
-    """Load secrets from an absolute backend env path and the process environment."""
+    """Validate and load secrets from the backend env path and process environment."""
 
     selected_env_file = DEFAULT_ENV_FILE if env_file is None else env_file
+    validate_env_file_permissions(selected_env_file)
     return Credentials(_env_file=selected_env_file, _env_file_encoding="utf-8")
 
 
 def check_credentials(env_file: Path | None = None) -> CredentialCheck:
     """Validate the env file boundary and return a safe readiness result."""
 
-    selected_env_file = DEFAULT_ENV_FILE if env_file is None else env_file
-    validate_env_file_permissions(selected_env_file)
-    return CredentialCheck(credentials=load_credentials(selected_env_file))
+    return CredentialCheck(credentials=load_credentials(env_file))
