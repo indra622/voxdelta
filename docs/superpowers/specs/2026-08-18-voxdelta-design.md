@@ -7,7 +7,7 @@
 
 ## 1. Overview
 
-VoxDelta is a local-first web application for analyzing Korean customer-service call recordings. It separates the speakers, identifies the customer and agent, transcribes the call, estimates the customer's emotion for each utterance, and produces an evidence-linked report of how the customer's emotional state changed over the conversation.
+VoxDelta is a local-first web application for analyzing Korean customer-service call recordings that contain exactly two primary speakers: one customer and one agent. It separates the speakers, confirms their business roles, transcribes the call, estimates the customer's emotion for each utterance, and produces an evidence-linked report of how the customer's emotional state changed over the conversation.
 
 The distinguishing feature is not emotion classification alone. VoxDelta identifies customer-agent-customer turn triplets in which the customer's negative-emotion score changes materially after an agent response. The product calls these **emotion recovery segments** and **emotion worsening segments**. It reports an association between an agent response and the immediately following change; it does not claim that the response caused the change.
 
@@ -17,7 +17,7 @@ The first release is a personal portfolio project. It runs locally, accepts reco
 
 ### Goals
 
-1. Analyze a recorded Korean two-speaker customer-service call end to end.
+1. Analyze a recorded Korean customer-service call end to end under the explicit assumption that its two primary speakers are one customer and one agent.
 2. Make every model result traceable to an audio interval and transcript excerpt.
 3. Show both categorical emotion and a continuous negative-emotion trajectory.
 4. Identify and explain recovery and worsening segments using adjacent conversation turns.
@@ -27,7 +27,7 @@ The first release is a personal portfolio project. It runs locally, accepts reco
 ### MVP success criteria
 
 - WAV, MP3, and M4A files between 1 and 60 minutes are accepted; the primary demo range is 5–15 minutes.
-- A two-speaker call can proceed from upload to a completed dashboard without manual file conversion.
+- A call containing one customer and one agent can proceed from upload to a completed dashboard without manual file conversion.
 - The user can correct the customer/agent assignment before emotion analysis continues.
 - Every customer utterance has audio bounds, text, seven-emotion probabilities, an operational state, negative-emotion intensity, and confidence.
 - Every reported recovery or worsening segment links the preceding customer turn, the intervening agent response, and the following customer turn.
@@ -41,7 +41,7 @@ The first release is a personal portfolio project. It runs locally, accepts reco
 - Real-time streaming analysis or live agent coaching
 - Public web deployment, user accounts, or organization-level multi-tenant access
 - Production contact-center integrations
-- More than two primary speakers in the MVP
+- Calls that do not contain exactly two primary speakers in the roles of one customer and one agent
 - Autonomous customer-service decisions
 - Causal claims about agent behavior and customer emotion
 - Building a foundation speech model from scratch
@@ -263,7 +263,7 @@ Benchmark outputs record dataset split hashes, provider/model versions, configur
 - Unit tests validate label mapping, intensity calibration, delta calculation, cache keys, and report phrasing constraints.
 - Contract tests run every provider adapter against canonical fixtures and verify normalized outputs.
 - Pipeline tests use short synthetic fixtures to exercise checkpoints, retries, invalidation, and role swapping.
-- Integration tests analyze licensed or generated two-speaker Korean samples end to end.
+- Integration tests analyze licensed or generated Korean samples containing one customer and one agent end to end.
 - Failure tests cover corrupt audio, missing credentials, API timeout, partial transcripts, overlapping speech, and unsupported speaker count.
 - Snapshot tests verify that dashboard and exported reports render the same structured results.
 - Evaluation tests prevent accidental train/evaluation speaker leakage.
