@@ -234,6 +234,7 @@ class ProviderProvenance(BaseModel):
 
 class ProviderUsage(BaseModel):
     latency_ms: float = Field(ge=0)
+    peak_rss_mb: float | None = Field(default=None, ge=0)
     input_units: int | None = Field(default=None, ge=0)
     output_units: int | None = Field(default=None, ge=0)
     cost_usd: float | None = Field(default=None, ge=0)

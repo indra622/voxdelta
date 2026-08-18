@@ -1,6 +1,6 @@
 # VoxDelta Design Specification
 
-- Status: Approved concept, pending written-spec review
+- Status: Approved for implementation
 - Date: 2026-08-18
 - Codename: VoxDelta
 - Subtitle: Korean Call Emotion Shift Analysis
@@ -11,7 +11,7 @@ VoxDelta is a local-first web application for analyzing Korean customer-service 
 
 The distinguishing feature is not emotion classification alone. VoxDelta identifies customer-agent-customer turn triplets in which the customer's negative-emotion score changes materially after an agent response. The product calls these **emotion recovery segments** and **emotion worsening segments**. It reports an association between an agent response and the immediately following change; it does not claim that the response caused the change.
 
-The first release is a personal portfolio project. It runs locally, accepts recorded files rather than live streams, and compares one local baseline model with one frontier API model on the same benchmark data.
+The first release is a personal portfolio project. It runs locally and accepts recorded files rather than live streams. It keeps stable local models as reproducible baselines, evaluates newer local challengers on the same benchmark, and compares the selected local emotion model with one frontier API model.
 
 ## 2. Goals and Success Criteria
 
@@ -21,7 +21,7 @@ The first release is a personal portfolio project. It runs locally, accepts reco
 2. Make every model result traceable to an audio interval and transcript excerpt.
 3. Show both categorical emotion and a continuous negative-emotion trajectory.
 4. Identify and explain recovery and worsening segments using adjacent conversation turns.
-5. Compare a local model and a frontier API model by quality, latency, cost, and confidence.
+5. Compare stable and modern local candidates, then compare the selected local model with a frontier API model by quality, latency, memory, cost, and confidence.
 6. Keep orchestration, artifacts, configuration, and reports local while allowing explicitly authorized API processing.
 
 ### MVP success criteria
@@ -33,7 +33,7 @@ The first release is a personal portfolio project. It runs locally, accepts reco
 - Every reported recovery or worsening segment links the preceding customer turn, the intervening agent response, and the following customer turn.
 - A failed stage can be retried without repeating completed stages.
 - The same report data can render in the dashboard and export as HTML or PDF.
-- A benchmark run can compare the selected local and API emotion providers with reproducible inputs and recorded latency/cost metadata.
+- A benchmark run can compare stable and modern local candidates, select a local default by explicit gates, and compare that selected local emotion provider with the API provider using reproducible inputs and recorded latency/memory/cost metadata.
 - No raw datasets, call recordings, API keys, or generated private reports are committed to Git.
 
 ## 3. Non-goals
@@ -45,6 +45,7 @@ The first release is a personal portfolio project. It runs locally, accepts reco
 - Autonomous customer-service decisions
 - Causal claims about agent behavior and customer emotion
 - Building a foundation speech model from scratch
+- High-throughput batch serving or simultaneous loading of every local model candidate
 - Long-term cloud storage of audio or reports
 
 ## 4. User Experience
@@ -89,7 +90,9 @@ The completed analysis view contains:
 
 ### 4.5 Model comparison
 
-A comparison view runs or loads the same evaluation items for one local emotion provider and one frontier API emotion provider. It presents quality metrics, calibration, mean and percentile latency, observed API cost, failure count, and model/version metadata. The comparison is an evaluation feature rather than a requirement to run every production analysis twice.
+Model evaluation has two phases. First, stable and modern local candidates are run sequentially on the same component test sets: faster-whisper versus Qwen3-ASR for Korean transcription, and Wav2Vec2-XLS-R versus emotion2vec+ for seven-emotion classification. Second, the selected local emotion provider and Gemini run on identical gold utterances with the same frozen upstream transcript and speaker artifacts, so the comparison does not confound emotion quality with ASR or diarization differences.
+
+The comparison view presents the selected local emotion provider and the frontier API provider. It includes quality metrics, calibration, mean and percentile latency, peak local memory, observed API cost, failure count, and model/version metadata. Baseline and challenger details remain available in benchmark metadata. Comparison is an evaluation feature rather than a requirement to run every production analysis twice.
 
 ## 5. Emotion Representation
 
@@ -122,7 +125,7 @@ The local and API adapters must expose the same seven-label schema. Provider-spe
 
 ### 5.3 Negative-emotion intensity
 
-Each provider returns a calibrated `negative_intensity` value from 0.0 to 1.0. For the local baseline, calibration is learned from the manually annotated call-center validation set using the seven-emotion probabilities as inputs. For an API provider, the adapter requests the same rubric and then applies calibration against the same validation set.
+Each provider returns a calibrated `negative_intensity` value from 0.0 to 1.0. For each local candidate, calibration is learned independently from the manually annotated call-center validation set using the seven-emotion probabilities as inputs. For an API provider, the adapter requests the same rubric and then applies its own calibration against the same validation set.
 
 The per-utterance series is smoothed with a three-customer-turn median window. The unsmoothed value remains available for inspection.
 
@@ -186,9 +189,18 @@ Each provider declares:
 - cost metadata support
 - retention-policy URL or note for remote providers
 
-The initial implementation supports one local baseline and one API implementation where comparison is required. Additional providers are outside the MVP but can be added without changing the core pipeline or UI data contracts.
+The initial implementation supports stable and modern local candidates, one optional remote diarization benchmark, and one frontier emotion/text provider. Provider selection happens through versioned configuration and does not change the core pipeline or UI data contracts.
 
-### 7.3 Canonical data contracts
+### 7.3 Model selection policy
+
+- **Diarization:** pyannote `speaker-diarization-community-1` is the default local provider. `speaker-diarization-precision-2` is an optional remote benchmark, never an implicit fallback.
+- **ASR:** faster-whisper `large-v3-turbo` is the stable baseline. Qwen3-ASR `1.7B` with the `0.6B` forced aligner is the modern local candidate; `0.6B` ASR is an explicit lower-memory profile.
+- **Local emotion:** Wav2Vec2-XLS-R 300M is the stable baseline. emotion2vec+ large is the modern candidate, used as a frozen speech-emotion encoder with a seven-class AI Hub-trained head.
+- **Frontier emotion and text analysis:** Gemini `3.6 Flash` receives explicitly authorized audio/text and returns validated structured output.
+
+Local candidates run sequentially because high-throughput serving is outside scope. On the target Apple Silicon machine, the modern profile may become the default only if it completes without unsupported operations or memory exhaustion, stays below 18 GiB peak resident memory per loaded model, and passes the benchmark gates. An unavailable modern provider is reported as unavailable; it never silently falls back to the stable provider.
+
+### 7.4 Canonical data contracts
 
 The pipeline uses stable internal objects:
 
@@ -229,7 +241,7 @@ Logs exclude credentials and avoid storing full transcripts or raw provider payl
 The project uses two AI Hub sources with different roles:
 
 - The Korean consultation-speech dataset supplies call-center-domain audio and transcripts for domain inspection, ASR evaluation, and representative demonstrations.
-- The Korean conversational emotion-classification dataset supplies seven-emotion supervision for the local baseline.
+- The Korean conversational emotion-classification dataset supplies seven-emotion supervision for both local emotion candidates.
 
 Dataset files remain outside Git. The repository contains download/setup instructions, checksums or manifests where licensing permits, preprocessing code, and derived metadata that does not redistribute protected content.
 
@@ -257,6 +269,8 @@ Because the emotion dataset is not specifically a call-center dataset, VoxDelta 
 - Percentage of results marked uncertain
 
 Benchmark outputs record dataset split hashes, provider/model versions, configuration, and run timestamp. Calls from the same source conversation or speaker must not be split across training and evaluation sets.
+
+ASR candidate selection first requires at least 95% completion on the consultation-speech test subset. Qwen3-ASR becomes the default when it improves Korean CER by at least 1% absolute over faster-whisper. When the difference is smaller, Qwen3-ASR becomes the default only when its CER is no worse and its median latency is no more than twice faster-whisper; otherwise faster-whisper remains selected. Emotion candidate selection first requires at least 95% completion and no worse than 0.02 absolute expected-calibration error regression. emotion2vec+ becomes the default when macro-F1 improves by at least 0.01; within ±0.01 macro-F1, lower calibration error wins, followed by lower median latency. If a modern candidate fails its runtime gate, the stable baseline remains selected and the failure reason is recorded.
 
 ## 12. Testing Strategy
 

@@ -280,11 +280,11 @@ Sort by absolute delta descending, filter recovery/worsening, label response str
 
 - [ ] **Step 3: Add benchmark summary endpoint and schema**
 
-Define a backend `BenchmarkSummary` response with provider/model, dataset hash, macro-F1, expected calibration error, mean latency, p95 latency, cost per audio minute, failures, and uncertain rate. `GET /api/comparisons/latest` reads a versioned local artifact and returns 404 when no benchmark has run.
+Define Zod schemas matching the backend `BenchmarkSummary`, `ProviderBenchmark`, and `BenchmarkCandidate` contracts exactly. The response has exactly two public emotion `providers` plus all `candidates`. Public provider entries contain provider/model, `frozen_input_hash`, macro-F1, expected calibration error, mean/median/p95 latency, peak resident memory, cost per audio minute, failures, and uncertain rate. Candidate entries additionally contain `task` (`diarization`, `asr`, or `emotion`), eligibility status, selection reason, and nullable task-specific metrics such as DER, CER, macro-F1, or calibration error. `GET /api/comparisons/latest` reads a versioned local artifact and returns 404 when no benchmark has run. Reject a summary whose two public providers do not share `frozen_input_hash`.
 
 - [ ] **Step 4: Implement comparison UI**
 
-Display local and API providers as two cards plus a metric table. Do not rank a provider when dataset hashes differ. Format absent API cost as `측정 안 됨`, not zero. Link the run metadata and per-class metrics below the summary.
+Display the selected local and API emotion providers as two cards plus a metric table. Show a collapsible “로컬 후보 선정 근거” section for faster-whisper/Qwen3-ASR and XLS-R/emotion2vec+ metrics, unavailable reasons, and the selected default. Do not rank providers when frozen-input hashes differ. Format absent API cost as `측정 안 됨`, not zero. Link the run metadata and per-class metrics below the summary.
 
 - [ ] **Step 5: Run checks and commit**
 
