@@ -439,6 +439,20 @@ class PipelineRunner:
                 artifact.utterances
             ):
                 return False
+            semantic_fingerprints = {
+                (
+                    item.start,
+                    item.end,
+                    item.speaker_id,
+                    item.overlap,
+                    item.confidence,
+                    item.role,
+                    item.transcript,
+                )
+                for item in artifact.utterances
+            }
+            if len(semantic_fingerprints) != len(artifact.utterances):
+                return False
             ordered = sorted(
                 artifact.utterances,
                 key=lambda item: (item.start, item.end, item.id, item.speaker_id),

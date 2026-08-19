@@ -239,6 +239,8 @@ class WordDerivedTranscription(FakeTranscriptionProvider):
             utterances[-1] = utterances[-1].model_copy(update={"start": 62.0, "end": 63.0})
         elif self.corruption == "duplicate":
             utterances[1] = utterances[1].model_copy(update={"id": utterances[0].id})
+        elif self.corruption == "semantic-duplicate":
+            utterances[1] = utterances[0].model_copy(update={"id": "word-1-copy"})
         elif self.corruption == "unsorted":
             utterances = list(reversed(utterances))
         elif self.corruption == "cross-speaker":
@@ -492,7 +494,16 @@ def test_transcription_semantics_accept_word_intervals_and_adjacent_same_speaker
 
 @pytest.mark.parametrize(
     "corruption",
-    ["mismatch", "zero-overlap", "duplicate", "unsorted", "cross-speaker", "outside", "empty"],
+    [
+        "mismatch",
+        "zero-overlap",
+        "duplicate",
+        "semantic-duplicate",
+        "unsorted",
+        "cross-speaker",
+        "outside",
+        "empty",
+    ],
 )
 def test_transcription_semantics_reject_hostile_word_alignment(
     corruption: str,
