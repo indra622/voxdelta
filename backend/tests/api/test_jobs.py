@@ -7,12 +7,13 @@ import sqlite3
 import stat
 import threading
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from voxdelta.api.app import create_app
@@ -461,12 +462,40 @@ async def test_audio_full_and_all_single_range_forms_without_path_disclosure(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("range_header", "expected_status", "expected_content"),
+    [
+        ("Bytes=0-1", 206, None),
+        ("bytes= 0-1", 206, None),
+        ("items=0-1", 200, "full"),
+    ],
+)
+async def test_audio_range_unit_is_case_insensitive_with_ows_and_unknown_units_ignored(
+    range_header: str,
+    expected_status: int,
+    expected_content: str | None,
+    tmp_path: Path,
+) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        full = await client.get(f"/api/jobs/{job_id}/audio")
+        response = await client.get(
+            f"/api/jobs/{job_id}/audio",
+            headers={"Range": range_header},
+        )
+
+    assert response.status_code == expected_status
+    assert response.content == (full.content if expected_content == "full" else full.content[:2])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "range_header",
     [
         "bytes=999999999-",
         "bytes=100-99",
         "bytes=0-1,2-3",
-        "items=0-1",
         "bytes=",
         "bytes=-0",
         "bytes=a-b",
@@ -556,6 +585,114 @@ async def test_audio_rejects_symlink_or_hash_tampering(tmp_path: Path) -> None:
     assert repository.get_job(job_id)["stages"]["normalize"]["status"] == "completed"
     assert response.status_code == 409
     assert str(preview) not in response.text
+
+
+def audio_endpoint(app: FastAPI):  # type: ignore[no-untyped-def]
+    return next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/jobs/{job_id}/audio"
+    )
+
+
+def audio_request(job_id: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": f"/api/jobs/{job_id}/audio",
+            "raw_path": f"/api/jobs/{job_id}/audio".encode(),
+            "query_string": b"",
+            "headers": [],
+            "client": ("test", 1),
+            "server": ("test", 80),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_audio_response_background_closes_unstarted_body_once(tmp_path: Path) -> None:
+    app, _, _, runner = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+    job_id = created.json()["job_id"]
+    original = runner.open_mixed_preview
+    closes = 0
+
+    @contextmanager
+    def tracking_open(selected_job_id: str):  # type: ignore[no-untyped-def]
+        nonlocal closes
+        with original(selected_job_id) as opened:
+            try:
+                yield opened
+            finally:
+                closes += 1
+
+    runner.open_mixed_preview = tracking_open  # type: ignore[method-assign]
+    response = audio_endpoint(app)(job_id, audio_request(job_id))
+
+    assert isinstance(response, StreamingResponse)
+    assert closes == 0
+    assert response.background is not None
+    await response.background()
+    await response.background()
+    assert closes == 1
+
+
+@pytest.mark.asyncio
+async def test_audio_cancelled_body_and_background_do_not_double_close(tmp_path: Path) -> None:
+    app, _, _, runner = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+    job_id = created.json()["job_id"]
+    original = runner.open_mixed_preview
+    closes = 0
+
+    @contextmanager
+    def tracking_open(selected_job_id: str):  # type: ignore[no-untyped-def]
+        nonlocal closes
+        with original(selected_job_id) as opened:
+            try:
+                yield opened
+            finally:
+                closes += 1
+
+    runner.open_mixed_preview = tracking_open  # type: ignore[method-assign]
+    response = audio_endpoint(app)(job_id, audio_request(job_id))
+    first = await anext(response.body_iterator)
+    assert first
+    await response.body_iterator.aclose()
+    assert response.background is not None
+    await response.background()
+
+    assert closes == 1
+
+
+@pytest.mark.asyncio
+async def test_audio_accessor_hashes_only_the_opened_mixed_preview_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, artifacts, runner = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+    job_id = created.json()["job_id"]
+    normalized = artifacts.read_model(job_id, StageName.NORMALIZE, NormalizeArtifact)
+    original = runner._open_trusted_media  # noqa: SLF001
+    opened_paths: list[str] = []
+
+    @contextmanager
+    def counting_open(selected_job_id: str, raw_path: str):  # type: ignore[no-untyped-def]
+        opened_paths.append(raw_path)
+        with original(selected_job_id, raw_path) as opened:
+            yield opened
+
+    monkeypatch.setattr(runner, "_open_trusted_media", counting_open)
+    with runner.open_mixed_preview(job_id) as opened:
+        assert opened.read(1)
+
+    assert opened_paths == [normalized.mixed_preview.path]
 
 
 @pytest.mark.asyncio

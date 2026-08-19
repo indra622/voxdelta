@@ -308,7 +308,12 @@ class PipelineRunner:
             return digest.hexdigest()
 
     def _normalize_media_are_valid(self, job_id: str, artifact: NormalizeArtifact) -> bool:
-        references = (*artifact.normalized_media, artifact.mixed_preview)
+        references = tuple(
+            {
+                (item.path, item.sha256): item
+                for item in (*artifact.normalized_media, artifact.mixed_preview)
+            }.values()
+        )
         generations = {Path(item.path).parent for item in references}
         if len(generations) != 1:
             return False
@@ -511,34 +516,51 @@ class PipelineRunner:
         *,
         require_confirmed_role: bool,
     ) -> bool:
+        artifact = self._completed_artifact_manifest(
+            job_id,
+            stage,
+            row,
+            require_confirmed_role=require_confirmed_role,
+        )
+        return artifact is not None and self._artifact_semantics_are_valid(job_id, artifact)
+
+    def _completed_artifact_manifest(
+        self,
+        job_id: str,
+        stage: StageName,
+        row: dict[str, object],
+        *,
+        require_confirmed_role: bool,
+    ) -> StageArtifact | None:
+        """Load a typed cache-valid artifact without reading referenced media bytes."""
+
         try:
             model = ARTIFACT_MODELS[stage]
             artifact = self._artifacts.read_model(job_id, stage, model)
             if not isinstance(artifact, StageArtifact):
-                return False
+                return None
             if row.get("artifact_path") != self._artifacts.artifact_path(job_id, stage).name:
-                return False
+                return None
             if row.get("cache_key") != artifact.cache_key:
-                return False
+                return None
             if row.get("artifact_hash") != self._artifacts.content_hash(job_id, stage):
-                return False
+                return None
             if artifact.provider != self._provider(stage):
-                return False
+                return None
             role_artifact = artifact if isinstance(artifact, RoleArtifact) else None
             if require_confirmed_role and (role_artifact is None or not role_artifact.confirmed):
-                return False
+                return None
             if role_artifact is not None:
                 expected_marker = 1 if role_artifact.confirmed else 0
                 if row.get("role_confirmed") != expected_marker:
-                    return False
+                    return None
             expected_key, upstream_hashes = self._cache_key(job_id, stage, role_artifact)
-            return (
-                artifact.cache_key == expected_key
-                and artifact.upstream_hashes == upstream_hashes
-                and self._artifact_semantics_are_valid(job_id, artifact)
+            valid = (
+                artifact.cache_key == expected_key and artifact.upstream_hashes == upstream_hashes
             )
+            return artifact if valid else None
         except (OSError, TypeError, ValueError, ValidationError):
-            return False
+            return None
 
     def _invalidate_from(self, job_id: str, stage: StageName) -> None:
         selected = downstream_stages(stage)
@@ -1024,17 +1046,18 @@ class PipelineRunner:
                     "audio_not_ready",
                     "Normalized audio is not available yet.",
                 )
-            if not self._completed_artifact_is_valid(
+            artifact = self._completed_artifact_manifest(
                 job_id,
                 StageName.NORMALIZE,
                 row,
                 require_confirmed_role=False,
-            ):
+            )
+            if not isinstance(artifact, NormalizeArtifact):
                 raise PipelineValidationError(
                     "invalid_normalized_audio",
                     "The normalized audio preview is invalid.",
                 )
-            normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
+            normalized = artifact
             media_context = self._open_trusted_media(job_id, normalized.mixed_preview.path)
             opened = media_context.__enter__()
             try:

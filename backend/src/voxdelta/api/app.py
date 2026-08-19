@@ -7,11 +7,13 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import AbstractContextManager
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, BinaryIO, cast
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from voxdelta.api.dependencies import build_dependencies
 from voxdelta.api.schemas import (
@@ -54,6 +56,25 @@ class _UploadAdmissionError(ValueError):
         self.code = code
         self.message = message
         super().__init__(message)
+
+
+class _ContextCloser:
+    """Idempotently release a streamed descriptor from body or response cleanup."""
+
+    def __init__(self, context: AbstractContextManager[BinaryIO]) -> None:
+        self._context = context
+        self._lock = Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._context.__exit__(None, None, None)
+        except Exception:
+            pass
 
 
 def _not_found() -> HTTPException:
@@ -172,9 +193,16 @@ def _cleanup_failed_upload(
 def _parse_range(raw: str | None, size: int) -> tuple[int, int] | None:
     if raw is None:
         return None
-    if size == 0 or not raw.startswith("bytes="):
+    if "=" not in raw:
+        if raw.strip().casefold().startswith("bytes"):
+            raise ValueError("invalid range")
+        return None
+    unit, value = raw.split("=", 1)
+    if unit.strip().casefold() != "bytes":
+        return None
+    if size == 0:
         raise ValueError("invalid range")
-    value = raw.removeprefix("bytes=")
+    value = value.strip()
     if not value or "," in value or value.count("-") != 1:
         raise ValueError("invalid range")
     start_text, end_text = value.split("-", 1)
@@ -204,7 +232,7 @@ def _parse_range(raw: str | None, size: int) -> tuple[int, int] | None:
 
 async def _audio_chunks(
     opened: BinaryIO,
-    context: AbstractContextManager[BinaryIO],
+    closer: _ContextCloser,
     start: int,
     length: int,
 ) -> AsyncIterator[bytes]:
@@ -218,7 +246,7 @@ async def _audio_chunks(
             remaining -= len(chunk)
             yield chunk
     finally:
-        context.__exit__(None, None, None)
+        closer.close()
 
 
 def create_app(
@@ -406,11 +434,22 @@ def create_app(
             raise _pipeline_error(409, error) from None
         except (OSError, ValueError):
             raise _not_found() from None
-        size = os.fstat(opened.fileno()).st_size
+        closer = _ContextCloser(context)
+        try:
+            size = os.fstat(opened.fileno()).st_size
+        except OSError:
+            closer.close()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "invalid_normalized_audio",
+                    "message": "The normalized audio preview is invalid.",
+                },
+            ) from None
         try:
             selected = _parse_range(request.headers.get("range"), size)
         except ValueError:
-            context.__exit__(None, None, None)
+            closer.close()
             return StreamingResponse(
                 iter(()),
                 status_code=416,
@@ -434,10 +473,11 @@ def create_app(
         if status_code == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         return StreamingResponse(
-            _audio_chunks(opened, context, start, length),
+            _audio_chunks(opened, closer, start, length),
             status_code=status_code,
             headers=headers,
             media_type="audio/wav",
+            background=BackgroundTask(closer.close),
         )
 
     @app.delete("/api/jobs/{job_id}", status_code=204)
