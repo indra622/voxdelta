@@ -39,6 +39,10 @@ class PublicError(StrictSchema):
     message: str
 
 
+class PublicErrorEnvelope(StrictSchema):
+    detail: PublicError
+
+
 class PublicStage(StrictSchema):
     status: str
     error: PublicError | None = None
@@ -82,6 +86,7 @@ __all__ = [
     "ProviderConfiguration",
     "ProviderDisclosure",
     "PublicError",
+    "PublicErrorEnvelope",
     "PublicJob",
     "PublicProvenance",
     "PublicStage",

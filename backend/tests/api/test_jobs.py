@@ -297,6 +297,32 @@ async def test_validation_handler_preserves_openapi_and_intentional_http_errors(
 
 
 @pytest.mark.asyncio
+async def test_openapi_documents_uniform_request_validation_envelope(tmp_path: Path) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        response = await client.get("/openapi.json")
+
+    assert response.status_code == 200
+    schema = response.json()
+    error_envelope = schema["components"]["schemas"]["PublicErrorEnvelope"]
+    assert error_envelope["additionalProperties"] is False
+    assert error_envelope["required"] == ["detail"]
+    assert error_envelope["properties"]["detail"] == {"$ref": "#/components/schemas/PublicError"}
+
+    for path in (
+        "/api/jobs",
+        "/api/jobs/{job_id}/roles",
+        "/api/jobs/{job_id}/retry",
+    ):
+        validation_response = schema["paths"][path]["post"]["responses"]["422"]
+        assert validation_response["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/PublicErrorEnvelope"
+        }
+        assert "HTTPValidationError" not in json.dumps(validation_response)
+
+
+@pytest.mark.asyncio
 async def test_upload_pauses_persists_diagnostic_false_and_never_trusts_filename(
     tmp_path: Path,
 ) -> None:

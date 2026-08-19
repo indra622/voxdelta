@@ -24,6 +24,7 @@ from voxdelta.api.schemas import (
     JobCreated,
     ProviderConfiguration,
     PublicError,
+    PublicErrorEnvelope,
     PublicJob,
     PublicStage,
     RetryRequest,
@@ -462,7 +463,17 @@ def create_app(
     def provider_configuration() -> ProviderConfiguration:
         return ProviderConfiguration(stages=runner.provider_disclosures())
 
-    @app.post("/api/jobs", status_code=202, response_model=JobCreated)
+    @app.post(
+        "/api/jobs",
+        status_code=202,
+        response_model=JobCreated,
+        responses={
+            422: {
+                "model": PublicErrorEnvelope,
+                "description": "Invalid request",
+            }
+        },
+    )
     async def create_job(
         background_tasks: BackgroundTasks,
         uploaded_file: Annotated[UploadFile, File(alias="file")],
@@ -585,7 +596,16 @@ def create_app(
     def get_job(job_id: str) -> PublicJob:
         return _public_job(repository, runner, job_id)
 
-    @app.post("/api/jobs/{job_id}/roles", response_model=PublicJob)
+    @app.post(
+        "/api/jobs/{job_id}/roles",
+        response_model=PublicJob,
+        responses={
+            422: {
+                "model": PublicErrorEnvelope,
+                "description": "Invalid request",
+            }
+        },
+    )
     def confirm_roles(job_id: str, confirmation: RoleConfirmation) -> PublicJob:
         try:
             runner.confirm_roles(job_id, confirmation.mapping)
@@ -599,7 +619,16 @@ def create_app(
             raise _not_found() from None
         return _public_job(repository, runner, job_id)
 
-    @app.post("/api/jobs/{job_id}/retry", response_model=PublicJob)
+    @app.post(
+        "/api/jobs/{job_id}/retry",
+        response_model=PublicJob,
+        responses={
+            422: {
+                "model": PublicErrorEnvelope,
+                "description": "Invalid request",
+            }
+        },
+    )
     def retry(job_id: str, request: RetryRequest) -> PublicJob:
         try:
             runner.retry(job_id, request.stage)
