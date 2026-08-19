@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -48,7 +49,11 @@ def _write_pair(
 
 
 def _run_builder(
-    consultation: Path, emotion: Path, output: Path
+    consultation: Path,
+    emotion: Path,
+    output: Path,
+    *,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -67,6 +72,7 @@ def _run_builder(
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
 
 
@@ -419,3 +425,45 @@ def test_builder_cli_sanitizes_filesystem_failures(tmp_path: Path, failure_kind:
     assert result.stderr == "manifest build failed: filesystem operation failed\n"
     assert "PRIVATE_OUTPUT_SENTINEL" not in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_builder_cli_fails_closed_on_recursive_walk_error(tmp_path: Path) -> None:
+    consultation = tmp_path / "consultation"
+    emotion = tmp_path / "emotion"
+    output = tmp_path / "manifests"
+    injection = tmp_path / "injection"
+    consultation.mkdir()
+    emotion.mkdir()
+    injection.mkdir()
+    (injection / "sitecustomize.py").write_text(
+        """import os
+
+real_walk = os.walk
+target = os.environ["VOXDELTA_TEST_WALK_ROOT"]
+
+def injected_walk(top, topdown=True, onerror=None, followlinks=False):
+    if os.fspath(top) == target:
+        if onerror is None:
+            return iter(())
+        onerror(PermissionError("PRIVATE_WALK_SENTINEL"))
+        raise AssertionError("onerror unexpectedly returned")
+    return real_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
+
+os.walk = injected_walk
+""",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{injection}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else str(injection)
+    )
+    env["VOXDELTA_TEST_WALK_ROOT"] = str(consultation)
+
+    result = _run_builder(consultation, emotion, output, env=env)
+
+    assert result.returncode == 2
+    assert result.stderr == "manifest build failed: filesystem operation failed\n"
+    assert "PRIVATE_WALK_SENTINEL" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not list(output.glob("*.jsonl"))

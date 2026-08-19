@@ -10,7 +10,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
+from typing import Never, cast
 
 from voxdelta.domain.models import EmotionLabel
 from voxdelta.evaluation.aihub_fields import resolve_canonical_field
@@ -79,10 +79,16 @@ def _output_root(path: Path) -> Path:
     return absolute
 
 
+def _raise_walk_error(error: OSError) -> Never:
+    raise error
+
+
 def _discover_pairs(root: Path) -> list[tuple[Path, Path]]:
     audio_by_key: dict[tuple[Path, str], Path] = {}
     metadata_by_key: dict[tuple[Path, str], Path] = {}
-    for directory_name, directory_names, file_names in os.walk(root, followlinks=False):
+    for directory_name, directory_names, file_names in os.walk(
+        root, onerror=_raise_walk_error, followlinks=False
+    ):
         directory = Path(directory_name)
         for name in directory_names:
             candidate = directory / name
