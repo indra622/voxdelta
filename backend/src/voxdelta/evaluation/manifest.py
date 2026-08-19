@@ -1,0 +1,117 @@
+"""Typed dataset manifest contracts and split-integrity checks."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
+
+from voxdelta.domain.models import EmotionLabel
+
+DatasetSplit = Literal["train", "validation", "test"]
+
+
+class DatasetItem(BaseModel):
+    """One immutable utterance record in an evaluation manifest."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    call_id: str
+    speaker_id: str
+    audio_path: str
+    transcript: str
+    split: DatasetSplit
+    emotion: EmotionLabel | None = None
+    start: float | None = None
+    end: float | None = None
+    sha256: str
+
+
+def _absolute_path(path: str | Path) -> Path:
+    return Path(os.path.abspath(Path(path).expanduser()))
+
+
+def _reject_symlink_components(path: Path) -> None:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"symlinked path is not allowed: {path}")
+
+
+def read_trusted_regular_file(path: str | Path) -> bytes:
+    """Read a regular file without accepting lexical escapes or symlink traversal."""
+
+    absolute = _absolute_path(path)
+    _reject_symlink_components(absolute)
+    if not absolute.exists():
+        raise ValueError(f"file does not exist: {absolute}")
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(absolute, flags)
+    except OSError as error:
+        raise ValueError(f"unable to open trusted file: {absolute}") from error
+
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"path is not a regular file: {absolute}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise ValueError(f"file changed while being read: {absolute}")
+    return b"".join(chunks)
+
+
+def load_manifest(path: str | Path) -> list[DatasetItem]:
+    """Load a trusted JSONL manifest and return records sorted by item ID."""
+
+    raw = read_trusted_regular_file(path)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("manifest must be UTF-8") from error
+
+    items: list[DatasetItem] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"invalid JSON on manifest line {line_number}") from error
+        items.append(DatasetItem.model_validate(payload))
+
+    seen: set[str] = set()
+    for item in items:
+        if item.id in seen:
+            raise ValueError(f"duplicate item id: {item.id}")
+        seen.add(item.id)
+    return sorted(items, key=lambda item: item.id)
+
+
+def validate_disjoint_splits(items: list[DatasetItem]) -> None:
+    """Reject call or speaker identities that occur in more than one split."""
+
+    calls: dict[str, DatasetSplit] = {}
+    speakers: dict[str, DatasetSplit] = {}
+    for item in items:
+        call_split = calls.setdefault(item.call_id, item.split)
+        if call_split != item.split:
+            raise ValueError(f"call leakage: {item.call_id}")
+        speaker_split = speakers.setdefault(item.speaker_id, item.split)
+        if speaker_split != item.split:
+            raise ValueError(f"speaker leakage: {item.speaker_id}")
