@@ -176,6 +176,12 @@ class JobRepository:
             raise ValueError("role stage transitions require fenced publication")
         now = self._now().isoformat()
         with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            job = database.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            if job["status"] == "deleting":
+                raise ValueError("job is being deleted")
             updated_stage = database.execute(
                 """
                 UPDATE stages
@@ -228,8 +234,11 @@ class JobRepository:
         placeholders = ", ".join("?" for _ in stages)
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
-            if database.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+            job = database.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
                 raise KeyError(job_id)
+            if job["status"] == "deleting":
+                raise ValueError("job is being deleted")
             updated = database.execute(
                 f"""
                 UPDATE stages
@@ -270,6 +279,11 @@ class JobRepository:
         token = uuid.uuid4().hex
         with self._connect() as database:
             database.execute("BEGIN IMMEDIATE")
+            job = database.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            if job["status"] == "deleting":
+                return None
             row = database.execute(
                 "SELECT status, generation, claimed_at FROM stages WHERE job_id = ? AND stage = ?",
                 (job_id, stage.value),
@@ -600,6 +614,46 @@ class JobRepository:
                 "SELECT * FROM stages WHERE job_id = ? ORDER BY rowid", (job_id,)
             ).fetchall()
         return {**dict(job), "stages": {row["stage"]: dict(row) for row in stages}}
+
+    def begin_delete(self, job_id: str) -> None:
+        """Fence every stage and retain a retryable deleting row."""
+
+        validate_job_id(job_id)
+        now = self._now().isoformat()
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            job = database.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            if job["status"] != "deleting":
+                updated = database.execute(
+                    """
+                    UPDATE stages
+                    SET status = 'deleting', generation = generation + 1,
+                        claim_token = NULL, claimed_at = NULL, error_json = NULL
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                )
+                if updated.rowcount != len(StageName):
+                    raise KeyError(f"{job_id}:stage rows")
+                database.execute(
+                    "UPDATE jobs SET status = 'deleting', updated_at = ? WHERE id = ?",
+                    (now, job_id),
+                )
+
+    def finalize_delete(self, job_id: str) -> None:
+        """Delete only a previously fenced job after artifact removal succeeds."""
+
+        validate_job_id(job_id)
+        with self._connect() as database:
+            deleted = database.execute(
+                "DELETE FROM jobs WHERE id = ? AND status = 'deleting'", (job_id,)
+            )
+            if deleted.rowcount != 1:
+                if database.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone():
+                    raise ValueError("job deletion was not fenced")
+                raise KeyError(job_id)
 
     def delete_job(self, job_id: str) -> None:
         """Delete a job and cascade its stages in one transaction."""

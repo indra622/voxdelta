@@ -484,6 +484,8 @@ def create_app(
     def delete_job(job_id: str) -> Response:
         try:
             runner.delete_job(job_id)
+        except PipelineStateError as error:
+            raise _pipeline_error(409, error) from None
         except (KeyError, ValueError):
             raise _not_found() from None
         return Response(status_code=204)

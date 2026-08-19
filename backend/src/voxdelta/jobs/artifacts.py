@@ -38,10 +38,9 @@ _LINKED_JOB_DIRECTORY_ERROR = (
     "job directory beneath jobs root must not be a symlink or reparse point"
 )
 _OPERATION_LOCK_VALIDATION_ERROR = "job operation lock could not be validated safely"
+_TOMBSTONE_VALIDATION_ERROR = "job deletion tombstone could not be validated safely"
 _OPERATION_LOCKS: dict[Path, threading.Lock] = {}
 _OPERATION_LOCKS_GUARD = threading.Lock()
-_DELETION_FENCE = threading.RLock()
-_DELETED_JOB_PATHS: set[Path] = set()
 
 
 def _operation_process_lock(path: Path) -> threading.Lock:
@@ -134,19 +133,102 @@ class ArtifactStore:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def _job_path(self, job_id: str, *, create: bool, require_directory: bool) -> Path:
-        with _DELETION_FENCE:
-            return self._job_path_unlocked(
-                job_id,
-                create=create,
-                require_directory=require_directory,
-            )
+    def _control_directory(self, name: str, *, create: bool, error_message: str) -> Path:
+        if create:
+            self.root.mkdir(parents=True, exist_ok=True)
+        resolved_root = self.root.resolve()
+        candidate = self.root / name
+        if _is_link_like(candidate):
+            raise ValueError(error_message)
+        if create:
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        if candidate.exists():
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                raise ValueError(error_message) from None
+            if (
+                _is_link_like(candidate)
+                or not candidate.is_dir()
+                or resolved != resolved_root / name
+                or resolved.parent != resolved_root
+            ):
+                raise ValueError(error_message)
+            if create:
+                os.chmod(candidate, 0o700)
+        return candidate
 
-    def _job_path_unlocked(self, job_id: str, *, create: bool, require_directory: bool) -> Path:
+    def _tombstone_path(self, job_id: str, *, create_directory: bool) -> Path:
         validate_job_id(job_id)
-        deletion_key = self.root.resolve() / job_id
-        if deletion_key in _DELETED_JOB_PATHS:
-            raise FileNotFoundError(deletion_key)
+        directory = self._control_directory(
+            ".deleted",
+            create=create_directory,
+            error_message=_TOMBSTONE_VALIDATION_ERROR,
+        )
+        return directory / f"{job_id}.tombstone"
+
+    def deletion_tombstone_exists(self, job_id: str) -> bool:
+        """Return whether a durable, regular tombstone fences this job ID."""
+
+        target = self._tombstone_path(job_id, create_directory=False)
+        if not target.exists() and not _is_link_like(target):
+            return False
+        try:
+            metadata = target.lstat()
+            parent = target.parent.resolve()
+        except (OSError, RuntimeError):
+            raise ValueError(_TOMBSTONE_VALIDATION_ERROR) from None
+        if (
+            _is_link_like(target)
+            or not stat.S_ISREG(metadata.st_mode)
+            or parent != self.root.resolve() / ".deleted"
+        ):
+            raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
+        return True
+
+    def mark_deletion_tombstone(self, job_id: str) -> Path:
+        """Atomically and durably fence every future write for one random job ID."""
+
+        target = self._tombstone_path(job_id, create_directory=True)
+        if self.deletion_tombstone_exists(job_id):
+            return target
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(target, flags, 0o600)
+        except FileExistsError:
+            if self.deletion_tombstone_exists(job_id):
+                return target
+            raise ValueError(_TOMBSTONE_VALIDATION_ERROR) from None
+        try:
+            os.fchmod(descriptor, 0o600)
+            payload = job_id.encode("ascii")
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("tombstone write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(target.parent)
+        return target
+
+    def _job_path(
+        self,
+        job_id: str,
+        *,
+        create: bool,
+        require_directory: bool,
+        allow_deleted: bool = False,
+    ) -> Path:
+        validate_job_id(job_id)
+        if not allow_deleted and self.deletion_tombstone_exists(job_id):
+            raise FileNotFoundError(job_id)
         if create:
             self.root.mkdir(parents=True, exist_ok=True)
         resolved_root = self.root.resolve()
@@ -171,6 +253,13 @@ class ArtifactStore:
             raise FileNotFoundError(resolved)
         if _is_link_like(unresolved) or unresolved.resolve() != resolved:
             raise ValueError("job directory changed while it was being validated")
+        if not allow_deleted and self.deletion_tombstone_exists(job_id):
+            if create:
+                try:
+                    unresolved.rmdir()
+                except OSError:
+                    pass
+            raise FileNotFoundError(job_id)
         return resolved
 
     def job_dir(self, job_id: str) -> Path:
@@ -182,12 +271,17 @@ class ArtifactStore:
     def operation_lock(self, job_id: str) -> Iterator[None]:
         """Serialize one job's claim/reset transitions across runner processes.
 
-        POSIX uses ``flock`` on a validated job-local file. Platforms without ``fcntl``
+        POSIX uses ``flock`` on a validated root-control file. Platforms without ``fcntl``
         retain process-wide per-path serialization but cannot promise cross-process locking.
         """
 
-        directory = self.job_dir(job_id)
-        target = directory / ".operation.lock"
+        validate_job_id(job_id)
+        directory = self._control_directory(
+            ".locks",
+            create=True,
+            error_message=_OPERATION_LOCK_VALIDATION_ERROR,
+        )
+        target = directory / f"{job_id}.lock"
         flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
         with _operation_process_lock(target):
@@ -203,7 +297,7 @@ class ArtifactStore:
                 opened = os.fstat(descriptor)
                 current = target.lstat()
                 try:
-                    target_is_local = target.resolve().parent == directory
+                    target_is_local = target.resolve().parent == directory.resolve()
                 except (OSError, RuntimeError):
                     raise ValueError(_OPERATION_LOCK_VALIDATION_ERROR) from None
                 if (
@@ -293,14 +387,14 @@ class ArtifactStore:
         return model_type.model_validate_json(path.read_bytes())
 
     def delete_job(self, job_id: str) -> None:
-        """Delete exactly one validated job directory beneath the configured root."""
+        """Durably fence and remove exactly one job directory; safe to retry."""
 
-        with _DELETION_FENCE:
-            resolved_target = self._job_path_unlocked(
-                job_id,
-                create=False,
-                require_directory=False,
-            )
-            _DELETED_JOB_PATHS.add(resolved_target)
-            if resolved_target.exists():
-                shutil.rmtree(resolved_target)
+        self.mark_deletion_tombstone(job_id)
+        resolved_target = self._job_path(
+            job_id,
+            create=False,
+            require_directory=False,
+            allow_deleted=True,
+        )
+        if resolved_target.exists():
+            shutil.rmtree(resolved_target)

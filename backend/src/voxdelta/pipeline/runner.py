@@ -1080,13 +1080,22 @@ class PipelineRunner:
                 media_context.__exit__(None, None, None)
 
     def delete_job(self, job_id: str) -> None:
-        """Fence current work and delete exactly one job's index and artifacts."""
+        """Durably fence and retryably delete exactly one job."""
 
         self._repository.get_job(job_id)
-        with self._job_lock(job_id), self._artifacts.operation_lock(job_id):
-            self._repository.invalidate_stages(job_id, tuple(StageName))
-            self._repository.delete_job(job_id)
-            self._artifacts.delete_job(job_id)
+        with self._job_lock(job_id):
+            try:
+                with self._artifacts.operation_lock(job_id):
+                    self._repository.begin_delete(job_id)
+                    self._artifacts.delete_job(job_id)
+                    self._repository.finalize_delete(job_id)
+            except KeyError:
+                raise
+            except Exception:
+                raise PipelineStateError(
+                    "deletion_incomplete",
+                    "Local deletion did not finish and can be retried safely.",
+                ) from None
 
     def confirm_roles(
         self,

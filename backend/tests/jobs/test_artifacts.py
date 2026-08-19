@@ -89,10 +89,11 @@ def test_job_operation_lock_serializes_separate_processes(tmp_path: Path) -> Non
 
 def test_job_operation_lock_rejects_a_linked_lock_file(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "jobs")
-    job_directory = store.job_dir("j1")
+    lock_directory = store.root / ".locks"
+    lock_directory.mkdir(parents=True)
     outside = tmp_path / "outside.lock"
     outside.write_text("outside", encoding="utf-8")
-    (job_directory / ".operation.lock").symlink_to(outside)
+    (lock_directory / "j1.lock").symlink_to(outside)
 
     with pytest.raises(ValueError, match="operation lock"):
         with store.operation_lock("j1"):
@@ -101,18 +102,34 @@ def test_job_operation_lock_rejects_a_linked_lock_file(tmp_path: Path) -> None:
     assert outside.read_text(encoding="utf-8") == "outside"
 
 
+def test_external_job_operation_lock_rejects_linked_control_directory(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".locks").symlink_to(outside, target_is_directory=True)
+    store = ArtifactStore(root)
+
+    with pytest.raises(ValueError, match="operation lock"):
+        with store.operation_lock("j1"):
+            pytest.fail("linked external operation lock directory was accepted")
+
+    assert not list(outside.iterdir())
+
+
 @pytest.mark.parametrize("cycle", ["self", "two-link"])
 def test_job_operation_lock_rejects_cyclic_links_without_disclosing_paths(
     cycle: str,
     tmp_path: Path,
 ) -> None:
     store = ArtifactStore(tmp_path / "jobs")
-    job_directory = store.job_dir("j1")
-    lock_path = job_directory / ".operation.lock"
+    lock_directory = store.root / ".locks"
+    lock_directory.mkdir(parents=True)
+    lock_path = lock_directory / "j1.lock"
     if cycle == "self":
         lock_path.symlink_to(lock_path.name)
     else:
-        second = job_directory / ".operation-lock-cycle"
+        second = lock_directory / ".operation-lock-cycle"
         lock_path.symlink_to(second.name)
         second.symlink_to(lock_path.name)
 
@@ -314,6 +331,67 @@ def test_delete_job_removes_only_the_exact_job_directory(tmp_path: Path) -> None
     assert root.is_dir()
     assert not (root / "j1").exists()
     assert sibling.read_text(encoding="utf-8") == "j10"
+
+
+def test_delete_job_persists_tombstone_that_blocks_stale_process_logger(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    store.job_dir("j1")
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    blocked = tmp_path / "blocked"
+    recreated = tmp_path / "recreated"
+    script = "\n".join(
+        (
+            "import time",
+            "from pathlib import Path",
+            "from voxdelta.jobs.artifacts import ArtifactStore",
+            "from voxdelta.jobs.logging import PipelineLogger",
+            f"root = Path({str(root)!r})",
+            "store = ArtifactStore(root)",
+            "store.job_dir('j1')",
+            f"Path({str(ready)!r}).write_text('ready')",
+            f"release = Path({str(release)!r})",
+            "while not release.exists(): time.sleep(0.01)",
+            "try:",
+            "    PipelineLogger(store).event(",
+            "        job_id='j1', stage='report', event='late', duration_ms=0,",
+            "        provider=None, model=None, error_code=None,",
+            "    )",
+            "except FileNotFoundError:",
+            f"    Path({str(blocked)!r}).write_text('blocked')",
+            "else:",
+            f"    Path({str(recreated)!r}).write_text('recreated')",
+        )
+    )
+    child = subprocess.Popen([sys.executable, "-c", script])
+    deadline = time.monotonic() + 5
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+
+    store.delete_job("j1")
+    release.write_text("release", encoding="utf-8")
+
+    assert child.wait(timeout=5) == 0
+    assert blocked.read_text(encoding="utf-8") == "blocked"
+    assert not recreated.exists()
+    assert not (root / "j1").exists()
+    assert (root / ".deleted" / "j1.tombstone").is_file()
+
+
+def test_delete_job_rejects_linked_tombstone_control_directory(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / ".deleted").symlink_to(outside, target_is_directory=True)
+    store = ArtifactStore(root)
+
+    with pytest.raises(ValueError, match="tombstone"):
+        store.delete_job("j1")
+
+    assert not list(outside.iterdir())
 
 
 def test_delete_job_rejects_a_symlink_that_resolves_outside_the_jobs_root(tmp_path: Path) -> None:

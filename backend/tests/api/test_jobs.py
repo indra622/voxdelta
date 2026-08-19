@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+import voxdelta.jobs.artifacts as artifacts_module
 from voxdelta.api.app import create_app
 from voxdelta.audio.service import AudioService
 from voxdelta.domain.models import AudioAsset, StageName, StageStatus
@@ -60,6 +61,18 @@ class FailingDeleteRepository(JobRepository):
     def delete_job(self, job_id: str) -> None:
         del job_id
         raise RuntimeError("private database cleanup row")
+
+
+class FailOnceFinalizeRepository(JobRepository):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.finalize_attempts = 0
+
+    def finalize_delete(self, job_id: str) -> None:
+        self.finalize_attempts += 1
+        if self.finalize_attempts == 1:
+            raise RuntimeError("private database finalization row")
+        super().finalize_delete(job_id)
 
 
 def build_harness(
@@ -731,6 +744,71 @@ async def test_delete_removes_exact_job_database_and_artifacts(tmp_path: Path) -
     assert not (artifacts.root / first_id).exists()
     assert repository.get_job(second_id)["id"] == second_id
     assert (artifacts.root / second_id).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_delete_rmtree_failure_is_retryable_without_recreation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path)
+    real_rmtree = artifacts_module.shutil.rmtree
+    attempts = 0
+
+    def fail_once(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("private rmtree path")
+        real_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(artifacts_module.shutil, "rmtree", fail_once)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://testserver",
+    ) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        first = await client.delete(f"/api/jobs/{job_id}")
+        persisted = repository.get_job(job_id)
+        second = await client.delete(f"/api/jobs/{job_id}")
+
+    assert first.status_code == 409
+    assert first.json()["detail"]["code"] == "deletion_incomplete"
+    assert str(tmp_path) not in first.text
+    assert persisted["status"] == "deleting"
+    assert all(row["status"] == "deleting" for row in persisted["stages"].values())
+    assert all(int(row["generation"]) >= 1 for row in persisted["stages"].values())
+    assert all(row["claim_token"] is None for row in persisted["stages"].values())
+    assert second.status_code == 204
+    with pytest.raises(KeyError):
+        repository.get_job(job_id)
+    assert not (artifacts.root / job_id).exists()
+    assert (artifacts.root / ".deleted" / f"{job_id}.tombstone").is_file()
+
+
+@pytest.mark.asyncio
+async def test_delete_database_finalization_failure_is_retryable(
+    tmp_path: Path,
+) -> None:
+    repository = FailOnceFinalizeRepository(tmp_path / "voxdelta.sqlite3")
+    app, _, artifacts, _ = build_harness(tmp_path, repository_override=repository)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://testserver",
+    ) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        first = await client.delete(f"/api/jobs/{job_id}")
+        persisted = repository.get_job(job_id)
+        second = await client.delete(f"/api/jobs/{job_id}")
+
+    assert first.status_code == 409
+    assert first.json()["detail"]["code"] == "deletion_incomplete"
+    assert persisted["status"] == "deleting"
+    assert not (artifacts.root / job_id).exists()
+    assert second.status_code == 204
+    with pytest.raises(KeyError):
+        repository.get_job(job_id)
 
 
 @pytest.mark.asyncio
