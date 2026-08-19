@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
@@ -42,8 +43,9 @@ UPSTREAM_STAGES: dict[StageName, tuple[StageName, ...]] = {
     ),
 }
 
-_SECRET_KEY_PARTS = ("key", "token", "authorization")
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_NON_IDENTIFIER = re.compile(r"[^a-zA-Z0-9]+")
 
 
 def downstream_stages(stage: StageName) -> tuple[StageName, ...]:
@@ -66,8 +68,16 @@ def _canonical_cache_value(value: object) -> Any:
         for raw_key, item in value.items():
             if not isinstance(raw_key, str):
                 raise TypeError("cache configuration keys must be strings")
-            if any(part in raw_key.casefold() for part in _SECRET_KEY_PARTS):
-                continue
+            separated = _CAMEL_BOUNDARY.sub("_", raw_key)
+            normalized = _NON_IDENTIFIER.sub("_", separated).strip("_").casefold()
+            if (
+                normalized in {"authorization", "key", "token", "password", "secret"}
+                or normalized.endswith("_key")
+                or normalized.endswith("_token")
+                or normalized.endswith("_password")
+                or normalized.endswith("_secret")
+            ):
+                raise ValueError("credential-bearing cache configuration is not allowed")
             sanitized[raw_key] = _canonical_cache_value(item)
         return sanitized
     if isinstance(value, (list, tuple)):

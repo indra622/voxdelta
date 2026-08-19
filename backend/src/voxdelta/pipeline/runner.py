@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import math
+import os
+import tempfile
 import time
-from collections.abc import Mapping
+import wave
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock, RLock
 from typing import TypeVar, cast
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from voxdelta.analysis.emotions import median_smooth
 from voxdelta.analysis.roles import suggest_roles
@@ -17,6 +22,7 @@ from voxdelta.analysis.transitions import build_transitions
 from voxdelta.audio.service import AudioRejected, AudioService, ChannelPreference
 from voxdelta.domain.models import (
     AnalysisReport,
+    CallSummary,
     ProviderProvenance,
     Role,
     StageName,
@@ -71,6 +77,20 @@ _DEFAULT_STAGE_CONFIG: dict[StageName, dict[str, object]] = {
 }
 
 
+class NormalizeRunnerConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    channel_preference: ChannelPreference = "auto"
+
+
+class RunnerConfig(BaseModel):
+    """The complete set of behavior-changing options currently implemented."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    normalize: NormalizeRunnerConfig = NormalizeRunnerConfig()
+
+
 class PipelineValidationError(ValueError):
     """A stable public pipeline error without provider or user payload text."""
 
@@ -98,6 +118,17 @@ def _ordered_utterances(artifact: RoleArtifact) -> list[Utterance]:
     )
 
 
+def _relevant_agent_ids(ordered: list[Utterance]) -> list[str]:
+    return [
+        item.id
+        for index, item in enumerate(ordered)
+        if 0 < index < len(ordered) - 1
+        and item.role == Role.AGENT
+        and ordered[index - 1].role == Role.CUSTOMER
+        and ordered[index + 1].role == Role.CUSTOMER
+    ]
+
+
 class PipelineRunner:
     """Compose storage, providers, and deterministic analysis into resumable stages."""
 
@@ -112,7 +143,7 @@ class PipelineRunner:
         emotion_provider: EmotionProvider | None = None,
         strategy_provider: ResponseStrategyProvider | None = None,
         report_provider: ReportSummaryProvider | None = None,
-        config: Mapping[str, Mapping[str, object]] | None = None,
+        config: RunnerConfig | Mapping[str, Mapping[str, object]] | None = None,
         logger: PipelineLogger | None = None,
     ) -> None:
         self._repository = repository
@@ -123,7 +154,14 @@ class PipelineRunner:
         self._emotion = emotion_provider or FakeEmotionProvider()
         self._strategy = strategy_provider or FakeResponseStrategyProvider()
         self._report = report_provider or FakeReportSummaryProvider()
-        self._config = {stage: dict((config or {}).get(stage.value, {})) for stage in STAGE_ORDER}
+        try:
+            self._config = (
+                config
+                if isinstance(config, RunnerConfig)
+                else RunnerConfig.model_validate(config or {})
+            )
+        except ValidationError:
+            raise ValueError("runner configuration contains unsupported fields or values") from None
         self._logger = logger or PipelineLogger(artifacts)
         self._locks: dict[str, RLock] = {}
         self._locks_guard = Lock()
@@ -148,7 +186,8 @@ class PipelineRunner:
         role_artifact: RoleArtifact | None = None,
     ) -> dict[str, object]:
         config = dict(_DEFAULT_STAGE_CONFIG[stage])
-        config.update(self._config[stage])
+        if stage == StageName.NORMALIZE:
+            config.update(self._config.normalize.model_dump(mode="python"))
         if stage == StageName.CONFIRM_ROLES and role_artifact is not None:
             config["confirmed"] = role_artifact.confirmed
             if role_artifact.mapping is not None:
@@ -185,28 +224,197 @@ class PipelineRunner:
     def _read(self, job_id: str, stage: StageName, model: type[TArtifact]) -> TArtifact:
         return self._artifacts.read_model(job_id, stage, model)
 
+    @contextmanager
+    def _emotion_clip(
+        self,
+        job_id: str,
+        asset: NormalizeArtifact,
+        utterance: Utterance,
+    ) -> Iterator[Path]:
+        audio = asset.asset
+        if not audio.normalized_paths:
+            raise ValueError("normalized audio path is missing")
+        selected = Path(audio.normalized_paths[0])
+        preview = selected.parent / "mixed.wav" if audio.channel_mode == "separate" else selected
+        job_directory = self._artifacts.job_dir(job_id)
+        if preview.is_symlink() or not preview.is_file():
+            raise ValueError("normalized mixed preview is unavailable")
+        resolved_preview = preview.resolve()
+        if not resolved_preview.is_relative_to(job_directory):
+            raise ValueError("normalized mixed preview must remain inside the job directory")
+        if (
+            not math.isfinite(utterance.start)
+            or not math.isfinite(utterance.end)
+            or utterance.start < 0
+            or utterance.end <= utterance.start
+        ):
+            raise ValueError("utterance bounds are invalid for emotion slicing")
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=job_directory,
+            prefix=".emotion-",
+            suffix=".wav",
+        )
+        clip = Path(temporary_name)
+        try:
+            try:
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+            try:
+                with wave.open(str(resolved_preview), "rb") as source:
+                    if (
+                        source.getnchannels() != 1
+                        or source.getsampwidth() != 2
+                        or source.getcomptype() != "NONE"
+                        or source.getframerate() <= 0
+                    ):
+                        raise ValueError("normalized mixed preview format is invalid")
+                    sample_rate = source.getframerate()
+                    start_frame = round(utterance.start * sample_rate)
+                    end_frame = round(utterance.end * sample_rate)
+                    if (
+                        start_frame < 0
+                        or end_frame <= start_frame
+                        or end_frame > source.getnframes()
+                    ):
+                        raise ValueError("utterance bounds exceed normalized audio")
+                    source.setpos(start_frame)
+                    frames = source.readframes(end_frame - start_frame)
+                    if len(frames) != (end_frame - start_frame) * source.getsampwidth():
+                        raise ValueError("normalized audio ended before the utterance bound")
+                    with wave.open(str(clip), "wb") as output:
+                        output.setparams(
+                            (
+                                1,
+                                source.getsampwidth(),
+                                sample_rate,
+                                end_frame - start_frame,
+                                "NONE",
+                                "not compressed",
+                            )
+                        )
+                        output.writeframes(frames)
+                os.chmod(clip, 0o600)
+                with clip.open("rb") as output:
+                    os.fsync(output.fileno())
+            except (EOFError, OSError, wave.Error):
+                raise ValueError("normalized mixed preview is invalid") from None
+            yield clip
+        finally:
+            clip.unlink(missing_ok=True)
+
     def _artifact_semantics_are_valid(self, job_id: str, artifact: StageArtifact) -> bool:
         if isinstance(artifact, NormalizeArtifact):
             return bool(artifact.asset.normalized_paths) and all(
                 Path(path).is_file() for path in artifact.asset.normalized_paths
             )
+        if isinstance(artifact, DiarizeArtifact):
+            ordered_segments = sorted(
+                artifact.segments,
+                key=lambda item: (item.start, item.end, item.speaker_id),
+            )
+            return (
+                bool(artifact.segments)
+                and artifact.segments == ordered_segments
+                and len({item.speaker_id for item in artifact.segments}) == 2
+            )
+        if isinstance(artifact, TranscribeArtifact):
+            diarized = self._read(job_id, StageName.DIARIZE, DiarizeArtifact)
+            if len(artifact.utterances) != len(diarized.segments):
+                return False
+            if len({item.id for item in artifact.utterances}) != len(artifact.utterances):
+                return False
+            return all(
+                utterance.role == Role.UNKNOWN
+                and (
+                    utterance.start,
+                    utterance.end,
+                    utterance.speaker_id,
+                    utterance.overlap,
+                    utterance.confidence,
+                )
+                == (
+                    segment.start,
+                    segment.end,
+                    segment.speaker_id,
+                    segment.overlap,
+                    segment.confidence,
+                )
+                for utterance, segment in zip(artifact.utterances, diarized.segments, strict=True)
+            )
         if isinstance(artifact, RoleArtifact):
+            transcribed = self._read(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
             speakers = {utterance.speaker_id for utterance in artifact.utterances}
             if len(speakers) != 2:
                 return False
+            if artifact.suggestion != suggest_roles(transcribed.utterances):
+                return False
             if not artifact.confirmed:
-                return all(utterance.role == Role.UNKNOWN for utterance in artifact.utterances)
+                expected = [
+                    Utterance.model_validate(
+                        {**utterance.model_dump(mode="python"), "role": Role.UNKNOWN}
+                    )
+                    for utterance in transcribed.utterances
+                ]
+                return artifact.mapping is None and artifact.utterances == expected
             if artifact.mapping is None or set(artifact.mapping) != speakers:
                 return False
             if sorted(artifact.mapping.values()) != [Role.AGENT, Role.CUSTOMER]:
                 return False
-            return all(
-                utterance.role == artifact.mapping[utterance.speaker_id]
-                for utterance in artifact.utterances
+            expected = [
+                Utterance.model_validate(
+                    {
+                        **utterance.model_dump(mode="python"),
+                        "role": artifact.mapping[utterance.speaker_id],
+                    }
+                )
+                for utterance in transcribed.utterances
+            ]
+            return artifact.utterances == expected
+        if isinstance(artifact, EmotionArtifact):
+            roles = self._read(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
+            customer_ids = [
+                item.id for item in _ordered_utterances(roles) if item.role == Role.CUSTOMER
+            ]
+            return [item.utterance_id for item in artifact.results] == customer_ids and all(
+                item.provider == self._emotion.provenance for item in artifact.results
+            )
+        if isinstance(artifact, StrategyArtifact):
+            roles = self._read(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
+            expected_ids = _relevant_agent_ids(_ordered_utterances(roles))
+            return [item.utterance_id for item in artifact.results] == expected_ids and all(
+                item.provider == self._strategy.provenance for item in artifact.results
+            )
+        if isinstance(artifact, TransitionsArtifact):
+            roles = self._read(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
+            emotions = self._read(job_id, StageName.EMOTION, EmotionArtifact)
+            return artifact.results == build_transitions(
+                _ordered_utterances(roles), emotions.results
             )
         if isinstance(artifact, ReportArtifact):
-            return artifact.report.job_id == job_id
-        return True
+            roles = self._read(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
+            emotions = self._read(job_id, StageName.EMOTION, EmotionArtifact)
+            strategies = self._read(job_id, StageName.RESPONSE_STRATEGY, StrategyArtifact)
+            transitions = self._read(job_id, StageName.TRANSITIONS, TransitionsArtifact)
+            report_utterances = _ordered_utterances(roles)
+            customers = [item for item in report_utterances if item.role == Role.CUSTOMER]
+            expected_summary = build_call_summary(customers, emotions.results, transitions.results)
+            summary_without_narrative = CallSummary.model_validate(
+                {
+                    **artifact.report.summary.model_dump(mode="python"),
+                    "narrative": None,
+                }
+            )
+            return (
+                artifact.report.job_id == job_id
+                and artifact.report.utterances == report_utterances
+                and artifact.report.emotions == emotions.results
+                and artifact.report.strategies == strategies.results
+                and artifact.report.transitions == transitions.results
+                and summary_without_narrative == expected_summary
+            )
+        return False
 
     def _completed_artifact_is_valid(
         self,
@@ -225,11 +433,17 @@ class PipelineRunner:
                 return False
             if row.get("cache_key") != artifact.cache_key:
                 return False
+            if row.get("artifact_hash") != self._artifacts.content_hash(job_id, stage):
+                return False
             if artifact.provider != self._provider(stage):
                 return False
             role_artifact = artifact if isinstance(artifact, RoleArtifact) else None
             if require_confirmed_role and (role_artifact is None or not role_artifact.confirmed):
                 return False
+            if role_artifact is not None:
+                expected_marker = 1 if role_artifact.confirmed else 0
+                if row.get("role_confirmed") != expected_marker:
+                    return False
             expected_key, upstream_hashes = self._cache_key(job_id, stage, role_artifact)
             return (
                 artifact.cache_key == expected_key
@@ -279,6 +493,29 @@ class PipelineRunner:
             error_code=error_code,
         )
 
+    def _diagnostic(
+        self,
+        job_id: str,
+        stage: StageName,
+        phase: str,
+        metadata: Mapping[str, object],
+    ) -> None:
+        job = self._repository.get_job(job_id)
+        enabled = job.get("diagnostic_capture") == 1
+        provider = self._provider(stage)
+        self._logger.diagnostic(
+            job_id,
+            enabled,
+            f"{stage.value}-{phase}",
+            {
+                "stage": stage.value,
+                "phase": phase,
+                "provider": provider.name if provider is not None else None,
+                "model": provider.model if provider is not None else None,
+                **metadata,
+            },
+        )
+
     def _build_artifact(self, job_id: str, stage: StageName) -> StageArtifact:
         cache_key, upstream_hashes = self._cache_key(job_id, stage)
         provider = self._provider(stage)
@@ -303,20 +540,46 @@ class PipelineRunner:
             )
         if stage == StageName.DIARIZE:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
+            self._diagnostic(
+                job_id,
+                stage,
+                "request",
+                {"duration_seconds": normalized.asset.duration_seconds},
+            )
+            segments = self._diarization.diarize(normalized.asset)
+            self._diagnostic(
+                job_id,
+                stage,
+                "response",
+                {"result_type": "speaker_segments", "item_count": len(segments)},
+            )
             return DiarizeArtifact(
                 cache_key=cache_key,
                 upstream_hashes=upstream_hashes,
                 provider=provider,
-                segments=self._diarization.diarize(normalized.asset),
+                segments=segments,
             )
         if stage == StageName.TRANSCRIBE:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
             diarized = self._read(job_id, StageName.DIARIZE, DiarizeArtifact)
+            self._diagnostic(
+                job_id,
+                stage,
+                "request",
+                {"segment_count": len(diarized.segments)},
+            )
+            utterances = self._transcription.transcribe(normalized.asset, diarized.segments)
+            self._diagnostic(
+                job_id,
+                stage,
+                "response",
+                {"result_type": "utterances", "item_count": len(utterances)},
+            )
             return TranscribeArtifact(
                 cache_key=cache_key,
                 upstream_hashes=upstream_hashes,
                 provider=provider,
-                utterances=self._transcription.transcribe(normalized.asset, diarized.segments),
+                utterances=utterances,
             )
         if stage == StageName.CONFIRM_ROLES:
             transcribed = self._read(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
@@ -345,12 +608,28 @@ class PipelineRunner:
         ordered = _ordered_utterances(roles)
         if stage == StageName.EMOTION:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
-            audio_path = Path(normalized.asset.normalized_paths[0])
             customer_utterances = [item for item in ordered if item.role == Role.CUSTOMER]
-            raw_results = [
-                self._emotion.analyze(item.id, audio_path, item.transcript)
-                for item in customer_utterances
-            ]
+            raw_results = []
+            for item in customer_utterances:
+                with self._emotion_clip(job_id, normalized, item) as audio_path:
+                    self._diagnostic(
+                        job_id,
+                        stage,
+                        "request",
+                        {
+                            "utterance_id": item.id,
+                            "start_seconds": item.start,
+                            "end_seconds": item.end,
+                        },
+                    )
+                    emotion_result = self._emotion.analyze(item.id, audio_path, item.transcript)
+                    self._diagnostic(
+                        job_id,
+                        stage,
+                        "response",
+                        {"utterance_id": item.id, "result_type": "emotion_result"},
+                    )
+                    raw_results.append(emotion_result)
             return EmotionArtifact(
                 cache_key=cache_key,
                 upstream_hashes=upstream_hashes,
@@ -358,19 +637,29 @@ class PipelineRunner:
                 results=median_smooth(raw_results),
             )
         if stage == StageName.RESPONSE_STRATEGY:
-            relevant_agents = [
-                item
-                for index, item in enumerate(ordered)
-                if 0 < index < len(ordered) - 1
-                and item.role == Role.AGENT
-                and ordered[index - 1].role == Role.CUSTOMER
-                and ordered[index + 1].role == Role.CUSTOMER
-            ]
+            relevant_ids = set(_relevant_agent_ids(ordered))
+            relevant_agents = [item for item in ordered if item.id in relevant_ids]
+            strategy_results = []
+            for item in relevant_agents:
+                self._diagnostic(
+                    job_id,
+                    stage,
+                    "request",
+                    {"utterance_id": item.id, "context_count": len(ordered)},
+                )
+                strategy_result = self._strategy.classify(item, ordered)
+                self._diagnostic(
+                    job_id,
+                    stage,
+                    "response",
+                    {"utterance_id": item.id, "result_type": "strategy_result"},
+                )
+                strategy_results.append(strategy_result)
             return StrategyArtifact(
                 cache_key=cache_key,
                 upstream_hashes=upstream_hashes,
                 provider=provider,
-                results=[self._strategy.classify(item, ordered) for item in relevant_agents],
+                results=strategy_results,
             )
         emotions = self._read(job_id, StageName.EMOTION, EmotionArtifact)
         if stage == StageName.TRANSITIONS:
@@ -393,35 +682,69 @@ class PipelineRunner:
                 strategies=strategies.results,
                 transitions=transitions.results,
             )
+            self._diagnostic(
+                job_id,
+                stage,
+                "request",
+                {
+                    "utterance_count": len(ordered),
+                    "transition_count": len(transitions.results),
+                },
+            )
             narrative = self._report.summarize(report)
+            if not isinstance(narrative, str):
+                raise ValueError("report summary provider returned an invalid type")
+            self._diagnostic(
+                job_id,
+                stage,
+                "response",
+                {"result_type": "summary", "character_count": len(narrative)},
+            )
+            summary_with_narrative = CallSummary.model_validate(
+                {**report.summary.model_dump(mode="python"), "narrative": narrative}
+            )
             return ReportArtifact(
                 cache_key=cache_key,
                 upstream_hashes=upstream_hashes,
                 provider=provider,
-                report=report.model_copy(
-                    update={"summary": report.summary.model_copy(update={"narrative": narrative})}
+                report=AnalysisReport.model_validate(
+                    {
+                        **report.model_dump(mode="python"),
+                        "summary": summary_with_narrative,
+                    }
                 ),
             )
         raise KeyError(stage)
 
     def _execute_stage(self, job_id: str, stage: StageName) -> bool:
-        if not self._repository.try_start_stage(job_id, stage):
+        claim = self._repository.claim_stage(job_id, stage)
+        if claim is None:
             return False
         started = time.monotonic()
         try:
             self._log(job_id, stage, "started", started)
             artifact = self._build_artifact(job_id, stage)
-            path = self._artifacts.write_model(job_id, stage, artifact)
+            artifact = type(artifact).model_validate(artifact.model_dump(mode="python"))
+            if not self._artifact_semantics_are_valid(job_id, artifact):
+                raise ValueError("stage artifact does not match its upstream contracts")
+            prepared = self._artifacts.prepare_model(job_id, stage, artifact)
             status = (
                 StageStatus.PAUSED if stage == StageName.CONFIRM_ROLES else StageStatus.COMPLETED
             )
-            self._repository.set_stage(
-                job_id,
-                stage,
-                status,
-                path.name,
-                cache_key=artifact.cache_key,
-            )
+            try:
+                published = self._repository.publish_claimed_stage(
+                    claim,
+                    status=status,
+                    artifact_path=prepared.target.name,
+                    cache_key=artifact.cache_key,
+                    artifact_hash=prepared.content_hash,
+                    role_confirmed=False,
+                    publish=prepared.publish,
+                )
+            finally:
+                prepared.discard()
+            if not published:
+                return False
             self._log(job_id, stage, status.value, started)
             return True
         except (
@@ -432,21 +755,17 @@ class PipelineRunner:
             ValueError,
         ) as error:
             public = self._public_failure(stage, error)
-            self._repository.set_stage(
-                job_id,
-                stage,
-                StageStatus.FAILED,
-                error={"code": public.code, "message": public.message},
+            self._repository.fail_claimed_stage(
+                claim,
+                {"code": public.code, "message": public.message},
             )
             self._log(job_id, stage, "failed", started, public.code)
             return False
         except Exception as error:
             error_class = type(error).__name__
-            self._repository.set_stage(
-                job_id,
-                stage,
-                StageStatus.FAILED,
-                error={
+            self._repository.fail_claimed_stage(
+                claim,
+                {
                     "code": error_class,
                     "message": "An unexpected pipeline error occurred.",
                 },
@@ -481,9 +800,12 @@ class PipelineRunner:
                     return job
                 self._invalidate_from(job_id, stage)
                 status = StageStatus.PENDING.value
-            if status in {StageStatus.RUNNING.value, StageStatus.FAILED.value}:
+            if status == StageStatus.FAILED.value:
                 return self._repository.get_job(job_id)
-            if status != StageStatus.PENDING.value:
+            if status not in {
+                StageStatus.PENDING.value,
+                StageStatus.RUNNING.value,
+            }:
                 self._invalidate_from(job_id, stage)
             if not self._execute_stage(job_id, stage):
                 return self._repository.get_job(job_id)
@@ -517,12 +839,29 @@ class PipelineRunner:
                 row,
                 require_confirmed_role=False,
             ):
+                if row.get("status") == StageStatus.PAUSED.value:
+                    raise PipelineValidationError(
+                        "invalid_role_candidate",
+                        "The paused role candidate no longer matches transcription.",
+                    )
                 raise PipelineStateError(
                     "role_confirmation_not_ready",
                     "Role confirmation is available only while the role stage is paused.",
                 )
             candidate = self._read(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
-            observed = {utterance.speaker_id for utterance in candidate.utterances}
+            transcribe_row = _stage_rows(job)[StageName.TRANSCRIBE.value]
+            if not self._completed_artifact_is_valid(
+                job_id,
+                StageName.TRANSCRIBE,
+                transcribe_row,
+                require_confirmed_role=False,
+            ):
+                raise PipelineValidationError(
+                    "invalid_role_candidate",
+                    "The paused role candidate no longer matches transcription.",
+                )
+            transcribed = self._read(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
+            observed = {utterance.speaker_id for utterance in transcribed.utterances}
             try:
                 normalized_mapping = {
                     speaker_id: value if isinstance(value, Role) else Role(value)
@@ -539,33 +878,62 @@ class PipelineRunner:
                     "invalid_role_mapping",
                     "Map exactly the two observed speakers to one customer and one agent.",
                 )
-            confirmed = candidate.model_copy(
-                update={
-                    "utterances": [
-                        utterance.model_copy(
-                            update={"role": normalized_mapping[utterance.speaker_id]},
-                            deep=True,
-                        )
-                        for utterance in candidate.utterances
-                    ],
-                    "confirmed": True,
-                    "mapping": normalized_mapping,
-                },
-                deep=True,
+            confirmed_utterances = [
+                Utterance.model_validate(
+                    {
+                        **utterance.model_dump(mode="python"),
+                        "role": normalized_mapping[utterance.speaker_id],
+                    }
+                )
+                for utterance in transcribed.utterances
+            ]
+            confirmed = RoleArtifact(
+                cache_key=candidate.cache_key,
+                upstream_hashes=candidate.upstream_hashes,
+                provider=None,
+                utterances=confirmed_utterances,
+                suggestion=suggest_roles(transcribed.utterances),
+                confirmed=True,
+                mapping=normalized_mapping,
             )
             cache_key, upstream_hashes = self._cache_key(job_id, StageName.CONFIRM_ROLES, confirmed)
-            confirmed = confirmed.model_copy(
-                update={"cache_key": cache_key, "upstream_hashes": upstream_hashes},
-                deep=True,
+            confirmed = RoleArtifact.model_validate(
+                {
+                    **confirmed.model_dump(mode="python"),
+                    "cache_key": cache_key,
+                    "upstream_hashes": upstream_hashes,
+                }
             )
-            path = self._artifacts.write_model(job_id, StageName.CONFIRM_ROLES, confirmed)
-            self._repository.set_stage(
-                job_id,
-                StageName.CONFIRM_ROLES,
-                StageStatus.COMPLETED,
-                path.name,
-                cache_key=cache_key,
-            )
+            prepared = self._artifacts.prepare_model(job_id, StageName.CONFIRM_ROLES, confirmed)
+            generation = row.get("generation")
+            candidate_hash = row.get("artifact_hash")
+            if (
+                isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or not isinstance(candidate_hash, str)
+            ):
+                prepared.discard()
+                raise PipelineValidationError(
+                    "invalid_role_candidate",
+                    "The paused role candidate metadata is invalid.",
+                )
+            try:
+                published = self._repository.publish_role_confirmation(
+                    job_id,
+                    expected_generation=generation,
+                    expected_candidate_hash=candidate_hash,
+                    artifact_path=prepared.target.name,
+                    cache_key=cache_key,
+                    artifact_hash=prepared.content_hash,
+                    publish=prepared.publish,
+                )
+            finally:
+                prepared.discard()
+            if not published:
+                raise PipelineStateError(
+                    "stale_role_candidate",
+                    "Role confirmation raced with newer pipeline work.",
+                )
             return self._run_locked(job_id)
 
     def retry(self, job_id: str, stage: StageName) -> dict[str, object]:

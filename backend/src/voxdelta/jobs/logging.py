@@ -17,10 +17,34 @@ import orjson
 
 from voxdelta.jobs.artifacts import ArtifactStore
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
+
 _REDACTED = "[REDACTED]"
 _UNSERIALIZABLE = "[UNSERIALIZABLE]"
 _SENSITIVE_KEY_PARTS = ("key", "token", "authorization", "transcript", "payload")
 _SAFE_NAME = re.compile(r"[^a-z0-9_-]+")
+_PATH_LOCKS: dict[Path, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.Lock:
+    """Return a process-wide fallback lock; POSIX also takes an OS flock."""
+
+    resolved = path.resolve()
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(resolved, threading.Lock())
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("pipeline log write made no progress")
+        remaining = remaining[written:]
 
 
 def redact(value: object) -> Any:
@@ -50,7 +74,6 @@ class PipelineLogger:
 
     def __init__(self, artifacts: ArtifactStore) -> None:
         self._artifacts = artifacts
-        self._lock = threading.Lock()
 
     def event(
         self,
@@ -81,12 +104,16 @@ class PipelineLogger:
         target = self._artifacts.job_dir(job_id) / "pipeline.jsonl"
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        with self._lock:
+        with _path_lock(target):
             descriptor = os.open(target, flags, 0o600)
             try:
                 os.fchmod(descriptor, 0o600)
-                os.write(descriptor, encoded)
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                _write_all(descriptor, encoded)
             finally:
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
 
     def diagnostic(

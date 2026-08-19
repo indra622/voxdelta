@@ -70,6 +70,43 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
+class PreparedArtifact:
+    """A durable temporary artifact that is harmless until its fenced publish."""
+
+    def __init__(
+        self,
+        store: ArtifactStore,
+        job_id: str,
+        target: Path,
+        temporary: Path,
+        content_hash: str,
+    ) -> None:
+        self._store = store
+        self._job_id = job_id
+        self.target = target
+        self.temporary = temporary
+        self.content_hash = content_hash
+        self._published = False
+
+    def publish(self) -> None:
+        """Atomically replace the target after revalidating its job directory."""
+
+        directory = self._store._job_path(  # noqa: SLF001 - paired capability type
+            self._job_id, create=False, require_directory=True
+        )
+        if directory != self.target.parent or self.temporary.parent != directory:
+            raise ValueError("prepared artifact directory changed before publication")
+        os.replace(self.temporary, self.target)
+        _fsync_directory(directory)
+        self._published = True
+
+    def discard(self) -> None:
+        """Remove an unpublished temporary artifact."""
+
+        if not self._published:
+            self.temporary.unlink(missing_ok=True)
+
+
 class ArtifactStore:
     """Store one versioned JSON artifact per pipeline stage and job."""
 
@@ -112,9 +149,20 @@ class ArtifactStore:
     def write_model(self, job_id: str, stage: StageName, value: BaseModel) -> Path:
         """Atomically persist a model without dropping its version fields."""
 
+        prepared = self.prepare_model(job_id, stage, value)
+        try:
+            prepared.publish()
+        finally:
+            prepared.discard()
+        return prepared.target
+
+    def prepare_model(self, job_id: str, stage: StageName, value: BaseModel) -> PreparedArtifact:
+        """Validate and durably stage a model without replacing the fixed artifact."""
+
         directory = self.job_dir(job_id)
         target = directory / f"{stage.value}.v1.json"
-        payload = orjson.dumps(value.model_dump(mode="json"), option=orjson.OPT_INDENT_2)
+        validated = type(value).model_validate(value.model_dump(mode="python"))
+        payload = orjson.dumps(validated.model_dump(mode="json"), option=orjson.OPT_INDENT_2)
         descriptor, temporary_name = tempfile.mkstemp(
             dir=target.parent,
             prefix=f".{target.name}.",
@@ -126,14 +174,16 @@ class ArtifactStore:
                 file.write(payload)
                 file.flush()
                 os.fsync(file.fileno())
-            if self._job_path(job_id, create=False, require_directory=True) != directory:
-                raise ValueError("job directory changed while the artifact was being written")
-            os.replace(temporary, target)
-            _fsync_directory(directory)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
-        return target
+        return PreparedArtifact(
+            self,
+            job_id,
+            target,
+            temporary,
+            hashlib.sha256(payload).hexdigest(),
+        )
 
     def artifact_path(self, job_id: str, stage: StageName) -> Path:
         """Return the exact path reserved for one validated stage artifact."""

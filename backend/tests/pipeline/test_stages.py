@@ -18,7 +18,7 @@ def test_stage_order_and_downstream_are_exact() -> None:
     )
 
 
-def test_cache_key_is_canonical_and_excludes_secret_values() -> None:
+def test_cache_key_is_canonical_and_noncredential_key_names_affect_identity() -> None:
     provider = ProviderProvenance(name="fake", model="v1", remote=False)
     first = cache_key_for_stage(
         StageName.EMOTION,
@@ -27,7 +27,8 @@ def test_cache_key_is_canonical_and_excludes_secret_values() -> None:
         {
             "threshold": 0.55,
             "nested": {"z": 1, "a": 2},
-            "apiToken": "first-secret",
+            "monkey_count": 1,
+            "tokenizer": "first",
         },
     )
     second = cache_key_for_stage(
@@ -37,7 +38,8 @@ def test_cache_key_is_canonical_and_excludes_secret_values() -> None:
         {
             "nested": {"a": 2, "z": 1},
             "threshold": 0.55,
-            "apiToken": "different-secret",
+            "monkey_count": 1,
+            "tokenizer": "first",
         },
     )
 
@@ -55,6 +57,35 @@ def test_cache_key_is_canonical_and_excludes_secret_values() -> None:
         provider.model_copy(update={"model": "v2"}),
         {"nested": {"a": 2, "z": 1}, "threshold": 0.55},
     )
+    assert first != cache_key_for_stage(
+        StageName.EMOTION,
+        ("a" * 64, "b" * 64),
+        provider,
+        {
+            "nested": {"a": 2, "z": 1},
+            "threshold": 0.55,
+            "monkey_count": 2,
+            "tokenizer": "second",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "credential_field",
+    ["api_key", "gemini_api_key", "access_token", "refresh_token", "Authorization"],
+)
+def test_cache_key_rejects_credential_bearing_configuration(
+    credential_field: str,
+) -> None:
+    with pytest.raises(ValueError, match="credential-bearing") as raised:
+        cache_key_for_stage(
+            StageName.EMOTION,
+            ("a" * 64,),
+            None,
+            {"nested": {credential_field: "do-not-hash-this-secret"}},
+        )
+
+    assert "do-not-hash-this-secret" not in str(raised.value)
 
 
 def test_cache_key_rejects_non_sha256_upstream_identifiers() -> None:

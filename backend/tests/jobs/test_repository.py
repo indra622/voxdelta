@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -93,19 +95,129 @@ def test_repository_migrates_cache_key_for_an_existing_database(tmp_path: Path) 
 
     with sqlite3.connect(database) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(stages)")}
-    assert "cache_key" in columns
+    assert {
+        "cache_key",
+        "generation",
+        "claim_token",
+        "claimed_at",
+        "artifact_hash",
+        "role_confirmed",
+    } <= columns
+
+
+def test_concurrent_repository_initialization_serializes_old_schema_migration(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "voxdelta.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE jobs (
+              id TEXT PRIMARY KEY, source_name TEXT NOT NULL, status TEXT NOT NULL,
+              diagnostic_capture INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE stages (
+              job_id TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+              artifact_path TEXT, error_json TEXT,
+              PRIMARY KEY (job_id, stage)
+            );
+            """
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        repositories = list(executor.map(lambda _: JobRepository(database), range(16)))
+
+    assert len(repositories) == 16
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(stages)")}
+    assert {"generation", "claim_token", "artifact_hash", "role_confirmed"} <= columns
+
+
+def test_claim_stage_does_not_steal_a_live_claim_and_recovers_an_expired_claim(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 8, 19, tzinfo=UTC)
+
+    def clock() -> datetime:
+        return now
+
+    repository = JobRepository(
+        tmp_path / "voxdelta.sqlite3",
+        clock=clock,
+        claim_lease_seconds=30,
+    )
+    job_id = repository.create_job("sample.wav")
+
+    first = repository.claim_stage(job_id, StageName.NORMALIZE)
+    assert first is not None
+    assert first.generation == 0
+    assert repository.claim_stage(job_id, StageName.NORMALIZE) is None
+
+    now += timedelta(seconds=29)
+    assert repository.claim_stage(job_id, StageName.NORMALIZE) is None
+
+    now += timedelta(seconds=2)
+    recovered = repository.claim_stage(job_id, StageName.NORMALIZE)
+    assert recovered is not None
+    assert recovered.generation == first.generation + 1
+    assert recovered.token != first.token
+
+
+def test_stale_claim_cannot_publish_or_change_current_stage_state(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 19, tzinfo=UTC)
+    repository = JobRepository(
+        tmp_path / "voxdelta.sqlite3",
+        clock=lambda: now,
+        claim_lease_seconds=10,
+    )
+    job_id = repository.create_job("sample.wav")
+    stale = repository.claim_stage(job_id, StageName.NORMALIZE)
+    assert stale is not None
+    now += timedelta(seconds=11)
+    current = repository.claim_stage(job_id, StageName.NORMALIZE)
+    assert current is not None
+    publish_calls: list[str] = []
+
+    published = repository.publish_claimed_stage(
+        stale,
+        status=StageStatus.COMPLETED,
+        artifact_path="normalize.v1.json",
+        cache_key="a" * 64,
+        artifact_hash="b" * 64,
+        role_confirmed=False,
+        publish=lambda: publish_calls.append("published"),
+    )
+
+    assert published is False
+    assert publish_calls == []
+    row = repository.get_job(job_id)["stages"]["normalize"]
+    assert row["status"] == "running"
+    assert row["generation"] == current.generation
+    assert row["claim_token"] == current.token
 
 
 def test_invalidate_stages_resets_exact_rows_and_job_status_atomically(tmp_path: Path) -> None:
     repository = JobRepository(tmp_path / "voxdelta.sqlite3")
     job_id = repository.create_job("sample.wav")
     for stage in StageName:
+        if stage == StageName.CONFIRM_ROLES:
+            continue
         repository.set_stage(
             job_id,
             stage,
             StageStatus.COMPLETED,
             f"{stage.value}.v1.json",
             cache_key=stage.value * 8,
+        )
+    with sqlite3.connect(repository.path) as database:
+        database.execute(
+            """
+            UPDATE stages SET status = 'completed', artifact_path = 'confirm_roles.v1.json',
+                cache_key = ?, role_confirmed = 1
+            WHERE job_id = ? AND stage = 'confirm_roles'
+            """,
+            (StageName.CONFIRM_ROLES.value * 8, job_id),
         )
 
     repository.invalidate_stages(
