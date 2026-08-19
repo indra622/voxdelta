@@ -55,6 +55,7 @@ from voxdelta.pipeline.stages import (
 )
 from voxdelta.providers.base import (
     DiarizationProvider,
+    DiarizationTimelineProvider,
     EmotionProvider,
     ReportSummaryProvider,
     ResponseStrategyProvider,
@@ -407,14 +408,30 @@ class PipelineRunner:
                 artifact.segments,
                 key=lambda item: (item.start, item.end, item.speaker_id),
             )
+            ordered_alignment = sorted(
+                artifact.alignment_segments,
+                key=lambda item: (item.start, item.end, item.speaker_id),
+            )
             return (
                 bool(artifact.segments)
                 and artifact.segments == ordered_segments
                 and len({item.speaker_id for item in artifact.segments}) == 2
+                and bool(artifact.alignment_segments)
+                and artifact.alignment_segments == ordered_alignment
+                and len({item.speaker_id for item in artifact.alignment_segments}) == 2
+                and all(not item.overlap for item in artifact.alignment_segments)
+                and all(
+                    previous.end <= current.start
+                    for previous, current in zip(
+                        artifact.alignment_segments,
+                        artifact.alignment_segments[1:],
+                        strict=False,
+                    )
+                )
             )
         if isinstance(artifact, TranscribeArtifact):
             diarized = self._read(job_id, StageName.DIARIZE, DiarizeArtifact)
-            if len(artifact.utterances) != len(diarized.segments):
+            if len(artifact.utterances) != len(diarized.alignment_segments):
                 return False
             if len({item.id for item in artifact.utterances}) != len(artifact.utterances):
                 return False
@@ -434,7 +451,9 @@ class PipelineRunner:
                     segment.overlap,
                     segment.confidence,
                 )
-                for utterance, segment in zip(artifact.utterances, diarized.segments, strict=True)
+                for utterance, segment in zip(
+                    artifact.utterances, diarized.alignment_segments, strict=True
+                )
             )
         if isinstance(artifact, RoleArtifact):
             transcribed = self._read(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
@@ -674,7 +693,13 @@ class PipelineRunner:
                 "request",
                 {"duration_seconds": normalized.asset.duration_seconds},
             )
-            segments = self._diarization.diarize(normalized.asset)
+            if isinstance(self._diarization, DiarizationTimelineProvider):
+                timelines = self._diarization.diarize_timelines(normalized.asset)
+                segments = timelines.evidence
+                alignment_segments = timelines.exclusive
+            else:
+                segments = self._diarization.diarize(normalized.asset)
+                alignment_segments = list(segments)
             self._diagnostic(
                 job_id,
                 stage,
@@ -686,6 +711,7 @@ class PipelineRunner:
                 upstream_hashes=upstream_hashes,
                 provider=provider,
                 segments=segments,
+                alignment_segments=alignment_segments,
             )
         if stage == StageName.TRANSCRIBE:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
@@ -694,9 +720,11 @@ class PipelineRunner:
                 job_id,
                 stage,
                 "request",
-                {"segment_count": len(diarized.segments)},
+                {"segment_count": len(diarized.alignment_segments)},
             )
-            utterances = self._transcription.transcribe(normalized.asset, diarized.segments)
+            utterances = self._transcription.transcribe(
+                normalized.asset, diarized.alignment_segments
+            )
             self._diagnostic(
                 job_id,
                 stage,
@@ -1128,6 +1156,7 @@ class PipelineRunner:
                             "model": provider.model,
                             "remote": provider.remote,
                             "schema_version": provider.schema_version,
+                            "revision": provider.revision,
                         }
                         if provider is not None
                         else None

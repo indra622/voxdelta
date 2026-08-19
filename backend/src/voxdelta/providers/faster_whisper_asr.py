@@ -7,6 +7,11 @@ from importlib import import_module
 from typing import Literal, Protocol, cast
 
 from voxdelta.domain.models import AudioAsset, ProviderProvenance, SpeakerSegment, Utterance
+from voxdelta.providers._asr_runtime import (
+    activate_candidate,
+    prepare_candidate_load,
+    release_candidate,
+)
 from voxdelta.providers.asr_alignment import (
     LOCAL_ASR_INFERENCE_LOCK,
     AlignedWord,
@@ -80,7 +85,9 @@ class FasterWhisperProvider:
     ) -> None:
         if model_id != MODEL_ID or device not in {"cpu", "cuda"}:
             raise ProviderError("provider_unavailable")
-        self.provenance = ProviderProvenance(name="faster-whisper", model=MODEL_ID, remote=False)
+        self.provenance = ProviderProvenance(
+            name="faster-whisper", model=MODEL_ID, remote=False, revision=MODEL_ID
+        )
         self._device = device
         self._compute_type = "float16" if device == "cuda" else "int8"
         self._factory = model_factory or _default_factory
@@ -90,17 +97,33 @@ class FasterWhisperProvider:
     def _load(self) -> _WhisperModel:
         if self._model is not None:
             return self._model
+        prepare_candidate_load(self)
         try:
-            self._model = self._factory(
-                MODEL_ID, device=self._device, compute_type=self._compute_type
-            )
+            model = self._factory(MODEL_ID, device=self._device, compute_type=self._compute_type)
         except ProviderError:
             raise
         except TimeoutError:
             raise ProviderError("provider_timeout") from None
         except Exception:
             raise ProviderError("provider_unavailable") from None
+        self._model = model
+        activate_candidate(self, self._release)
         return self._model
+
+    def _release(self) -> None:
+        model = self._model
+        self._model = None
+        close = getattr(model, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def unload(self) -> None:
+        with LOCAL_ASR_INFERENCE_LOCK:
+            self._release()
+            release_candidate(self)
 
     def _transcribe_path(self, path: str, duration: float) -> list[AlignedWord]:
         try:

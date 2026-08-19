@@ -23,6 +23,7 @@ from voxdelta.evaluation.emotion_training import (
 )
 from voxdelta.evaluation.manifest import read_trusted_regular_file
 from voxdelta.providers.base import ProviderError, ProviderErrorCode
+from voxdelta.providers.checkpoints import checkpoint_tree_digest
 
 Device = Literal["auto", "cpu", "cuda", "mps"]
 Architecture = Literal["wav2vec-xls-r", "emotion2vec-plus"]
@@ -43,6 +44,7 @@ class CheckpointInfo:
     encoder_revision: str | None
     encoder_hash: str | None
     freeze_encoder: bool | None
+    digest: str
 
 
 def activate_candidate(owner: object, unload: Callable[[], None]) -> None:
@@ -132,7 +134,7 @@ def validate_checkpoint(
         config = _load_strict_json(resolved / "config.json")
         mapping = _load_strict_json(resolved / "label_mapping.json")
         metrics = _load_strict_json(resolved / "metrics.json")
-        weights = read_trusted_regular_file(resolved / "model.safetensors")
+        weights_metadata = (resolved / "model.safetensors").stat(follow_symlinks=False)
         expected_mapping = {str(index): label for index, label in enumerate(CANONICAL_LABELS)}
         expected_config_keys = {"schema_version", "architecture", "model_id", "labels"}
         if architecture == "emotion2vec-plus":
@@ -168,7 +170,7 @@ def validate_checkpoint(
                     or not 0 <= metrics["expected_calibration_error"] <= 1
                 )
             )
-            or not weights
+            or weights_metadata.st_size <= 0
         ):
             raise ValueError
         encoder_revision: str | None = None
@@ -197,6 +199,7 @@ def validate_checkpoint(
             encoder_revision,
             encoder_hash,
             freeze_encoder,
+            checkpoint_tree_digest(resolved),
         )
     except Exception:
         raise ProviderError("invalid_local_checkpoint") from None

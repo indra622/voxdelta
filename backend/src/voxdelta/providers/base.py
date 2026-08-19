@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
@@ -48,11 +49,26 @@ class ProviderError(RuntimeError):
         super().__init__(_PROVIDER_ERROR_MESSAGES[code])
 
 
+@dataclass(frozen=True, slots=True)
+class DiarizationTimelines:
+    """Overlap-aware evidence and a non-overlapping alignment timeline."""
+
+    evidence: list[SpeakerSegment]
+    exclusive: list[SpeakerSegment]
+
+
 @runtime_checkable
 class DiarizationProvider(Protocol):
     provenance: ProviderProvenance
 
     def diarize(self, asset: AudioAsset) -> list[SpeakerSegment]: ...
+
+
+@runtime_checkable
+class DiarizationTimelineProvider(Protocol):
+    provenance: ProviderProvenance
+
+    def diarize_timelines(self, asset: AudioAsset) -> DiarizationTimelines: ...
 
 
 @runtime_checkable

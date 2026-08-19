@@ -13,7 +13,8 @@ from pydantic import SecretStr
 
 from voxdelta.credentials import Credentials
 from voxdelta.domain.models import AudioAsset, ProviderProvenance, SpeakerSegment
-from voxdelta.providers.base import ProviderError, ProviderErrorCode
+from voxdelta.providers.base import DiarizationTimelines, ProviderError, ProviderErrorCode
+from voxdelta.providers.checkpoints import checkpoint_tree_digest
 
 COMMUNITY_MODEL_ID = "pyannote/speaker-diarization-community-1"
 
@@ -49,14 +50,6 @@ class _TelemetryDisabledPipeline:
         return self._pipeline(audio_path, **kwargs)
 
 
-@dataclass(frozen=True, slots=True)
-class DiarizationTimelines:
-    """Overlap evidence plus a transcript-alignment timeline from one inference."""
-
-    evidence: list[SpeakerSegment]
-    exclusive: list[SpeakerSegment]
-
-
 @dataclass(frozen=True, slots=True, order=True)
 class _Turn:
     start: float
@@ -76,7 +69,7 @@ def _default_pipeline_factory(model: str, *, token: str | None) -> _Pipeline:
     return _TelemetryDisabledPipeline(pipeline, set_telemetry_metrics)
 
 
-def _local_checkpoint(model_path: Path) -> tuple[str, str]:
+def _local_checkpoint(model_path: Path) -> tuple[str, str, str]:
     try:
         if model_path.is_symlink():
             raise ProviderError("invalid_local_checkpoint")
@@ -96,7 +89,12 @@ def _local_checkpoint(model_path: Path) -> tuple[str, str]:
         raise ProviderError("invalid_local_checkpoint") from None
     if not model_name:
         raise ProviderError("invalid_local_checkpoint")
-    return str(resolved), model_name
+    digest_root = resolved if resolved.is_dir() else resolved.parent
+    try:
+        digest = checkpoint_tree_digest(digest_root)
+    except ValueError:
+        raise ProviderError("invalid_local_checkpoint") from None
+    return str(resolved), model_name, digest
 
 
 def _safe_provider_error(error: Exception) -> ProviderError:
@@ -343,9 +341,10 @@ class PyannoteDiarizationProvider(_PyannoteAdapter):
         if model_path is None:
             model_reference = COMMUNITY_MODEL_ID
             model_name = "speaker-diarization-community-1"
+            revision = "community-1"
             local_checkpoint = False
         else:
-            model_reference, model_name = _local_checkpoint(model_path)
+            model_reference, model_name, revision = _local_checkpoint(model_path)
             local_checkpoint = True
         super().__init__(
             credentials,
@@ -354,6 +353,7 @@ class PyannoteDiarizationProvider(_PyannoteAdapter):
                 name="pyannote",
                 model=model_name,
                 remote=False,
+                revision=revision,
             ),
             credential_name="huggingface",
             local_checkpoint=local_checkpoint,

@@ -22,6 +22,7 @@ from voxdelta.domain.models import (
 )
 from voxdelta.providers.base import (
     DiarizationProvider,
+    DiarizationTimelines,
     EmotionProvider,
     ReportSummaryProvider,
     ResponseStrategyProvider,
@@ -102,6 +103,10 @@ class FakeDiarizationProvider(DiarizationProvider):
                 )
             )
         return segments
+
+    def diarize_timelines(self, asset: AudioAsset) -> DiarizationTimelines:
+        segments = self.diarize(asset)
+        return DiarizationTimelines(evidence=segments, exclusive=list(segments))
 
 
 class FakeTranscriptionProvider(TranscriptionProvider):

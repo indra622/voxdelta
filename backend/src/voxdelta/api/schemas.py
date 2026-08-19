@@ -68,6 +68,7 @@ class PublicProvenance(StrictSchema):
     model: str
     remote: bool
     schema_version: str
+    revision: str | None = None
 
 
 class ProviderDisclosure(StrictSchema):

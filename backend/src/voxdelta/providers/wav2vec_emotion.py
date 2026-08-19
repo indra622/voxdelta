@@ -96,7 +96,10 @@ class Wav2VecEmotionProvider:
             checkpoint_path, architecture="wav2vec-xls-r", model_id=MODEL_ID
         )
         self.provenance = ProviderProvenance(
-            name="wav2vec-xls-r", model="wav2vec2-xls-r-300m-seven-emotion", remote=False
+            name="wav2vec-xls-r",
+            model="wav2vec2-xls-r-300m-seven-emotion",
+            remote=False,
+            revision=self._checkpoint.digest,
         )
         self._requested_device = device
         self._factory = model_factory or _default_factory

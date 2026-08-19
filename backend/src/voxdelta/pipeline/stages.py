@@ -90,12 +90,15 @@ def cache_key_for_stage(
         for value in upstream_hashes
     ):
         raise ValueError("upstream artifact hashes must be lowercase SHA-256 values")
+    provider_identity: dict[str, object] | None = None
+    if provider is not None:
+        provider_identity = {"name": provider.name, "model": provider.model}
+        if provider.revision is not None:
+            provider_identity["revision"] = provider.revision
     payload = {
         "stage": stage.value,
         "upstream_artifact_content_hashes": list(upstream_hashes),
-        "provider": (
-            {"name": provider.name, "model": provider.model} if provider is not None else None
-        ),
+        "provider": provider_identity,
         "config": _canonical_cache_value(config),
     }
     canonical = orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)
@@ -113,7 +116,7 @@ class StageArtifact(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1"] = SCHEMA_VERSION
+    schema_version: str = SCHEMA_VERSION
     cache_key: str = Field(pattern=_SHA256_PATTERN)
     upstream_hashes: tuple[str, ...] = ()
     provider: ProviderProvenance | None = None
@@ -138,6 +141,7 @@ class MediaReference(BaseModel):
 
 
 class NormalizeArtifact(StageArtifact):
+    schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.NORMALIZE] = StageName.NORMALIZE
     asset: AudioAsset
     normalized_media: tuple[MediaReference, ...]
@@ -159,16 +163,20 @@ class NormalizeArtifact(StageArtifact):
 
 
 class DiarizeArtifact(StageArtifact):
+    schema_version: Literal["2"] = "2"
     stage: Literal[StageName.DIARIZE] = StageName.DIARIZE
     segments: list[SpeakerSegment]
+    alignment_segments: list[SpeakerSegment]
 
 
 class TranscribeArtifact(StageArtifact):
+    schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.TRANSCRIBE] = StageName.TRANSCRIBE
     utterances: list[Utterance]
 
 
 class RoleArtifact(StageArtifact):
+    schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.CONFIRM_ROLES] = StageName.CONFIRM_ROLES
     utterances: list[Utterance]
     suggestion: dict[str, Role] | None = None
@@ -183,21 +191,25 @@ class RoleArtifact(StageArtifact):
 
 
 class EmotionArtifact(StageArtifact):
+    schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.EMOTION] = StageName.EMOTION
     results: list[EmotionResult]
 
 
 class StrategyArtifact(StageArtifact):
+    schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.RESPONSE_STRATEGY] = StageName.RESPONSE_STRATEGY
     results: list[ResponseStrategyResult]
 
 
 class TransitionsArtifact(StageArtifact):
+    schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.TRANSITIONS] = StageName.TRANSITIONS
     results: list[EmotionTransition]
 
 
 class ReportArtifact(StageArtifact):
+    schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.REPORT] = StageName.REPORT
     report: AnalysisReport
 

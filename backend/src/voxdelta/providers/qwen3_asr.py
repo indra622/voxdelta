@@ -7,6 +7,11 @@ from importlib import import_module
 from typing import Literal, Protocol, cast
 
 from voxdelta.domain.models import AudioAsset, ProviderProvenance, SpeakerSegment, Utterance
+from voxdelta.providers._asr_runtime import (
+    activate_candidate,
+    prepare_candidate_load,
+    release_candidate,
+)
 from voxdelta.providers.asr_alignment import (
     LOCAL_ASR_INFERENCE_LOCK,
     AlignedWord,
@@ -164,7 +169,10 @@ class Qwen3AsrProvider:
         if model_id is not None and model_id != selected_id:
             raise ProviderError("provider_unavailable")
         self.provenance = ProviderProvenance(
-            name="qwen3-asr", model=selected_id.removeprefix("Qwen/"), remote=False
+            name="qwen3-asr",
+            model=selected_id.removeprefix("Qwen/"),
+            remote=False,
+            revision=f"{selected_id}+{ALIGNER_MODEL_ID}",
         )
         self._model_id = selected_id
         self._requested_device = device
@@ -195,17 +203,24 @@ class Qwen3AsrProvider:
         if self._model is not None:
             return self._model
         device, dtype = self._select_runtime()
+        prepare_candidate_load(self)
         try:
-            self._model = self._model_factory(
+            model = self._model_factory(
                 self._model_id,
                 aligner_id=ALIGNER_MODEL_ID,
                 device=device,
                 dtype=dtype,
             )
         except ProviderError:
+            self._release()
+            release_candidate(self)
             raise
         except Exception as error:
+            self._release()
+            release_candidate(self)
             raise ProviderError(_runtime_code(error)) from None
+        self._model = model
+        activate_candidate(self, self._release)
         return self._model
 
     def _load_aligner(self) -> _Aligner:
@@ -215,10 +230,32 @@ class Qwen3AsrProvider:
         try:
             self._aligner = self._aligner_factory(ALIGNER_MODEL_ID, device=device, dtype=dtype)
         except ProviderError:
+            self._release()
+            release_candidate(self)
             raise
         except Exception as error:
+            self._release()
+            release_candidate(self)
             raise ProviderError(_runtime_code(error)) from None
         return self._aligner
+
+    def _release(self) -> None:
+        model = self._model
+        aligner = self._aligner
+        self._model = None
+        self._aligner = None
+        for candidate in (aligner, model):
+            close = getattr(candidate, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    def unload(self) -> None:
+        with LOCAL_ASR_INFERENCE_LOCK:
+            self._release()
+            release_candidate(self)
 
     def _transcribe_path(self, path: str, duration: float) -> list[AlignedWord]:
         try:

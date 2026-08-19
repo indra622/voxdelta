@@ -31,6 +31,7 @@ from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.repository import JobRepository
 from voxdelta.pipeline.runner import PipelineRunner, PipelineStateError, PipelineValidationError
 from voxdelta.pipeline.stages import (
+    DiarizeArtifact,
     EmotionArtifact,
     MediaReference,
     NormalizeArtifact,
@@ -40,6 +41,7 @@ from voxdelta.pipeline.stages import (
     TransitionsArtifact,
     cache_key_for_stage,
 )
+from voxdelta.providers.base import DiarizationTimelines
 from voxdelta.providers.fake import (
     FakeDiarizationProvider,
     FakeEmotionProvider,
@@ -130,6 +132,34 @@ class ReversedDiarizer(FakeDiarizationProvider):
 class ReversedTranscription(FakeTranscriptionProvider):
     def transcribe(self, asset: AudioAsset, segments: list[SpeakerSegment]) -> list[Utterance]:
         return list(reversed(super().transcribe(asset, segments)))
+
+
+class EvidenceDiarizer(FakeDiarizationProvider):
+    def __init__(self) -> None:
+        self.timeline_calls = 0
+        self.legacy_calls = 0
+
+    def diarize(self, asset: AudioAsset) -> list[SpeakerSegment]:
+        self.legacy_calls += 1
+        return super().diarize(asset)
+
+    def diarize_timelines(self, asset: AudioAsset) -> DiarizationTimelines:
+        self.timeline_calls += 1
+        exclusive = FakeDiarizationProvider.diarize(self, asset)
+        evidence = [
+            segment.model_copy(update={"overlap": index in {0, 1}})
+            for index, segment in enumerate(exclusive)
+        ]
+        return DiarizationTimelines(evidence=evidence, exclusive=exclusive)
+
+
+class CapturingTranscription(FakeTranscriptionProvider):
+    def __init__(self) -> None:
+        self.segments: list[SpeakerSegment] = []
+
+    def transcribe(self, asset: AudioAsset, segments: list[SpeakerSegment]) -> list[Utterance]:
+        self.segments = list(segments)
+        return super().transcribe(asset, segments)
 
 
 class WrongIdEmotion(FakeEmotionProvider):
@@ -328,9 +358,29 @@ def test_seeded_fake_pipeline_pauses_then_finishes_with_aligned_outputs(tmp_path
     assert report.report.transitions == transitions.results
     for stage in StageName:
         raw = json.loads(store.artifact_path(job_id, stage).read_bytes())
-        assert raw["schema_version"] == "1"
+        assert raw["schema_version"] == ("2" if stage == StageName.DIARIZE else "1")
         assert len(raw["cache_key"]) == 64
         assert "provider" in raw
+
+
+def test_pipeline_persists_overlap_evidence_but_transcribes_exclusive_timeline(
+    tmp_path: Path,
+) -> None:
+    diarizer = EvidenceDiarizer()
+    transcription = CapturingTranscription()
+    runner, _repository, store, job_id = _harness(
+        tmp_path, diarizer=diarizer, transcription=transcription
+    )
+
+    paused = runner.run_until_pause(job_id)
+
+    assert paused["status"] == "paused"
+    artifact = store.read_model(job_id, StageName.DIARIZE, DiarizeArtifact)
+    assert diarizer.timeline_calls == 1
+    assert diarizer.legacy_calls == 0
+    assert any(segment.overlap for segment in artifact.segments)
+    assert all(not segment.overlap for segment in artifact.alignment_segments)
+    assert transcription.segments == artifact.alignment_segments
 
 
 def test_emotion_provider_receives_distinct_aligned_temporary_customer_clips(

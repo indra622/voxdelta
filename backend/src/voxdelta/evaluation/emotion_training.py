@@ -22,7 +22,11 @@ from typing import Any, Literal, Protocol, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from voxdelta.domain.models import EmotionLabel
-from voxdelta.evaluation.manifest import load_manifest, read_trusted_regular_file
+from voxdelta.evaluation.manifest import (
+    load_manifest,
+    read_trusted_regular_file,
+    validate_disjoint_splits,
+)
 
 SAMPLE_RATE = 16_000
 MIN_SAMPLES = SAMPLE_RATE // 2
@@ -624,6 +628,7 @@ def load_training_examples(manifest_path: str | Path) -> tuple[TrainingExample, 
 
     try:
         items = load_manifest(manifest_path)
+        validate_disjoint_splits(items)
         examples: list[TrainingExample] = []
         for item in items:
             if item.source != "emotion" or item.emotion is None:

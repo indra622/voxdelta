@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, ValidationError, model_validator
 
 from voxdelta.domain.models import EmotionLabel
 
 DatasetSplit = Literal["train", "validation", "test"]
 DatasetSource = Literal["consultation", "emotion"]
+
+
+def _reject_json_constant(_value: str) -> None:
+    raise ValueError
 
 
 class DatasetItem(BaseModel):
@@ -29,9 +34,20 @@ class DatasetItem(BaseModel):
     split: DatasetSplit
     source: DatasetSource
     emotion: EmotionLabel | None = None
-    start: float | None = None
-    end: float | None = None
+    start: StrictFloat | None = Field(default=None, ge=0)
+    end: StrictFloat | None = Field(default=None, ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def valid_interval(self) -> DatasetItem:
+        if (self.start is None) != (self.end is None):
+            raise ValueError("start and end must both be present or absent")
+        if self.start is not None and self.end is not None:
+            if not math.isfinite(self.start) or not math.isfinite(self.end):
+                raise ValueError("start and end must be finite")
+            if self.end <= self.start:
+                raise ValueError("end must be greater than start")
+        return self
 
 
 def _absolute_path(path: str | Path) -> Path:
@@ -92,8 +108,8 @@ def load_manifest(path: str | Path) -> list[DatasetItem]:
         if not line.strip():
             continue
         try:
-            payload = json.loads(line)
-        except json.JSONDecodeError as error:
+            payload = json.loads(line, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as error:
             raise ValueError(f"invalid JSON on manifest line {line_number}") from error
         try:
             items.append(DatasetItem.model_validate(payload))

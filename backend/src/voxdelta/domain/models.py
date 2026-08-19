@@ -6,7 +6,7 @@ from enum import StrEnum
 from math import isfinite
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 EmotionLabel = Literal["happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise"]
 OperationalState = Literal["satisfied", "stable", "dissatisfied", "escalated", "uncertain"]
@@ -46,6 +46,18 @@ class ProviderProvenance(BaseModel):
     transmits: tuple[Literal["audio", "text", "features"], ...] = ()
     retention_policy_url: str | None = None
     schema_version: str = "1"
+    revision: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @field_validator("revision")
+    @classmethod
+    def safe_revision(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if any(ord(character) < 0x21 or ord(character) > 0x7E for character in value):
+            raise ValueError("revision must contain visible ASCII")
+        if value.startswith(("/", "\\")) or "\\" in value or ".." in value.split("/"):
+            raise ValueError("revision must not be a filesystem path")
+        return value
 
 
 class ProviderUsage(BaseModel):

@@ -170,6 +170,7 @@ class Emotion2VecEmotionProvider:
             name="emotion2vec-plus",
             model="emotion2vec-plus-large-seven-emotion@v2.0.4",
             remote=False,
+            revision=self._checkpoint.digest,
         )
         self._requested_device = device
         self._factory = model_factory or _default_factory

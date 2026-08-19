@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +28,14 @@ class Settings(BaseSettings):
     admission_reconciliation_lease_seconds: int = Field(default=300, gt=0)
     max_active_jobs: int = Field(default=8, gt=0)
     api_capability_token: SecretStr | None = None
+    diarization_provider: Literal["fake", "pyannote-community"] = "fake"
+    asr_provider: Literal["fake", "faster-whisper", "qwen3"] = "fake"
+    emotion_provider: Literal["fake", "wav2vec", "emotion2vec"] = "fake"
+    pyannote_checkpoint_path: Path | None = None
+    emotion_checkpoint_path: Path | None = None
+    asr_device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
+    qwen_profile: Literal["default", "low-memory"] = "default"
+    emotion_device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
 
     model_config = SettingsConfigDict(env_prefix="VOXDELTA_", extra="ignore")
 

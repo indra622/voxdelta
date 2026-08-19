@@ -29,6 +29,7 @@ class PyannotePrecisionProvider(_PyannoteAdapter):
                 remote=True,
                 transmits=("audio",),
                 retention_policy_url=retention_policy_url,
+                revision="precision-2",
             ),
             credential_name="pyannoteai",
             local_checkpoint=False,
