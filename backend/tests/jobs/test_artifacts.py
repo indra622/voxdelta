@@ -44,6 +44,21 @@ def test_artifact_round_trip_retains_model_schema_version(tmp_path: Path) -> Non
     assert store.read_model("j1", StageName.REPORT, AnalysisReport) == report
 
 
+def test_stage_artifact_hash_and_exact_deletion_do_not_touch_audio(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "jobs")
+    report_path = store.write_model("j1", StageName.REPORT, analysis_report())
+    audio_generation = store.job_dir("j1") / "audio-generation" / "mixed.wav"
+    audio_generation.parent.mkdir()
+    audio_generation.write_bytes(b"normalized audio")
+
+    digest = store.content_hash("j1", StageName.REPORT)
+    store.delete_stage("j1", StageName.REPORT)
+
+    assert len(digest) == 64
+    assert not report_path.exists()
+    assert audio_generation.read_bytes() == b"normalized audio"
+
+
 def test_artifact_write_replaces_from_a_temporary_in_the_target_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

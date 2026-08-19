@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import os
 import shutil
 import stat
@@ -133,6 +134,30 @@ class ArtifactStore:
             temporary.unlink(missing_ok=True)
             raise
         return target
+
+    def artifact_path(self, job_id: str, stage: StageName) -> Path:
+        """Return the exact path reserved for one validated stage artifact."""
+
+        if not isinstance(stage, StageName):
+            raise KeyError(str(stage))
+        directory = self._job_path(job_id, create=False, require_directory=True)
+        return directory / f"{stage.value}.v1.json"
+
+    def content_hash(self, job_id: str, stage: StageName) -> str:
+        """Hash the exact persisted artifact bytes with SHA-256."""
+
+        digest = hashlib.sha256()
+        with self.artifact_path(job_id, stage).open("rb") as artifact:
+            while chunk := artifact.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def delete_stage(self, job_id: str, stage: StageName) -> None:
+        """Delete only one stage JSON, preserving audio and all other job files."""
+
+        path = self.artifact_path(job_id, stage)
+        path.unlink(missing_ok=True)
+        _fsync_directory(path.parent)
 
     def read_model(self, job_id: str, stage: StageName, model_type: type[T]) -> T:
         """Read and validate a versioned stage artifact."""

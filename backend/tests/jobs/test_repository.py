@@ -71,6 +71,81 @@ def test_set_stage_rejects_an_unknown_stage_value(tmp_path: Path) -> None:
         repository.set_stage(job_id, cast(StageName, "unknown"), StageStatus.RUNNING)
 
 
+def test_repository_migrates_cache_key_for_an_existing_database(tmp_path: Path) -> None:
+    database = tmp_path / "voxdelta.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE jobs (
+              id TEXT PRIMARY KEY, source_name TEXT NOT NULL, status TEXT NOT NULL,
+              diagnostic_capture INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE stages (
+              job_id TEXT NOT NULL, stage TEXT NOT NULL, status TEXT NOT NULL,
+              artifact_path TEXT, error_json TEXT,
+              PRIMARY KEY (job_id, stage)
+            );
+            """
+        )
+
+    JobRepository(database)
+
+    with sqlite3.connect(database) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(stages)")}
+    assert "cache_key" in columns
+
+
+def test_invalidate_stages_resets_exact_rows_and_job_status_atomically(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    job_id = repository.create_job("sample.wav")
+    for stage in StageName:
+        repository.set_stage(
+            job_id,
+            stage,
+            StageStatus.COMPLETED,
+            f"{stage.value}.v1.json",
+            cache_key=stage.value * 8,
+        )
+
+    repository.invalidate_stages(
+        job_id,
+        (
+            StageName.TRANSCRIBE,
+            StageName.CONFIRM_ROLES,
+            StageName.EMOTION,
+            StageName.RESPONSE_STRATEGY,
+            StageName.TRANSITIONS,
+            StageName.REPORT,
+        ),
+    )
+
+    job = repository.get_job(job_id)
+    assert job["status"] == "pending"
+    assert job["stages"]["normalize"]["status"] == "completed"
+    assert job["stages"]["diarize"]["status"] == "completed"
+    for stage in (
+        "transcribe",
+        "confirm_roles",
+        "emotion",
+        "response_strategy",
+        "transitions",
+        "report",
+    ):
+        row = job["stages"][stage]
+        assert row["status"] == "pending"
+        assert row["artifact_path"] is None
+        assert row["cache_key"] is None
+        assert row["error_json"] is None
+
+
+def test_invalidate_stages_rejects_unknown_job_without_partial_changes(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+
+    with pytest.raises(KeyError, match="missing"):
+        repository.invalidate_stages("missing", (StageName.REPORT,))
+
+
 def test_delete_job_cascades_to_stages_in_one_database_transaction(tmp_path: Path) -> None:
     database = tmp_path / "voxdelta.sqlite3"
     repository = JobRepository(database)

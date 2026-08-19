@@ -1,0 +1,131 @@
+"""Structured, redacted pipeline event and diagnostic persistence."""
+
+from __future__ import annotations
+
+import math
+import os
+import re
+import tempfile
+import threading
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import orjson
+
+from voxdelta.jobs.artifacts import ArtifactStore
+
+_REDACTED = "[REDACTED]"
+_UNSERIALIZABLE = "[UNSERIALIZABLE]"
+_SENSITIVE_KEY_PARTS = ("key", "token", "authorization", "transcript", "payload")
+_SAFE_NAME = re.compile(r"[^a-z0-9_-]+")
+
+
+def redact(value: object) -> Any:
+    """Return a recursively JSON-safe value with sensitive keyed values removed."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _UNSERIALIZABLE
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            folded = key.casefold()
+            result[key] = (
+                _REDACTED if any(part in folded for part in _SENSITIVE_KEY_PARTS) else redact(item)
+            )
+        return result
+    if isinstance(value, (list, tuple)):
+        return [redact(item) for item in value]
+    return _UNSERIALIZABLE
+
+
+class PipelineLogger:
+    """Append bounded JSON events and optional private diagnostic objects."""
+
+    def __init__(self, artifacts: ArtifactStore) -> None:
+        self._artifacts = artifacts
+        self._lock = threading.Lock()
+
+    def event(
+        self,
+        *,
+        job_id: str,
+        stage: str,
+        event: str,
+        duration_ms: float,
+        provider: str | None,
+        model: str | None,
+        error_code: str | None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
+        """Append exactly one newline-delimited, safely serializable event."""
+
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "job_id": job_id,
+            "stage": stage,
+            "event": event,
+            "duration_ms": round(max(0.0, duration_ms), 3),
+            "provider": provider,
+            "model": model,
+            "error_code": error_code,
+            "metadata": redact(metadata or {}),
+        }
+        encoded = orjson.dumps(record) + b"\n"
+        target = self._artifacts.job_dir(job_id) / "pipeline.jsonl"
+        flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        with self._lock:
+            descriptor = os.open(target, flags, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+                os.write(descriptor, encoded)
+            finally:
+                os.close(descriptor)
+
+    def diagnostic(
+        self,
+        job_id: str,
+        enabled: bool,
+        name: str,
+        value: object,
+    ) -> Path | None:
+        """Atomically write one opted-in redacted diagnostic with mode 0600."""
+
+        if not enabled:
+            return None
+        job_directory = self._artifacts.job_dir(job_id)
+        diagnostics = job_directory / "diagnostics"
+        diagnostics.mkdir(mode=0o700, exist_ok=True)
+        if diagnostics.is_symlink() or diagnostics.resolve().parent != job_directory:
+            raise ValueError("diagnostics directory must remain inside the job directory")
+        safe_stem = _SAFE_NAME.sub("-", name.casefold()).strip("-_") or "diagnostic"
+        target = diagnostics / f"{safe_stem}-{uuid4().hex}.json"
+        payload = orjson.dumps(redact(value), option=orjson.OPT_SORT_KEYS)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=diagnostics,
+            prefix=f".{safe_stem}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(payload)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, target)
+            os.chmod(target, 0o600)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+        return target
+
+
+__all__ = ["PipelineLogger", "redact"]
