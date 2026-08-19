@@ -1,1 +1,1 @@
-"""HTTP API package."""
+"""Local HTTP API for VoxDelta analysis jobs."""

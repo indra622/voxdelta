@@ -40,6 +40,8 @@ _LINKED_JOB_DIRECTORY_ERROR = (
 _OPERATION_LOCK_VALIDATION_ERROR = "job operation lock could not be validated safely"
 _OPERATION_LOCKS: dict[Path, threading.Lock] = {}
 _OPERATION_LOCKS_GUARD = threading.Lock()
+_DELETION_FENCE = threading.RLock()
+_DELETED_JOB_PATHS: set[Path] = set()
 
 
 def _operation_process_lock(path: Path) -> threading.Lock:
@@ -133,7 +135,18 @@ class ArtifactStore:
         self.root = root
 
     def _job_path(self, job_id: str, *, create: bool, require_directory: bool) -> Path:
+        with _DELETION_FENCE:
+            return self._job_path_unlocked(
+                job_id,
+                create=create,
+                require_directory=require_directory,
+            )
+
+    def _job_path_unlocked(self, job_id: str, *, create: bool, require_directory: bool) -> Path:
         validate_job_id(job_id)
+        deletion_key = self.root.resolve() / job_id
+        if deletion_key in _DELETED_JOB_PATHS:
+            raise FileNotFoundError(deletion_key)
         if create:
             self.root.mkdir(parents=True, exist_ok=True)
         resolved_root = self.root.resolve()
@@ -282,6 +295,12 @@ class ArtifactStore:
     def delete_job(self, job_id: str) -> None:
         """Delete exactly one validated job directory beneath the configured root."""
 
-        resolved_target = self._job_path(job_id, create=False, require_directory=False)
-        if resolved_target.exists():
-            shutil.rmtree(resolved_target)
+        with _DELETION_FENCE:
+            resolved_target = self._job_path_unlocked(
+                job_id,
+                create=False,
+                require_directory=False,
+            )
+            _DELETED_JOB_PATHS.add(resolved_target)
+            if resolved_target.exists():
+                shutil.rmtree(resolved_target)

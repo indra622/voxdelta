@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import stat
+import sys
 import tempfile
 import time
 import wave
@@ -13,7 +14,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Lock, RLock, Thread
-from typing import TypeVar, cast
+from typing import BinaryIO, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -262,8 +263,9 @@ class PipelineRunner:
     def _read(self, job_id: str, stage: StageName, model: type[TArtifact]) -> TArtifact:
         return self._artifacts.read_model(job_id, stage, model)
 
-    def _hash_trusted_media(self, job_id: str, raw_path: str) -> str:
-        """Hash one regular, non-link file in a direct job audio generation."""
+    @contextmanager
+    def _open_trusted_media(self, job_id: str, raw_path: str) -> Iterator[BinaryIO]:
+        """Open one stable regular, non-link file in a direct job audio generation."""
 
         job_directory = self._artifacts.job_dir(job_id)
         path = Path(raw_path)
@@ -288,15 +290,22 @@ class PipelineRunner:
             opened = os.fstat(descriptor)
             if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != _file_identity(before):
                 raise ValueError("normalized media changed while being opened")
-            digest = hashlib.sha256()
-            while chunk := os.read(descriptor, 1024 * 1024):
-                digest.update(chunk)
             after = path.lstat()
             if path.is_symlink() or _file_identity(after) != _file_identity(opened):
-                raise ValueError("normalized media changed while being hashed")
-            return digest.hexdigest()
+                raise ValueError("normalized media changed while being opened")
+            with os.fdopen(descriptor, "rb", closefd=False) as opened_file:
+                yield opened_file
         finally:
             os.close(descriptor)
+
+    def _hash_trusted_media(self, job_id: str, raw_path: str) -> str:
+        """Hash one regular, non-link file in a direct job audio generation."""
+
+        with self._open_trusted_media(job_id, raw_path) as opened:
+            digest = hashlib.sha256()
+            while chunk := opened.read(1024 * 1024):
+                digest.update(chunk)
+            return digest.hexdigest()
 
     def _normalize_media_are_valid(self, job_id: str, artifact: NormalizeArtifact) -> bool:
         references = (*artifact.normalized_media, artifact.mixed_preview)
@@ -922,6 +931,133 @@ class PipelineRunner:
         self._repository.get_job(job_id)
         with self._job_lock(job_id):
             return self._run_locked(job_id)
+
+    def provider_disclosures(self) -> list[dict[str, object]]:
+        """Return only public stage provenance and remote-data disclosures."""
+
+        disclosures: list[dict[str, object]] = []
+        for stage in StageName:
+            provider = self._provider(stage)
+            disclosures.append(
+                {
+                    "stage": stage.value,
+                    "provenance": (
+                        {
+                            "name": provider.name,
+                            "model": provider.model,
+                            "remote": provider.remote,
+                            "schema_version": provider.schema_version,
+                        }
+                        if provider is not None
+                        else None
+                    ),
+                    "transmits": provider.transmits if provider is not None else (),
+                    "retention_policy_url": (
+                        provider.retention_policy_url if provider is not None else None
+                    ),
+                }
+            )
+        return disclosures
+
+    def role_candidate(self, job_id: str) -> RoleArtifact:
+        """Return a cache-validated paused role candidate for public speaker selection."""
+
+        with self._job_lock(job_id):
+            job = self._repository.get_job(job_id)
+            row = _stage_rows(job)[StageName.CONFIRM_ROLES.value]
+            if row.get("status") != StageStatus.PAUSED.value:
+                raise PipelineStateError(
+                    "role_confirmation_not_ready",
+                    "Role confirmation is not currently available.",
+                )
+            if not self._completed_artifact_is_valid(
+                job_id,
+                StageName.CONFIRM_ROLES,
+                row,
+                require_confirmed_role=False,
+            ):
+                raise PipelineValidationError(
+                    "invalid_role_candidate",
+                    "The paused role candidate is invalid.",
+                )
+            return self._read(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
+
+    def report(self, job_id: str) -> AnalysisReport:
+        """Return only a completed, typed, cache-valid canonical report."""
+
+        with self._job_lock(job_id):
+            job = self._repository.get_job(job_id)
+            row = _stage_rows(job)[StageName.REPORT.value]
+            if row.get("status") != StageStatus.COMPLETED.value:
+                raise PipelineStateError(
+                    "report_not_ready",
+                    "The report is available only after report completion.",
+                )
+            if not self._completed_artifact_is_valid(
+                job_id,
+                StageName.REPORT,
+                row,
+                require_confirmed_role=False,
+            ):
+                raise PipelineValidationError(
+                    "invalid_report",
+                    "The completed report is no longer valid.",
+                )
+            return self._read(job_id, StageName.REPORT, ReportArtifact).report
+
+    @contextmanager
+    def open_mixed_preview(self, job_id: str) -> Iterator[BinaryIO]:
+        """Yield a stable descriptor for the hash-validated normalized mixed preview."""
+
+        media_context = None
+        with self._job_lock(job_id):
+            job = self._repository.get_job(job_id)
+            row = _stage_rows(job)[StageName.NORMALIZE.value]
+            if row.get("status") != StageStatus.COMPLETED.value:
+                raise PipelineStateError(
+                    "audio_not_ready",
+                    "Normalized audio is not available yet.",
+                )
+            if not self._completed_artifact_is_valid(
+                job_id,
+                StageName.NORMALIZE,
+                row,
+                require_confirmed_role=False,
+            ):
+                raise PipelineValidationError(
+                    "invalid_normalized_audio",
+                    "The normalized audio preview is invalid.",
+                )
+            normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
+            media_context = self._open_trusted_media(job_id, normalized.mixed_preview.path)
+            opened = media_context.__enter__()
+            try:
+                digest = hashlib.sha256()
+                while chunk := opened.read(1024 * 1024):
+                    digest.update(chunk)
+                if digest.hexdigest() != normalized.mixed_preview.sha256:
+                    raise PipelineValidationError(
+                        "invalid_normalized_audio",
+                        "The normalized audio preview is invalid.",
+                    )
+                opened.seek(0)
+            except BaseException:
+                media_context.__exit__(*sys.exc_info())
+                raise
+        try:
+            yield opened
+        finally:
+            if media_context is not None:
+                media_context.__exit__(None, None, None)
+
+    def delete_job(self, job_id: str) -> None:
+        """Fence current work and delete exactly one job's index and artifacts."""
+
+        self._repository.get_job(job_id)
+        with self._job_lock(job_id), self._artifacts.operation_lock(job_id):
+            self._repository.invalidate_stages(job_id, tuple(StageName))
+            self._repository.delete_job(job_id)
+            self._artifacts.delete_job(job_id)
 
     def confirm_roles(
         self,

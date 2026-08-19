@@ -134,6 +134,21 @@ class JobRepository:
             )
         return job_id
 
+    def update_source_name(self, job_id: str, source_name: str) -> None:
+        """Bind a newly streamed job upload before any pipeline work is scheduled."""
+
+        validate_job_id(job_id)
+        if not source_name:
+            raise ValueError("source name must not be empty")
+        now = self._now().isoformat()
+        with self._connect() as database:
+            updated = database.execute(
+                "UPDATE jobs SET source_name = ?, updated_at = ? WHERE id = ?",
+                (source_name, now, job_id),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(job_id)
+
     def set_stage(
         self,
         job_id: str,
