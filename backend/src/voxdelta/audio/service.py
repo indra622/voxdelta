@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -14,7 +16,8 @@ import wave
 from array import array
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
+from uuid import uuid4
 
 from voxdelta.domain.models import AudioAsset
 from voxdelta.jobs.artifacts import ArtifactStore
@@ -40,26 +43,70 @@ def _is_link_like(metadata: os.stat_result) -> bool:
     return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_attribute)
 
 
-def _regular_source_metadata(source: Path) -> os.stat_result:
-    try:
-        metadata = source.lstat()
-    except OSError:
-        raise AudioRejected(_DECODABILITY_ERROR) from None
-    if _is_link_like(metadata) or not stat.S_ISREG(metadata.st_mode):
-        raise AudioRejected(_DECODABILITY_ERROR)
-    return metadata
-
-
 def _source_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
     return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
 
 
-def _require_unchanged_source(source: Path, expected: tuple[int, int, int, int]) -> None:
-    if _source_identity(_regular_source_metadata(source)) != expected:
-        raise AudioRejected(_DECODABILITY_ERROR)
+def _open_trusted_source(source: Path) -> BinaryIO:
+    """Open the final source component once without following it on POSIX.
+
+    Windows lacks a portable ``O_NOFOLLOW`` equivalent. There we reject reparse points before
+    opening and compare the path metadata with the opened descriptor as a practical fallback.
+    """
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    before: os.stat_result | None = None
+    if os.name == "posix":
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    else:
+        try:
+            before = source.lstat()
+        except OSError:
+            raise AudioRejected(_DECODABILITY_ERROR) from None
+        if _is_link_like(before) or not stat.S_ISREG(before.st_mode):
+            raise AudioRejected(_DECODABILITY_ERROR)
+
+    try:
+        descriptor = os.open(source, flags)
+    except OSError:
+        raise AudioRejected(_DECODABILITY_ERROR) from None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise AudioRejected(_DECODABILITY_ERROR)
+        if before is not None:
+            try:
+                after = source.lstat()
+            except OSError:
+                raise AudioRejected(_DECODABILITY_ERROR) from None
+            if (
+                _is_link_like(after)
+                or _source_identity(before) != _source_identity(opened)
+                or _source_identity(after) != _source_identity(opened)
+            ):
+                raise AudioRejected(_DECODABILITY_ERROR)
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
-def _probe(source: Path) -> tuple[float, int]:
+def _stage_source(source_file: BinaryIO, workspace: Path, suffix: str) -> tuple[Path, str]:
+    staged = workspace / f"source{suffix.lower()}"
+    digest = hashlib.sha256()
+    try:
+        with staged.open("xb") as output:
+            while chunk := source_file.read(_HASH_CHUNK_BYTES):
+                output.write(chunk)
+                digest.update(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError:
+        raise AudioRejected(_DECODABILITY_ERROR) from None
+    return staged, digest.hexdigest()
+
+
+def _probe(source: Path) -> tuple[float, int, bool]:
     command = [
         "ffprobe",
         "-v",
@@ -99,6 +146,10 @@ def _probe(source: Path) -> tuple[float, int]:
     channels = audio_streams[0].get("channels")
     if isinstance(channels, bool) or not isinstance(channels, int) or channels <= 0:
         raise AudioRejected(_DECODABILITY_ERROR)
+    channel_layout = audio_streams[0].get("channel_layout")
+    if channel_layout is not None and not isinstance(channel_layout, str):
+        raise AudioRejected(_DECODABILITY_ERROR)
+    is_stereo = channels == 2 and channel_layout in {None, "stereo"}
 
     format_metadata = payload.get("format")
     raw_duration = format_metadata.get("duration") if isinstance(format_metadata, dict) else None
@@ -110,18 +161,7 @@ def _probe(source: Path) -> tuple[float, int]:
         raise AudioRejected(_DECODABILITY_ERROR) from None
     if not math.isfinite(duration):
         raise AudioRejected(_DECODABILITY_ERROR)
-    return duration, channels
-
-
-def _sha256(source: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with source.open("rb") as input_file:
-            while chunk := input_file.read(_HASH_CHUNK_BYTES):
-                digest.update(chunk)
-    except OSError:
-        raise AudioRejected(_DECODABILITY_ERROR) from None
-    return digest.hexdigest()
+    return duration, channels, is_stereo
 
 
 def _temporary_wav(job_directory: Path, label: str) -> Path:
@@ -132,6 +172,37 @@ def _temporary_wav(job_directory: Path, label: str) -> Path:
     )
     os.close(descriptor)
     return Path(name)
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as file:
+        os.fsync(file.fileno())
+
+
+def _fsync_directory(directory: Path) -> None:
+    if os.name != "posix":
+        return
+    unsupported = {
+        errno.EBADF,
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", errno.EINVAL),
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    }
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError as error:
+        if error.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in unsupported:
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def _run_ffmpeg(command: list[str]) -> None:
@@ -268,39 +339,41 @@ class AudioService:
 
         if upload_path.suffix.lower() not in _ALLOWED_EXTENSIONS:
             raise AudioRejected("unsupported extension")
-        source_metadata = _regular_source_metadata(upload_path)
-        source_identity = _source_identity(source_metadata)
-        duration, channels = _probe(upload_path)
-        _require_unchanged_source(upload_path, source_identity)
-
-        if duration < self._min_seconds:
-            raise AudioRejected(f"audio is shorter than {self._min_seconds} seconds")
-        if duration > self._max_seconds:
-            raise AudioRejected(f"audio exceeds {self._max_seconds} seconds")
-        if channel_preference == "separate" and channels == 1:
-            raise AudioRejected("separate channels requested for mono audio")
-
-        sha256 = _sha256(upload_path)
-        _require_unchanged_source(upload_path, source_identity)
-        job_directory = self._store.job_dir(job_id)
+        workspace: Path | None = None
         temporary_paths: list[Path] = []
-        committed_paths: list[Path] = []
+        published_generation: Path | None = None
 
         try:
-            mixed_temporary = _temporary_wav(job_directory, "mixed")
+            with _open_trusted_source(upload_path) as source_file:
+                job_directory = self._store.job_dir(job_id)
+                workspace = Path(tempfile.mkdtemp(dir=job_directory, prefix=".ingest-"))
+                staged_source, sha256 = _stage_source(source_file, workspace, upload_path.suffix)
+
+            duration, channels, is_stereo = _probe(staged_source)
+            if duration < self._min_seconds:
+                raise AudioRejected(f"audio is shorter than {self._min_seconds} seconds")
+            if duration > self._max_seconds:
+                raise AudioRejected(f"audio exceeds {self._max_seconds} seconds")
+            if channel_preference == "separate" and channels == 1:
+                raise AudioRejected("separate channels requested for mono audio")
+            if channel_preference == "separate" and not is_stereo:
+                raise AudioRejected("separate channels require stereo audio")
+
+            mixed_temporary = _temporary_wav(workspace, "mixed")
             temporary_paths.append(mixed_temporary)
-            _normalize_mixed(upload_path, mixed_temporary)
-            _require_unchanged_source(upload_path, source_identity)
+            _normalize_mixed(staged_source, mixed_temporary)
+            mixed_output = workspace / "mixed.wav"
+            os.replace(mixed_temporary, mixed_output)
 
             selected_mode: Literal["mixed", "separate"] = "mixed"
             left_temporary: Path | None = None
             right_temporary: Path | None = None
-            if channels > 1 and channel_preference != "mixed":
-                left_temporary = _temporary_wav(job_directory, "left")
-                right_temporary = _temporary_wav(job_directory, "right")
-                temporary_paths.extend((left_temporary, right_temporary))
-                _normalize_stereo_channels(upload_path, left_temporary, right_temporary)
-                _require_unchanged_source(upload_path, source_identity)
+            if is_stereo and channel_preference != "mixed":
+                left_temporary = _temporary_wav(workspace, "left")
+                temporary_paths.append(left_temporary)
+                right_temporary = _temporary_wav(workspace, "right")
+                temporary_paths.append(right_temporary)
+                _normalize_stereo_channels(staged_source, left_temporary, right_temporary)
                 if channel_preference == "separate" or _channels_are_distinct(
                     left_temporary, right_temporary
                 ):
@@ -309,31 +382,50 @@ class AudioService:
             if self._store.job_dir(job_id) != job_directory:
                 raise ValueError("job directory changed while audio was being normalized")
 
-            mixed_target = job_directory / "mixed.wav"
-            os.replace(mixed_temporary, mixed_target)
-            committed_paths.append(mixed_target)
-            normalized_paths: tuple[str, ...]
+            normalized_names: tuple[str, ...]
             if selected_mode == "separate":
                 if left_temporary is None or right_temporary is None:
                     raise AudioRejected(_DECODABILITY_ERROR)
-                left_target = job_directory / "left.wav"
-                right_target = job_directory / "right.wav"
-                os.replace(left_temporary, left_target)
-                committed_paths.append(left_target)
-                os.replace(right_temporary, right_target)
-                committed_paths.append(right_target)
-                normalized_paths = (str(left_target), str(right_target))
+                left_output = workspace / "left.wav"
+                right_output = workspace / "right.wav"
+                os.replace(left_temporary, left_output)
+                os.replace(right_temporary, right_output)
+                normalized_names = ("left.wav", "right.wav")
             else:
-                _unlink_all((job_directory / "left.wav", job_directory / "right.wav"))
-                normalized_paths = (str(mixed_target),)
+                normalized_names = ("mixed.wav",)
+
+            staged_source.unlink()
+            output_names = (
+                ("mixed.wav", *normalized_names)
+                if selected_mode == "separate"
+                else normalized_names
+            )
+            for name in dict.fromkeys(output_names):
+                _fsync_file(workspace / name)
+            _fsync_directory(workspace)
+            if self._store.job_dir(job_id) != job_directory:
+                raise ValueError("job directory changed while audio was being normalized")
+
+            generation = job_directory / f"audio-{uuid4().hex}"
+            os.replace(workspace, generation)
+            published_generation = generation
+            workspace = None
+            _fsync_directory(job_directory)
+            normalized_paths = tuple(str(generation / name) for name in normalized_names)
         except AudioRejected:
-            _unlink_all((*temporary_paths, *committed_paths))
+            _unlink_all(temporary_paths)
+            if published_generation is not None:
+                shutil.rmtree(published_generation, ignore_errors=True)
             raise
-        except (OSError, ValueError):
-            _unlink_all((*temporary_paths, *committed_paths))
+        except OSError:
+            _unlink_all(temporary_paths)
+            if published_generation is not None:
+                shutil.rmtree(published_generation, ignore_errors=True)
             raise AudioRejected(_DECODABILITY_ERROR) from None
         finally:
             _unlink_all(temporary_paths)
+            if workspace is not None:
+                shutil.rmtree(workspace, ignore_errors=True)
 
         return AudioAsset(
             source_name=upload_path.name,
