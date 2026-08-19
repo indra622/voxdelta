@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from time import time
-from typing import TypeVar
+from typing import Any, Protocol, TypeVar
 from uuid import uuid4
 
 import orjson
@@ -50,6 +50,12 @@ _TOMBSTONE_VALIDATION_ERROR = "job deletion tombstone could not be validated saf
 _INCOMING_VALIDATION_ERROR = "incoming upload could not be validated safely"
 _LEGACY_ARTIFACT_LEASE_GRACE_SECONDS = 3600.0
 _PROCESS_OWNER_TOKEN = uuid4().hex
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_TIMEOUT = 0x00000102
+_ERROR_ACCESS_DENIED = 5
+_ERROR_INVALID_PARAMETER = 87
 
 
 @dataclass(slots=True)
@@ -71,6 +77,47 @@ _INCOMING_OWNERS: dict[Path, _IncomingOwner] = {}
 _INCOMING_OWNERS_GUARD = threading.Lock()
 _ACTIVE_ARTIFACT_LEASES: dict[Path, str] = {}
 _ACTIVE_ARTIFACT_LEASES_GUARD = threading.Lock()
+
+
+class _WindowsProcessApi(Protocol):
+    def open_process(self, pid: int) -> tuple[int | None, int]: ...
+
+    def wait_for_single_object(self, handle: int) -> int: ...
+
+    def close_handle(self, handle: int) -> None: ...
+
+
+class _CtypesWindowsProcessApi:
+    """Minimal non-destructive wrapper around documented kernel32 process APIs."""
+
+    def __init__(self) -> None:
+        import ctypes
+
+        loader = getattr(ctypes, "WinDLL", None)
+        if loader is None:
+            raise OSError("Win32 process APIs are unavailable")
+        kernel32: Any = loader("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        self._get_last_error: Any = vars(ctypes)["get_last_error"]
+        self._kernel32 = kernel32
+
+    def open_process(self, pid: int) -> tuple[int | None, int]:
+        access = _PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE
+        handle = self._kernel32.OpenProcess(access, False, pid)
+        if handle is None:
+            return None, int(self._get_last_error())
+        return int(handle), 0
+
+    def wait_for_single_object(self, handle: int) -> int:
+        return int(self._kernel32.WaitForSingleObject(handle, 0))
+
+    def close_handle(self, handle: int) -> None:
+        self._kernel32.CloseHandle(handle)
 
 
 @contextmanager
@@ -183,9 +230,44 @@ def _relocate_artifact_lease(source: Path, destination: Path) -> Iterator[None]:
         _ACTIVE_ARTIFACT_LEASES[destination_lease] = owner_token
 
 
-def _pid_is_alive(pid: int) -> bool:
+def _windows_pid_is_alive(pid: int, api: _WindowsProcessApi | None = None) -> bool:
+    selected_api = _CtypesWindowsProcessApi() if api is None else api
+    try:
+        handle, error = selected_api.open_process(pid)
+    except OSError:
+        return True
+    if handle is None:
+        if error == _ERROR_ACCESS_DENIED:
+            return True
+        if error == _ERROR_INVALID_PARAMETER:
+            return False
+        # Unknown query errors fail closed to avoid deleting an active owner's media.
+        return True
+    try:
+        try:
+            wait_result = selected_api.wait_for_single_object(handle)
+        except OSError:
+            return True
+    finally:
+        selected_api.close_handle(handle)
+    if wait_result == _WAIT_OBJECT_0:
+        return False
+    if wait_result == _WAIT_TIMEOUT:
+        return True
+    return True
+
+
+def _pid_is_alive(
+    pid: int,
+    *,
+    platform_name: str | None = None,
+    windows_api: _WindowsProcessApi | None = None,
+) -> bool:
     if pid <= 0:
         return False
+    selected_platform = os.name if platform_name is None else platform_name
+    if selected_platform == "nt":
+        return _windows_pid_is_alive(pid, windows_api)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

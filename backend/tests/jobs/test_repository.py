@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import gc
 import os
 import sqlite3
@@ -10,10 +11,113 @@ from typing import cast
 
 import pytest
 
+import voxdelta.jobs.repository as repository_module
 from voxdelta.domain.models import StageName, StageStatus
 from voxdelta.jobs._ids import JobAbsenceProof
 from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.repository import JobRepository
+
+
+@pytest.mark.parametrize("phase", ["open", "open_errno", "fstat", "fstat_errno", "lstat"])
+def test_optional_sqlite_sidecar_disappearance_is_benign_at_every_validation_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    sidecar = tmp_path / "voxdelta.sqlite3-journal"
+    sidecar.write_bytes(b"")
+    original_open = repository_module.os.open
+    original_fstat = repository_module.os.fstat
+    original_lstat = Path.lstat
+
+    def disappearing_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        if phase in {"open", "open_errno"} and Path(path) == sidecar:
+            sidecar.unlink(missing_ok=True)
+            if phase == "open_errno":
+                raise OSError(errno.ENOENT, "sidecar disappeared")
+            raise FileNotFoundError
+        return original_open(path, flags, mode)
+
+    def disappearing_fstat(descriptor: int):  # type: ignore[no-untyped-def]
+        if phase in {"fstat", "fstat_errno"}:
+            sidecar.unlink(missing_ok=True)
+            if phase == "fstat_errno":
+                raise OSError(errno.ENOENT, "sidecar disappeared")
+            raise FileNotFoundError
+        return original_fstat(descriptor)
+
+    def disappearing_lstat(self: Path):  # type: ignore[no-untyped-def]
+        if phase == "lstat" and self == sidecar:
+            sidecar.unlink(missing_ok=True)
+            raise FileNotFoundError
+        return original_lstat(self)
+
+    monkeypatch.setattr(repository_module.os, "open", disappearing_open)
+    monkeypatch.setattr(repository_module.os, "fstat", disappearing_fstat)
+    monkeypatch.setattr(Path, "lstat", disappearing_lstat)
+
+    repository_module._secure_regular_file(sidecar, create=False, optional=True)
+
+
+def test_main_database_disappearance_during_validation_remains_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "voxdelta.sqlite3"
+    database.write_bytes(b"")
+    original_lstat = Path.lstat
+
+    def disappearing_lstat(self: Path):  # type: ignore[no-untyped-def]
+        if self == database:
+            database.unlink(missing_ok=True)
+            raise FileNotFoundError
+        return original_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", disappearing_lstat)
+
+    with pytest.raises(ValueError, match="database"):
+        repository_module._secure_regular_file(database, create=False, optional=False)
+
+
+def test_optional_sidecar_inode_replacement_remains_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sidecar = tmp_path / "voxdelta.sqlite3-wal"
+    sidecar.write_bytes(b"original")
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"replacement")
+    original_lstat = Path.lstat
+    replaced = False
+
+    def replacing_lstat(self: Path):  # type: ignore[no-untyped-def]
+        nonlocal replaced
+        if self == sidecar and not replaced:
+            replaced = True
+            os.replace(replacement, sidecar)
+        return original_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", replacing_lstat)
+
+    with pytest.raises(ValueError, match="database"):
+        repository_module._secure_regular_file(sidecar, create=False, optional=True)
+
+
+def test_concurrent_create_and_get_tolerates_natural_sqlite_sidecar_churn(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+
+    def create_and_read(worker: int) -> int:
+        created = 0
+        for iteration in range(75):
+            job_id = repository.create_job(f"worker-{worker}-{iteration}.wav")
+            assert repository.get_job(job_id)["source_name"] == f"worker-{worker}-{iteration}.wav"
+            created += 1
+        return created
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        counts = list(executor.map(create_and_read, range(8)))
+
+    assert counts == [75] * 8
 
 
 def test_job_stage_survives_repository_reopen(tmp_path: Path) -> None:
@@ -72,7 +176,10 @@ def test_repository_forces_private_database_parent_and_sidecars_under_permissive
             assert journal.stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.parametrize("unsafe_kind", ["database_symlink", "sidecar_symlink", "directory"])
+@pytest.mark.parametrize(
+    "unsafe_kind",
+    ["database_symlink", "sidecar_symlink", "directory", "sidecar_directory"],
+)
 def test_repository_rejects_link_or_nonregular_database_state(
     tmp_path: Path,
     unsafe_kind: str,
@@ -87,6 +194,9 @@ def test_repository_rejects_link_or_nonregular_database_state(
     elif unsafe_kind == "sidecar_symlink":
         database.touch()
         Path(f"{database}-wal").symlink_to(outside)
+    elif unsafe_kind == "sidecar_directory":
+        database.touch()
+        Path(f"{database}-wal").mkdir()
     else:
         database.mkdir()
 

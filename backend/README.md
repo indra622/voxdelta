@@ -147,8 +147,9 @@ claims after the claim lease; live claims are never stolen. A successfully publi
 retry garbage-collects obsolete `audio-*` generations. POSIX readers retain their already-open
 descriptor; Windows may defer one generation's cleanup until a later retry after readers close.
 Active decode/generation workspaces carry private PID/owner records and use `flock` where
-available; this preserves live owners and lets abandoned work be collected on other platforms.
-Pre-lease `.ingest-*` upgrade residue is retained for a one-hour safety grace before cleanup.
+available; Windows checks process state through non-destructive Win32 query handles. This preserves
+live owners and lets abandoned work be collected on other platforms. Pre-lease `.ingest-*` upgrade
+residue is retained for a one-hour safety grace before cleanup.
 
 `data/jobs/.incoming/`, `.locks/`, and `.deleted/` are private control directories used for
 durable upload admission, cross-process job coordination, and deletion tombstones. Empty control

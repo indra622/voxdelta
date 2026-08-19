@@ -15,6 +15,35 @@ from voxdelta.domain.models import AnalysisReport, StageName
 from voxdelta.jobs.artifacts import ArtifactStore
 
 
+class FakeWindowsProcessApi:
+    def __init__(
+        self,
+        *,
+        handle: int | None,
+        error: int = 0,
+        wait_result: int = 0,
+        wait_error: bool = False,
+    ) -> None:
+        self.handle = handle
+        self.error = error
+        self.wait_result = wait_result
+        self.wait_error = wait_error
+        self.closed: list[int] = []
+
+    def open_process(self, pid: int) -> tuple[int | None, int]:
+        del pid
+        return self.handle, self.error
+
+    def wait_for_single_object(self, handle: int) -> int:
+        assert handle == self.handle
+        if self.wait_error:
+            raise OSError("simulated Win32 wait failure")
+        return self.wait_result
+
+    def close_handle(self, handle: int) -> None:
+        self.closed.append(handle)
+
+
 def analysis_report(*, warning: str | None = None) -> AnalysisReport:
     return AnalysisReport(
         job_id="j1",
@@ -33,6 +62,74 @@ def analysis_report(*, warning: str | None = None) -> AnalysisReport:
         transitions=[],
         warnings=[] if warning is None else [warning],
     )
+
+
+@pytest.mark.parametrize(
+    ("api", "expected", "expected_closed"),
+    [
+        (FakeWindowsProcessApi(handle=41, wait_result=258), True, [41]),
+        (FakeWindowsProcessApi(handle=42, wait_result=0), False, [42]),
+        (FakeWindowsProcessApi(handle=None, error=5), True, []),
+        (FakeWindowsProcessApi(handle=None, error=87), False, []),
+    ],
+)
+def test_windows_pid_probe_uses_non_destructive_process_handles(
+    api: FakeWindowsProcessApi,
+    expected: bool,
+    expected_closed: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_kill(pid: int, signal: int) -> None:
+        del pid, signal
+        pytest.fail("Windows liveness probe must not call os.kill")
+
+    monkeypatch.setattr(artifacts_module.os, "kill", forbidden_kill)
+
+    assert artifacts_module._pid_is_alive(123, platform_name="nt", windows_api=api) is expected
+    assert api.closed == expected_closed
+
+
+def test_posix_pid_probe_preserves_signal_zero_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        artifacts_module.os, "kill", lambda pid, signal: calls.append((pid, signal))
+    )
+
+    assert artifacts_module._pid_is_alive(123, platform_name="posix")
+    assert calls == [(123, 0)]
+
+
+def test_windows_pid_probe_always_closes_an_open_process_handle() -> None:
+    api = FakeWindowsProcessApi(handle=43, wait_error=True)
+
+    assert artifacts_module._pid_is_alive(123, platform_name="nt", windows_api=api)
+    assert api.closed == [43]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Win32 process-query regression")
+def test_windows_pid_probe_preserves_live_owner_and_collects_it_after_exit(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "jobs")
+    incoming = store.root / ".incoming"
+    incoming.mkdir(mode=0o700, parents=True)
+    workspace = incoming / ".ingest-windows-owner"
+    workspace.mkdir()
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    (workspace / ".lease").write_text(
+        json.dumps({"pid": process.pid, "owner_token": "subprocess-owner"}),
+        encoding="utf-8",
+    )
+    os.utime(workspace, (0, 0))
+    try:
+        assert store.remove_stale_ingest_workspaces(lease_seconds=1, now=time.time()) == 0
+        assert workspace.is_dir()
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+    assert not artifacts_module._pid_is_alive(process.pid)
+    assert store.remove_stale_ingest_workspaces(lease_seconds=1, now=time.time()) == 1
+    assert not workspace.exists()
 
 
 def test_artifact_round_trip_retains_model_schema_version(tmp_path: Path) -> None:

@@ -27,35 +27,58 @@ Publisher = Callable[[], None]
 _DATABASE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 
 
-def _is_link_like(path: Path) -> bool:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return False
+def _metadata_is_link_like(metadata: os.stat_result) -> bool:
     file_attributes = getattr(metadata, "st_file_attributes", 0)
     reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_attribute)
 
 
-def _secure_regular_file(path: Path, *, create: bool) -> None:
+def _is_link_like(path: Path) -> bool:
+    try:
+        return _metadata_is_link_like(path.lstat())
+    except FileNotFoundError:
+        return False
+
+
+def _secure_regular_file(path: Path, *, create: bool, optional: bool = False) -> None:
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     if create:
         flags |= os.O_CREAT
     try:
         descriptor = os.open(path, flags, 0o600)
+    except FileNotFoundError:
+        if optional:
+            return
+        raise ValueError("database files must be private regular non-link files") from None
     except OSError:
         raise ValueError("database files must be private regular non-link files") from None
     try:
-        opened = os.fstat(descriptor)
-        current = path.lstat()
+        try:
+            opened = os.fstat(descriptor)
+            current = path.lstat()
+        except FileNotFoundError:
+            if optional:
+                return
+            raise ValueError("database files must be private regular non-link files") from None
         if (
-            _is_link_like(path)
+            _metadata_is_link_like(current)
             or not stat.S_ISREG(opened.st_mode)
             or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
         ):
             raise ValueError("database files must be private regular non-link files")
         if os.name == "posix":
             os.fchmod(descriptor, 0o600)
+        try:
+            final = path.lstat()
+        except FileNotFoundError:
+            if optional:
+                return
+            raise ValueError("database files must be private regular non-link files") from None
+        if _metadata_is_link_like(final) or (opened.st_dev, opened.st_ino) != (
+            final.st_dev,
+            final.st_ino,
+        ):
+            raise ValueError("database files must be private regular non-link files")
     finally:
         os.close(descriptor)
 
@@ -187,7 +210,7 @@ class JobRepository:
         for suffix in _DATABASE_SIDECAR_SUFFIXES:
             sidecar = Path(f"{self.path}{suffix}")
             if sidecar.exists() or _is_link_like(sidecar):
-                _secure_regular_file(sidecar, create=False)
+                _secure_regular_file(sidecar, create=False, optional=True)
 
     def _now(self) -> datetime:
         now = self._clock()
