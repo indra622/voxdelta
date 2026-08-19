@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 from voxdelta.evaluation.selection import (
     CandidateMetrics,
     select_asr_candidate,
+    select_emotion_candidate,
 )
 
 
@@ -265,3 +266,131 @@ def test_candidate_contract_is_strict_and_finite(field: str, value: object) -> N
     payload[field] = value
     with pytest.raises(ValidationError):
         CandidateMetrics.model_validate(payload)
+
+
+def _emotion_candidate(
+    candidate_id: str,
+    provider: str,
+    *,
+    f1: float | None,
+    ece: float | None,
+    latency: float | None = 100.0,
+    memory: float | None = 1_000.0,
+    completion: float = 1.0,
+    task: str = "emotion",
+) -> CandidateMetrics:
+    return CandidateMetrics(
+        candidate_id=candidate_id,
+        task=task,  # type: ignore[arg-type]
+        provider=provider,
+        model=candidate_id,
+        completion_rate=completion,
+        median_latency_ms=latency,
+        peak_rss_mb=memory,
+        macro_f1=f1,
+        expected_calibration_error=ece,
+    )
+
+
+def test_emotion2vec_wins_at_exact_f1_gain_when_ece_boundary_is_allowed() -> None:
+    decision = select_emotion_candidate(
+        [
+            _emotion_candidate("stable", "wav2vec-xls-r", f1=0.70, ece=0.08),
+            _emotion_candidate("modern", "emotion2vec-plus", f1=0.71, ece=0.10),
+        ]
+    )
+
+    assert decision.selected_candidate_id == "modern"
+    assert decision.candidate_status == {"stable": "rejected", "modern": "eligible"}
+
+
+def test_emotion2vec_loses_when_ece_is_worse_by_more_than_point_zero_two() -> None:
+    decision = select_emotion_candidate(
+        [
+            _emotion_candidate("stable", "wav2vec-xls-r", f1=0.70, ece=0.08),
+            _emotion_candidate("modern", "emotion2vec-plus", f1=0.80, ece=0.100001),
+        ]
+    )
+
+    assert decision.selected_candidate_id == "stable"
+    assert decision.reasons["modern"] == "emotion2vec_ece_regressed_above_0.02"
+
+
+def test_emotion_near_tie_uses_lower_ece_then_lower_latency() -> None:
+    lower_ece = select_emotion_candidate(
+        [
+            _emotion_candidate("stable", "wav2vec-xls-r", f1=0.70, ece=0.08, latency=50),
+            _emotion_candidate("modern", "emotion2vec-plus", f1=0.695, ece=0.07, latency=500),
+        ]
+    )
+    assert lower_ece.selected_candidate_id == "modern"
+
+    lower_latency = select_emotion_candidate(
+        [
+            _emotion_candidate("stable", "wav2vec-xls-r", f1=0.70, ece=0.08, latency=100),
+            _emotion_candidate("modern", "emotion2vec-plus", f1=0.695, ece=0.08, latency=99),
+        ]
+    )
+    assert lower_latency.selected_candidate_id == "modern"
+
+
+@pytest.mark.parametrize(
+    ("memory", "completion", "reason"),
+    [
+        (18_432.0, 0.95, "selected_as_only_eligible_provider"),
+        (18_432.000001, 1.0, "peak_rss_mb_above_18432"),
+        (1_000.0, 0.949999, "completion_rate_below_0.95"),
+    ],
+)
+def test_emotion_resource_boundaries_are_exact(
+    memory: float, completion: float, reason: str
+) -> None:
+    candidate = _emotion_candidate(
+        "modern",
+        "emotion2vec-plus",
+        f1=0.8,
+        ece=0.1,
+        memory=memory,
+        completion=completion,
+    )
+    decision = select_emotion_candidate([candidate])
+    assert decision.reasons["modern"] == reason
+    assert decision.selected_candidate_id == ("modern" if memory == 18_432.0 else None)
+
+
+def test_emotion_multiple_candidates_are_reduced_deterministically() -> None:
+    decision = select_emotion_candidate(
+        [
+            _emotion_candidate("stable-b", "wav2vec-xls-r", f1=0.68, ece=0.05),
+            _emotion_candidate("stable-a", "wav2vec-xls-r", f1=0.70, ece=0.08),
+            _emotion_candidate("modern-b", "emotion2vec-plus", f1=0.70, ece=0.08, latency=90),
+            _emotion_candidate("modern-a", "emotion2vec-plus", f1=0.70, ece=0.08, latency=80),
+            _emotion_candidate("unknown", "nine-class-remap", f1=0.99, ece=0.01),
+        ]
+    )
+
+    assert decision.selected_candidate_id == "modern-a"
+    assert decision.candidate_status == {
+        "stable-b": "rejected",
+        "stable-a": "rejected",
+        "modern-b": "rejected",
+        "modern-a": "eligible",
+        "unknown": "rejected",
+    }
+    assert set(decision.reasons) == set(decision.candidate_status)
+
+
+def test_emotion_gate_rejects_wrong_task_duplicate_ids_and_missing_metrics() -> None:
+    same = _emotion_candidate("same", "wav2vec-xls-r", f1=0.7, ece=0.1)
+    with pytest.raises(ValueError, match="duplicate"):
+        select_emotion_candidate([same, same])
+    with pytest.raises(ValueError, match="emotion"):
+        select_emotion_candidate(
+            [_emotion_candidate("asr", "wav2vec-xls-r", f1=0.7, ece=0.1, task="asr")]
+        )
+
+    decision = select_emotion_candidate(
+        [_emotion_candidate("missing", "wav2vec-xls-r", f1=None, ece=None)]
+    )
+    assert decision.selected_candidate_id is None
+    assert decision.reasons == {"missing": "emotion_metric_missing"}
