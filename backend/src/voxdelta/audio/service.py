@@ -357,7 +357,7 @@ class AudioService:
             if channel_preference == "separate" and channels == 1:
                 raise AudioRejected("separate channels requested for mono audio")
             if channel_preference == "separate" and not is_stereo:
-                raise AudioRejected("separate channels require stereo audio")
+                raise AudioRejected(_DECODABILITY_ERROR)
 
             mixed_temporary = _temporary_wav(workspace, "mixed")
             temporary_paths.append(mixed_temporary)

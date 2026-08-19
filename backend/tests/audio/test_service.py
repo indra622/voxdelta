@@ -203,7 +203,7 @@ def test_ingest_explicit_separate_rejects_more_than_two_channels(tmp_path: Path)
     source = tmp_path / "three-channel.wav"
     _write_three_channel_audio(source)
 
-    with pytest.raises(AudioRejected, match=r"^separate channels require stereo audio$"):
+    with pytest.raises(AudioRejected, match=r"^audio is not decodable$"):
         AudioService(tmp_path / "jobs", 60, 3600).ingest(
             source, "j1", channel_preference="separate"
         )
@@ -225,7 +225,7 @@ def test_ingest_respects_non_stereo_probe_layout_when_present(
     monkeypatch.setattr(service_module.subprocess, "run", fake_run)
 
     if preference == "separate":
-        with pytest.raises(AudioRejected, match=r"^separate channels require stereo audio$"):
+        with pytest.raises(AudioRejected, match=r"^audio is not decodable$"):
             AudioService(tmp_path / "jobs", 60, 3600).ingest(
                 MONO_FIXTURE,
                 "j1",
