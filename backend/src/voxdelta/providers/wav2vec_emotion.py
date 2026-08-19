@@ -88,7 +88,7 @@ class Wav2VecEmotionProvider:
         hardware_probe: Callable[[], tuple[bool, bool]] | None = None,
         inference_context: Callable[[], AbstractContextManager[object]] | None = None,
         clock: Callable[[], float] | None = None,
-        rss_probe: Callable[[], float] | None = None,
+        rss_probe: Callable[[], float | None] | None = None,
     ) -> None:
         if device not in {"auto", "cpu", "cuda", "mps"}:
             raise ProviderError("provider_runtime_unsupported")

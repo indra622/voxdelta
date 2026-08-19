@@ -428,3 +428,51 @@ def test_windows_rss_fallback_does_not_import_resource(monkeypatch: pytest.Monke
 
     assert runtime.default_rss_probe() == 2048.0
     assert requested == ["psutil"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_rss_probe_failure_is_missing_not_zero(
+    platform: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from voxdelta.providers import _emotion_runtime as runtime
+
+    class BrokenResource:
+        RUSAGE_SELF = 0
+
+        @staticmethod
+        def getrusage(_who: int) -> object:
+            raise OSError("private runtime detail")
+
+    def fake_import(name: str) -> object:
+        if name == "resource":
+            return BrokenResource()
+        if name == "psutil":
+            raise OSError("private runtime detail")
+        raise AssertionError(name)
+
+    monkeypatch.setattr(runtime, "import_module", fake_import)
+    monkeypatch.setattr(sys, "platform", platform)
+
+    assert runtime.default_rss_probe() is None
+
+
+def test_missing_rss_measurement_remains_none_in_provider_usage(tmp_path: Path) -> None:
+    from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
+
+    @contextmanager
+    def inference_mode():
+        yield
+
+    provider = Wav2VecEmotionProvider(
+        _checkpoint(tmp_path / "checkpoint"),
+        model_factory=FakeFactory(FakePredictor([[1.0] + [0.0] * 6])),
+        hardware_probe=lambda: (False, False),
+        inference_context=inference_mode,
+        clock=lambda: 1.0,
+        rss_probe=lambda: None,
+    )
+
+    result = provider.analyze("utt", _wav(tmp_path / "audio.wav", 1), "")
+
+    assert result.usage is not None
+    assert result.usage.peak_rss_mb is None

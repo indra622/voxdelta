@@ -118,6 +118,14 @@ def test_embedding_cache_key_is_collision_resistant_and_cache_fails_closed(
         cache.load(base)
 
 
+def test_default_embedding_cache_root_is_scoped_to_current_user_home() -> None:
+    from voxdelta.evaluation.emotion_training import default_embedding_cache_root
+
+    root = default_embedding_cache_root()
+
+    assert root == Path.home() / ".cache" / "voxdelta" / "emotion2vec-v1"
+
+
 def test_embedding_cache_rejects_symlinked_ancestors(tmp_path: Path) -> None:
     from voxdelta.evaluation.emotion_training import EmbeddingCache
 
@@ -128,6 +136,90 @@ def test_embedding_cache_rejects_symlinked_ancestors(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="invalid_embedding_cache"):
         EmbeddingCache(linked / "cache")
+
+
+def test_embedding_cache_uses_memory_without_secure_directory_primitives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from voxdelta.evaluation import emotion_training
+
+    monkeypatch.setattr(emotion_training, "_secure_persistent_cache_supported", lambda: False)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    root = parent / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cache = emotion_training.EmbeddingCache(root)
+
+    root.symlink_to(outside, target_is_directory=True)
+    cache.store("a" * 64, (1.0, 2.0))
+
+    assert cache.load("a" * 64) == (1.0, 2.0)
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and mode contract")
+def test_embedding_cache_rejects_public_or_foreign_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from voxdelta.evaluation import emotion_training
+
+    public = tmp_path / "public-cache"
+    public.mkdir(mode=0o700)
+    public.chmod(0o777)
+    with pytest.raises(ValueError, match="invalid_embedding_cache"):
+        emotion_training.EmbeddingCache(public)
+
+    private = tmp_path / "private-cache"
+    private.mkdir(mode=0o700)
+    owner = private.stat().st_uid
+    monkeypatch.setattr(emotion_training.os, "geteuid", lambda: owner + 1)
+    with pytest.raises(ValueError, match="invalid_embedding_cache"):
+        emotion_training.EmbeddingCache(private)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership and mode contract")
+def test_embedding_cache_rejects_public_poisoned_entry_with_valid_checksum(tmp_path: Path) -> None:
+    from voxdelta.evaluation.emotion_training import EmbeddingCache
+
+    root = tmp_path / "cache"
+    cache = EmbeddingCache(root)
+    key = "a" * 64
+    values = [1.0, 2.0]
+    canonical = json.dumps(values, separators=(",", ":")).encode()
+    cache.path_for(key).write_text(
+        json.dumps(
+            {"sha256": hashlib.sha256(canonical).hexdigest(), "values": values},
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    cache.path_for(key).chmod(0o777)
+
+    with pytest.raises(ValueError, match="invalid_embedding_cache"):
+        cache.load(key)
+    with pytest.raises(ValueError, match="invalid_embedding_cache"):
+        cache.store(key, (3.0, 4.0))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor contract")
+def test_embedding_cache_open_failure_does_not_close_negative_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from voxdelta.evaluation import emotion_training
+
+    closed: list[int] = []
+
+    def fail_open(*_args: object, **_kwargs: object) -> int:
+        raise OSError("private path")
+
+    monkeypatch.setattr(emotion_training, "_secure_persistent_cache_supported", lambda: True)
+    monkeypatch.setattr(emotion_training.os, "open", fail_open)
+    monkeypatch.setattr(emotion_training.os, "close", closed.append)
+
+    with pytest.raises(ValueError, match="invalid_embedding_cache"):
+        emotion_training.EmbeddingCache(tmp_path / "cache")
+    assert closed == []
 
 
 @pytest.mark.parametrize("swap", ["root", "ancestor"])
@@ -397,6 +489,30 @@ def test_evaluation_example_batches_use_exact_profile_batch_size() -> None:
     assert tuple(item for batch in evaluation_example_batches(examples, 8) for item in batch) == (
         examples
     )
+
+
+def test_xls_r_evaluation_caps_each_model_call_at_eight_windows() -> None:
+    from voxdelta.evaluation.emotion_training import (
+        AudioClip,
+        batched_evaluation_logits,
+        evaluation_windows,
+    )
+
+    clip = AudioClip(samples=(0.0,) * (45 * 16_000))
+    windows_by_item = tuple(evaluation_windows(clip) for _ in range(8))
+    call_sizes: list[int] = []
+
+    def predict(windows: tuple[AudioClip, ...]) -> tuple[tuple[float, ...], ...]:
+        offset = sum(call_sizes)
+        call_sizes.append(len(windows))
+        return tuple((float(offset + index),) * 7 for index in range(len(windows)))
+
+    logits = batched_evaluation_logits(windows_by_item, 8, predict)
+
+    assert call_sizes == [8, 8, 8]
+    assert len(logits) == 8
+    assert all(len(row) == 7 for row in logits)
+    assert [row[0] for row in logits] == [float(3 * index + 1) for index in range(8)]
 
 
 @pytest.mark.parametrize(

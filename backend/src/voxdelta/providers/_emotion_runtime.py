@@ -232,7 +232,7 @@ def rss_megabytes(raw_rss: int | float, platform: str) -> float:
     return value / (1024 * 1024) if platform == "darwin" else value / 1024
 
 
-def default_rss_probe() -> float:
+def default_rss_probe() -> float | None:
     try:
         if sys.platform == "win32":
             psutil = import_module("psutil")
@@ -242,7 +242,7 @@ def default_rss_probe() -> float:
         maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         return rss_megabytes(maximum, sys.platform)
     except Exception:
-        return 0.0
+        return None
 
 
 def _probabilities(window_logits: Sequence[Sequence[float]]) -> dict[EmotionLabel, float]:
@@ -298,7 +298,7 @@ def analyze_local_emotion(
     load_predictor: Callable[[], Predictor],
     inference_context: Callable[[], AbstractContextManager[object]],
     clock: Callable[[], float] = time.perf_counter,
-    rss_probe: Callable[[], float] = default_rss_probe,
+    rss_probe: Callable[[], float | None] = default_rss_probe,
 ) -> EmotionResult:
     del transcript
     if not utterance_id:
@@ -325,8 +325,13 @@ def analyze_local_emotion(
         elapsed = 0.0
     rss: float | None
     try:
-        measured_rss = float(rss_probe())
-        rss = measured_rss if math.isfinite(measured_rss) and measured_rss >= 0 else None
+        raw_rss = rss_probe()
+        measured_rss = None if raw_rss is None else float(raw_rss)
+        rss = (
+            measured_rss
+            if measured_rss is not None and math.isfinite(measured_rss) and measured_rss >= 0
+            else None
+        )
     except Exception:
         rss = None
     confidence = max(probabilities.values())
