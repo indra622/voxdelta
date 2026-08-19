@@ -1219,8 +1219,19 @@ class PipelineRunner:
 
         if not isinstance(stage, StageName):
             raise PipelineValidationError("invalid_stage", "Select a valid pipeline stage.")
-        self._repository.get_job(job_id)
+        job = self._repository.get_job(job_id)
+        if job.get("status") == "deleting":
+            raise PipelineStateError(
+                "job_deleting",
+                "The job is being deleted and cannot be retried.",
+            )
         with self._job_lock(job_id):
+            job = self._repository.get_job(job_id)
+            if job.get("status") == "deleting":
+                raise PipelineStateError(
+                    "job_deleting",
+                    "The job is being deleted and cannot be retried.",
+                )
             self._invalidate_from(job_id, stage)
             return self._run_locked(job_id)
 

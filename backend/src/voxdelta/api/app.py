@@ -12,8 +12,9 @@ from typing import Annotated, BinaryIO, cast
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from voxdelta.api.dependencies import build_dependencies
 from voxdelta.api.schemas import (
@@ -38,6 +39,8 @@ from voxdelta.pipeline.runner import (
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 AUDIO_CHUNK_BYTES = 64 * 1024
+# Multipart boundaries and headers are bounded separately from the exact stored-file limit.
+MULTIPART_OVERHEAD_BYTES = 64 * 1024
 _SUPPORTED_SUFFIXES = frozenset({".wav", ".mp3", ".m4a"})
 _PUBLIC_STAGE_ERRORS = {
     "pipeline_failed": "The pipeline stage failed.",
@@ -58,6 +61,65 @@ class _UploadAdmissionError(ValueError):
         super().__init__(message)
 
 
+class _RequestBodyLimitExceeded(Exception):
+    pass
+
+
+class _RequestBodyLimitMiddleware:
+    """Stop oversized upload bodies while the multipart parser is still reading ASGI messages."""
+
+    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+        self._app = app
+        self._max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] != "http"
+            or scope.get("method") != "POST"
+            or scope.get("path") != "/api/jobs"
+        ):
+            await self._app(scope, receive, send)
+            return
+
+        total = 0
+        limit_exceeded = False
+        response_started = False
+
+        async def limited_receive() -> Message:
+            nonlocal limit_exceeded, total
+            message = await receive()
+            if message["type"] == "http.request":
+                total += len(message.get("body", b""))
+                if total > self._max_bytes:
+                    limit_exceeded = True
+                    raise _RequestBodyLimitExceeded
+            return message
+
+        async def tracking_send(message: Message) -> None:
+            nonlocal response_started
+            if limit_exceeded and not response_started:
+                raise _RequestBodyLimitExceeded
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self._app(scope, limited_receive, tracking_send)
+        except _RequestBodyLimitExceeded:
+            if response_started:
+                raise
+            response = JSONResponse(
+                status_code=413,
+                content={
+                    "detail": {
+                        "code": "upload_too_large",
+                        "message": "The uploaded file exceeds the configured size limit.",
+                    }
+                },
+            )
+            await response(scope, receive, send)
+
+
 class _ContextCloser:
     """Idempotently release a streamed descriptor from body or response cleanup."""
 
@@ -75,6 +137,20 @@ class _ContextCloser:
             self._context.__exit__(None, None, None)
         except Exception:
             pass
+
+
+class _ManagedStreamingResponse(StreamingResponse):
+    """Own a streamed descriptor for the full ASGI response lifecycle."""
+
+    def __init__(self, *args: object, closer: _ContextCloser, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._closer = closer
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._closer.close()
 
 
 def _not_found() -> HTTPException:
@@ -177,13 +253,21 @@ def _cleanup_failed_upload(
             destination.unlink(missing_ok=True)
         except Exception:
             pass
+    discarded = False
     try:
-        artifacts.delete_job(job_id)
+        with artifacts.operation_lock(job_id):
+            try:
+                artifacts.discard_unstarted_job(job_id)
+            except Exception:
+                pass
+            try:
+                repository.discard_unstarted_job(job_id)
+                discarded = True
+            except Exception:
+                pass
     except Exception:
         pass
-    try:
-        repository.delete_job(job_id)
-    except Exception:
+    if not discarded:
         try:
             repository.fail_unhandled_job(job_id)
         except Exception:
@@ -273,6 +357,10 @@ def create_app(
         raise ValueError("max_upload_bytes must be positive")
 
     app = FastAPI(title="VoxDelta", version="0.1.0")
+    app.add_middleware(
+        _RequestBodyLimitMiddleware,
+        max_bytes=max_upload_bytes + MULTIPART_OVERHEAD_BYTES,
+    )
 
     @app.get("/api/config/providers", response_model=ProviderConfiguration)
     def provider_configuration() -> ProviderConfiguration:
@@ -472,12 +560,13 @@ def create_app(
         }
         if status_code == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return StreamingResponse(
+        return _ManagedStreamingResponse(
             _audio_chunks(opened, closer, start, length),
             status_code=status_code,
             headers=headers,
             media_type="audio/wav",
             background=BackgroundTask(closer.close),
+            closer=closer,
         )
 
     @app.delete("/api/jobs/{job_id}", status_code=204)
@@ -496,4 +585,10 @@ def create_app(
 app = create_app()
 
 
-__all__ = ["AUDIO_CHUNK_BYTES", "UPLOAD_CHUNK_BYTES", "app", "create_app"]
+__all__ = [
+    "AUDIO_CHUNK_BYTES",
+    "MULTIPART_OVERHEAD_BYTES",
+    "UPLOAD_CHUNK_BYTES",
+    "app",
+    "create_app",
+]

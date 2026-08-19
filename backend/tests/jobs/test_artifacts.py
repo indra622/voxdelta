@@ -333,6 +333,50 @@ def test_delete_job_removes_only_the_exact_job_directory(tmp_path: Path) -> None
     assert sibling.read_text(encoding="utf-8") == "j10"
 
 
+def test_discard_unstarted_job_removes_directory_without_tombstone_and_syncs_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    (store.job_dir("j1") / "partial.wav").write_bytes(b"partial")
+    synced: list[Path] = []
+    monkeypatch.setattr(artifacts_module, "_fsync_directory", synced.append)
+
+    store.discard_unstarted_job("j1")
+
+    assert not (root / "j1").exists()
+    assert not (root / ".deleted").exists()
+    assert synced == [root]
+
+
+def test_existing_tombstone_fsync_failure_is_retried_before_job_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    store.job_dir("j1")
+    store.mark_deletion_tombstone("j1")
+    real_fsync = artifacts_module.os.fsync
+    fsync_attempts = 0
+
+    def fail_once(descriptor: int) -> None:
+        nonlocal fsync_attempts
+        fsync_attempts += 1
+        if fsync_attempts == 1:
+            raise OSError("tombstone fsync interrupted")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(artifacts_module.os, "fsync", fail_once)
+
+    with pytest.raises(OSError, match="interrupted"):
+        store.delete_job("j1")
+    assert (root / "j1").is_dir()
+    store.delete_job("j1")
+
+    assert fsync_attempts >= 2
+    assert not (root / "j1").exists()
+
+
 def test_delete_job_persists_tombstone_that_blocks_stale_process_logger(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     store = ArtifactStore(root)

@@ -655,6 +655,41 @@ class JobRepository:
                     raise ValueError("job deletion was not fenced")
                 raise KeyError(job_id)
 
+    def discard_unstarted_job(self, job_id: str) -> None:
+        """CAS-delete only a pristine pending job that has never entered pipeline work."""
+
+        validate_job_id(job_id)
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            deleted = database.execute(
+                """
+                DELETE FROM jobs
+                WHERE id = ? AND status = ?
+                  AND (SELECT COUNT(*) FROM stages WHERE job_id = ?) = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM stages
+                    WHERE job_id = ? AND (
+                      status != ? OR artifact_path IS NOT NULL OR cache_key IS NOT NULL
+                      OR artifact_hash IS NOT NULL OR error_json IS NOT NULL
+                      OR claim_token IS NOT NULL OR claimed_at IS NOT NULL OR role_confirmed != 0
+                    )
+                  )
+                """,
+                (
+                    job_id,
+                    StageStatus.PENDING.value,
+                    job_id,
+                    len(StageName),
+                    job_id,
+                    StageStatus.PENDING.value,
+                ),
+            )
+            if deleted.rowcount == 1:
+                return
+            if database.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None:
+                raise KeyError(job_id)
+            raise ValueError("job is not an unstarted pending job")
+
     def delete_job(self, job_id: str) -> None:
         """Delete a job and cascade its stages in one transaction."""
 

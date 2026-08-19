@@ -15,6 +15,7 @@ import pytest
 from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from starlette.requests import ClientDisconnect
 
 import voxdelta.jobs.artifacts as artifacts_module
 from voxdelta.api.app import create_app
@@ -52,13 +53,13 @@ class PreClaimFailRunner(PipelineRunner):
 
 
 class FailingDeleteStore(ArtifactStore):
-    def delete_job(self, job_id: str) -> None:
+    def discard_unstarted_job(self, job_id: str) -> None:
         del job_id
         raise OSError("private artifact cleanup path")
 
 
 class FailingDeleteRepository(JobRepository):
-    def delete_job(self, job_id: str) -> None:
+    def discard_unstarted_job(self, job_id: str) -> None:
         del job_id
         raise RuntimeError("private database cleanup row")
 
@@ -130,6 +131,54 @@ async def upload(client: httpx.AsyncClient, *, diagnostic_capture: str = "false"
         files={"file": ("../../private-call.WAV", FIXTURE.read_bytes(), "audio/wav")},
         data={"diagnostic_capture": diagnostic_capture},
     )
+
+
+async def raw_chunked_request(
+    app: FastAPI,
+    body: bytes,
+    *,
+    include_content_length: bool,
+    chunk_size: int = 4096,
+) -> tuple[list[dict[str, object]], int]:
+    """Drive the ASGI app without allowing an HTTP client to pre-buffer the request."""
+
+    offset = 0
+    received = 0
+    sent: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        nonlocal offset, received
+        chunk = body[offset : offset + chunk_size]
+        offset += len(chunk)
+        received += len(chunk)
+        return {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": offset < len(body),
+        }
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    boundary = b"voxdelta-boundary"
+    headers = [(b"content-type", b"multipart/form-data; boundary=" + boundary)]
+    if include_content_length:
+        headers.append((b"content-length", str(len(body)).encode("ascii")))
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/jobs",
+        "raw_path": b"/api/jobs",
+        "query_string": b"",
+        "headers": headers,
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
+    await app(scope, receive, send)  # type: ignore[arg-type]
+    return sent, received
 
 
 def job_count(repository: JobRepository) -> int:
@@ -231,22 +280,70 @@ async def test_upload_rejects_cap_plus_one_and_empty_and_cleans_partial_state(
 ) -> None:
     app, repository, artifacts, _ = build_harness(tmp_path, max_upload_bytes=8)
     async with client_for(app) as client:
-        oversized = await client.post(
-            "/api/jobs",
-            files={"file": ("call.wav", b"123456789", "audio/wav")},
-        )
-        empty = await client.post(
-            "/api/jobs",
-            files={"file": ("call.wav", b"", "audio/wav")},
-        )
+        oversized = [
+            await client.post(
+                "/api/jobs",
+                files={"file": ("call.wav", b"123456789", "audio/wav")},
+            )
+            for _ in range(2)
+        ]
+        empty = [
+            await client.post(
+                "/api/jobs",
+                files={"file": ("call.wav", b"", "audio/wav")},
+            )
+            for _ in range(2)
+        ]
 
-    assert oversized.status_code == 413
-    assert oversized.json()["detail"]["code"] == "upload_too_large"
-    assert empty.status_code == 422
-    assert empty.json()["detail"]["code"] == "empty_upload"
+    assert all(response.status_code == 413 for response in oversized)
+    assert all(response.json()["detail"]["code"] == "upload_too_large" for response in oversized)
+    assert all(response.status_code == 422 for response in empty)
+    assert all(response.json()["detail"]["code"] == "empty_upload" for response in empty)
     assert job_count(repository) == 0
     assert not artifacts.root.exists() or not list(artifacts.root.glob("[!.]*"))
-    assert str(tmp_path) not in oversized.text + empty.text
+    assert not (artifacts.root / ".deleted").exists()
+    assert str(tmp_path) not in "".join(response.text for response in oversized + empty)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_content_length", [False, True])
+async def test_raw_multipart_ingress_stops_near_request_cap_before_parsing(
+    tmp_path: Path,
+    include_content_length: bool,
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path, max_upload_bytes=8)
+    boundary = b"voxdelta-boundary"
+    body = b"".join(
+        (
+            b"--" + boundary + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="call.wav"\r\n',
+            b"Content-Type: audio/wav\r\n\r\n",
+            b"x" * (3 * 1024 * 1024),
+            b"\r\n--" + boundary + b"--\r\n",
+        )
+    )
+
+    sent, received = await raw_chunked_request(
+        app,
+        body,
+        include_content_length=include_content_length,
+    )
+
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    response_body = b"".join(
+        message.get("body", b"")  # type: ignore[arg-type]
+        for message in sent
+        if message["type"] == "http.response.body"
+    )
+    assert start["status"] == 413
+    assert json.loads(response_body)["detail"] == {
+        "code": "upload_too_large",
+        "message": "The uploaded file exceeds the configured size limit.",
+    }
+    assert received <= 8 + (64 * 1024) + 4096
+    assert received < len(body)
+    assert job_count(repository) == 0
+    assert not artifacts.root.exists()
 
 
 @pytest.mark.asyncio
@@ -275,6 +372,7 @@ async def test_upload_close_failure_is_sanitized_and_cleans_job(
     }
     assert job_count(repository) == 0
     assert not artifacts.root.exists() or not list(artifacts.root.glob("[!.]*"))
+    assert not (artifacts.root / ".deleted").exists()
     assert "private" not in response.text
     assert str(tmp_path) not in response.text
 
@@ -684,6 +782,55 @@ async def test_audio_cancelled_body_and_background_do_not_double_close(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_audio_send_disconnect_closes_descriptor_without_manual_cleanup(
+    tmp_path: Path,
+) -> None:
+    app, _, _, runner = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+    job_id = created.json()["job_id"]
+    original = runner.open_mixed_preview
+    closes = 0
+
+    @contextmanager
+    def tracking_open(selected_job_id: str):  # type: ignore[no-untyped-def]
+        nonlocal closes
+        with original(selected_job_id) as opened:
+            try:
+                yield opened
+            finally:
+                closes += 1
+
+    runner.open_mixed_preview = tracking_open  # type: ignore[method-assign]
+    response = audio_endpoint(app)(job_id, audio_request(job_id))
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def disconnected_send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body":
+            raise OSError("client disconnected")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": f"/api/jobs/{job_id}/audio",
+        "raw_path": f"/api/jobs/{job_id}/audio".encode("ascii"),
+        "query_string": b"",
+        "headers": [],
+        "client": ("test", 1),
+        "server": ("test", 80),
+    }
+    with pytest.raises(ClientDisconnect):
+        await response(scope, receive, disconnected_send)  # type: ignore[arg-type]
+
+    assert closes == 1
+
+
+@pytest.mark.asyncio
 async def test_audio_accessor_hashes_only_the_opened_mixed_preview_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -809,6 +956,70 @@ async def test_delete_database_finalization_failure_is_retryable(
     assert second.status_code == 204
     with pytest.raises(KeyError):
         repository.get_job(job_id)
+
+
+@pytest.mark.asyncio
+async def test_retry_of_deleting_job_is_a_conflict_not_not_found(tmp_path: Path) -> None:
+    app, repository, _, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        repository.begin_delete(job_id)
+        response = await client.post(
+            f"/api/jobs/{job_id}/retry",
+            json={"stage": "diarize"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "job_deleting",
+        "message": "The job is being deleted and cannot be retried.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_delete_syncs_artifact_root_before_database_finalization_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path)
+    real_fsync_directory = artifacts_module._fsync_directory
+    real_finalize = repository.finalize_delete
+    events: list[str] = []
+    root_failures = 0
+    selected_job_id = ""
+
+    def fail_first_post_rmtree_root_sync(directory: Path) -> None:
+        nonlocal root_failures
+        if directory == artifacts.root and not (artifacts.root / selected_job_id).exists():
+            events.append("root_fsync")
+            root_failures += 1
+            if root_failures == 1:
+                raise OSError("private artifact root fsync")
+        real_fsync_directory(directory)
+
+    def tracking_finalize(job_id: str) -> None:
+        events.append("finalize")
+        real_finalize(job_id)
+
+    monkeypatch.setattr(artifacts_module, "_fsync_directory", fail_first_post_rmtree_root_sync)
+    monkeypatch.setattr(repository, "finalize_delete", tracking_finalize)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://testserver",
+    ) as client:
+        created = await upload(client)
+        selected_job_id = created.json()["job_id"]
+        first = await client.delete(f"/api/jobs/{selected_job_id}")
+        after_first = repository.get_job(selected_job_id)
+        second = await client.delete(f"/api/jobs/{selected_job_id}")
+
+    assert first.status_code == 409
+    assert first.json()["detail"]["code"] == "deletion_incomplete"
+    assert after_first["status"] == "deleting"
+    assert events == ["root_fsync", "root_fsync", "finalize"]
+    assert second.status_code == 204
+    with pytest.raises(KeyError):
+        repository.get_job(selected_job_id)
 
 
 @pytest.mark.asyncio

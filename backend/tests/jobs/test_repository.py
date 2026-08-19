@@ -350,6 +350,30 @@ def test_delete_job_rejects_an_unknown_job(tmp_path: Path) -> None:
         repository.delete_job("missing")
 
 
+def test_discard_unstarted_job_removes_only_a_pristine_pending_job(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    pristine = repository.create_job("")
+    claimed = repository.create_job("")
+    completed = repository.create_job("")
+    assert repository.claim_stage(claimed, StageName.NORMALIZE) is not None
+    with sqlite3.connect(repository.path) as database:
+        database.execute(
+            "UPDATE stages SET status = 'completed' WHERE job_id = ? AND stage = 'normalize'",
+            (completed,),
+        )
+
+    repository.discard_unstarted_job(pristine)
+    with pytest.raises(KeyError):
+        repository.get_job(pristine)
+    with pytest.raises(ValueError, match="unstarted"):
+        repository.discard_unstarted_job(claimed)
+    with pytest.raises(ValueError, match="unstarted"):
+        repository.discard_unstarted_job(completed)
+
+    assert repository.get_job(claimed)["stages"]["normalize"]["status"] == "running"
+    assert repository.get_job(completed)["stages"]["normalize"]["status"] == "completed"
+
+
 @pytest.mark.parametrize(
     "job_id",
     [

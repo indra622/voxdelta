@@ -138,11 +138,13 @@ class ArtifactStore:
             self.root.mkdir(parents=True, exist_ok=True)
         resolved_root = self.root.resolve()
         candidate = self.root / name
+        directory_created = False
         if _is_link_like(candidate):
             raise ValueError(error_message)
         if create:
             try:
                 candidate.mkdir(mode=0o700)
+                directory_created = True
             except FileExistsError:
                 pass
         if candidate.exists():
@@ -159,6 +161,8 @@ class ArtifactStore:
                 raise ValueError(error_message)
             if create:
                 os.chmod(candidate, 0o700)
+        if directory_created:
+            _fsync_directory(self.root)
         return candidate
 
     def _tombstone_path(self, job_id: str, *, create_directory: bool) -> Path:
@@ -193,25 +197,47 @@ class ArtifactStore:
         """Atomically and durably fence every future write for one random job ID."""
 
         target = self._tombstone_path(job_id, create_directory=True)
-        if self.deletion_tombstone_exists(job_id):
-            return target
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        create_flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        create_flags |= getattr(os, "O_NOFOLLOW", 0)
+        existing_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        existing_flags |= getattr(os, "O_NOFOLLOW", 0)
+        created = False
         try:
-            descriptor = os.open(target, flags, 0o600)
+            descriptor = os.open(target, create_flags, 0o600)
+            created = True
         except FileExistsError:
-            if self.deletion_tombstone_exists(job_id):
-                return target
-            raise ValueError(_TOMBSTONE_VALIDATION_ERROR) from None
+            try:
+                descriptor = os.open(target, existing_flags)
+            except OSError:
+                raise ValueError(_TOMBSTONE_VALIDATION_ERROR) from None
         try:
+            opened = os.fstat(descriptor)
+            current = target.lstat()
+            try:
+                target_is_local = target.resolve().parent == self.root.resolve() / ".deleted"
+            except (OSError, RuntimeError):
+                raise ValueError(_TOMBSTONE_VALIDATION_ERROR) from None
+            if (
+                _is_link_like(target)
+                or not target_is_local
+                or not stat.S_ISREG(opened.st_mode)
+                or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
             os.fchmod(descriptor, 0o600)
             payload = job_id.encode("ascii")
-            remaining = memoryview(payload)
-            while remaining:
-                written = os.write(descriptor, remaining)
-                if written <= 0:
-                    raise OSError("tombstone write made no progress")
-                remaining = remaining[written:]
+            if created:
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("tombstone write made no progress")
+                    remaining = remaining[written:]
+            else:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                persisted = os.read(descriptor, len(payload) + 1)
+                if persisted != payload:
+                    raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -398,3 +424,16 @@ class ArtifactStore:
         )
         if resolved_target.exists():
             shutil.rmtree(resolved_target)
+        _fsync_directory(self.root)
+
+    def discard_unstarted_job(self, job_id: str) -> None:
+        """Remove a never-scheduled job directory without permanently fencing its random ID."""
+
+        resolved_target = self._job_path(
+            job_id,
+            create=False,
+            require_directory=False,
+        )
+        if resolved_target.exists():
+            shutil.rmtree(resolved_target)
+        _fsync_directory(self.root)
