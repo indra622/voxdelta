@@ -431,30 +431,44 @@ class PipelineRunner:
             )
         if isinstance(artifact, TranscribeArtifact):
             diarized = self._read(job_id, StageName.DIARIZE, DiarizeArtifact)
-            if len(artifact.utterances) != len(diarized.alignment_segments):
+            normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
+            duration = normalized.asset.duration_seconds
+            if duration is None or not math.isfinite(duration) or duration <= 0:
                 return False
-            if len({item.id for item in artifact.utterances}) != len(artifact.utterances):
+            if not artifact.utterances or len({item.id for item in artifact.utterances}) != len(
+                artifact.utterances
+            ):
                 return False
-            return all(
-                utterance.role == Role.UNKNOWN
-                and (
-                    utterance.start,
-                    utterance.end,
-                    utterance.speaker_id,
-                    utterance.overlap,
-                    utterance.confidence,
-                )
-                == (
-                    segment.start,
-                    segment.end,
-                    segment.speaker_id,
-                    segment.overlap,
-                    segment.confidence,
-                )
-                for utterance, segment in zip(
-                    artifact.utterances, diarized.alignment_segments, strict=True
-                )
+            ordered = sorted(
+                artifact.utterances,
+                key=lambda item: (item.start, item.end, item.id, item.speaker_id),
             )
+            if artifact.utterances != ordered:
+                return False
+            speakers = {segment.speaker_id for segment in diarized.alignment_segments}
+            for utterance in artifact.utterances:
+                if (
+                    utterance.role != Role.UNKNOWN
+                    or utterance.speaker_id not in speakers
+                    or not utterance.id
+                    or not utterance.transcript.strip()
+                    or not math.isfinite(utterance.start)
+                    or not math.isfinite(utterance.end)
+                    or utterance.start < 0
+                    or utterance.end <= utterance.start
+                    or utterance.end > duration
+                ):
+                    return False
+                overlapping = [
+                    segment
+                    for segment in diarized.alignment_segments
+                    if utterance.start < segment.end and segment.start < utterance.end
+                ]
+                if not any(
+                    segment.speaker_id == utterance.speaker_id for segment in overlapping
+                ) or any(segment.speaker_id != utterance.speaker_id for segment in overlapping):
+                    return False
+            return True
         if isinstance(artifact, RoleArtifact):
             transcribed = self._read(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
             speakers = {utterance.speaker_id for utterance in artifact.utterances}

@@ -38,6 +38,7 @@ from voxdelta.pipeline.stages import (
     ReportArtifact,
     RoleArtifact,
     StrategyArtifact,
+    TranscribeArtifact,
     TransitionsArtifact,
     cache_key_for_stage,
 )
@@ -160,6 +161,93 @@ class CapturingTranscription(FakeTranscriptionProvider):
     def transcribe(self, asset: AudioAsset, segments: list[SpeakerSegment]) -> list[Utterance]:
         self.segments = list(segments)
         return super().transcribe(asset, segments)
+
+
+class ConsecutiveDiarizer(FakeDiarizationProvider):
+    def diarize_timelines(self, asset: AudioAsset) -> DiarizationTimelines:
+        del asset
+        segments = [
+            SpeakerSegment(start=0, end=10, speaker_id="SPEAKER_00", confidence=1),
+            SpeakerSegment(start=10, end=20, speaker_id="SPEAKER_00", confidence=1),
+            SpeakerSegment(start=20, end=30, speaker_id="SPEAKER_01", confidence=1),
+            SpeakerSegment(start=30, end=40, speaker_id="SPEAKER_00", confidence=1),
+            SpeakerSegment(start=40, end=50, speaker_id="SPEAKER_01", confidence=1),
+            SpeakerSegment(start=50, end=60, speaker_id="SPEAKER_01", confidence=1),
+        ]
+        return DiarizationTimelines(evidence=segments, exclusive=list(segments))
+
+
+class WordDerivedTranscription(FakeTranscriptionProvider):
+    def __init__(self, corruption: str | None = None) -> None:
+        self.corruption = corruption
+
+    def transcribe(self, asset: AudioAsset, segments: list[SpeakerSegment]) -> list[Utterance]:
+        del asset, segments
+        utterances = [
+            Utterance(
+                id="word-1",
+                start=1,
+                end=2,
+                speaker_id="SPEAKER_00",
+                confidence=1,
+                transcript="첫 번째",
+            ),
+            Utterance(
+                id="word-2",
+                start=2,
+                end=3,
+                speaker_id="SPEAKER_00",
+                confidence=1,
+                transcript="두 번째",
+            ),
+            Utterance(
+                id="span-same-speaker",
+                start=5,
+                end=15,
+                speaker_id="SPEAKER_00",
+                confidence=1,
+                transcript="연속 구간",
+            ),
+            Utterance(
+                id="word-3",
+                start=21,
+                end=22,
+                speaker_id="SPEAKER_01",
+                confidence=1,
+                transcript="세 번째",
+            ),
+            Utterance(
+                id="word-4",
+                start=41,
+                end=42,
+                speaker_id="SPEAKER_01",
+                confidence=1,
+                transcript="네 번째",
+            ),
+            Utterance(
+                id="partial-coverage",
+                start=59,
+                end=62,
+                speaker_id="SPEAKER_01",
+                confidence=1,
+                transcript="부분 겹침",
+            ),
+        ]
+        if self.corruption == "mismatch":
+            utterances[0] = utterances[0].model_copy(update={"speaker_id": "SPEAKER_01"})
+        elif self.corruption == "zero-overlap":
+            utterances[-1] = utterances[-1].model_copy(update={"start": 62.0, "end": 63.0})
+        elif self.corruption == "duplicate":
+            utterances[1] = utterances[1].model_copy(update={"id": utterances[0].id})
+        elif self.corruption == "unsorted":
+            utterances = list(reversed(utterances))
+        elif self.corruption == "cross-speaker":
+            utterances[2] = utterances[2].model_copy(update={"start": 19.0, "end": 21.0})
+        elif self.corruption == "outside":
+            utterances[-1] = utterances[-1].model_copy(update={"end": 66.0})
+        elif self.corruption == "empty":
+            utterances[0] = utterances[0].model_copy(update={"transcript": "   "})
+        return utterances
 
 
 class WrongIdEmotion(FakeEmotionProvider):
@@ -381,6 +469,49 @@ def test_pipeline_persists_overlap_evidence_but_transcribes_exclusive_timeline(
     assert any(segment.overlap for segment in artifact.segments)
     assert all(not segment.overlap for segment in artifact.alignment_segments)
     assert transcription.segments == artifact.alignment_segments
+
+
+def test_transcription_semantics_accept_word_intervals_and_adjacent_same_speaker_turns(
+    tmp_path: Path,
+) -> None:
+    runner, _repository, store, job_id = _harness(
+        tmp_path,
+        diarizer=ConsecutiveDiarizer(),
+        transcription=WordDerivedTranscription(),
+    )
+
+    result = runner.run_until_pause(job_id)
+
+    assert result["status"] == "paused"
+    transcribed = store.read_model(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
+    assert len(transcribed.utterances) == 6
+    assert transcribed.utterances[2].start == 5
+    assert transcribed.utterances[2].end == 15
+    assert transcribed.utterances[-1].end == 62
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["mismatch", "zero-overlap", "duplicate", "unsorted", "cross-speaker", "outside", "empty"],
+)
+def test_transcription_semantics_reject_hostile_word_alignment(
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    runner, repository, store, job_id = _harness(
+        tmp_path,
+        diarizer=ConsecutiveDiarizer(),
+        transcription=WordDerivedTranscription(corruption),
+    )
+
+    result = runner.run_until_pause(job_id)
+
+    assert result["stages"][StageName.TRANSCRIBE.value]["status"] == "failed"
+    assert not store.artifact_path(job_id, StageName.TRANSCRIBE).exists()
+    error = json.loads(
+        repository.get_job(job_id)["stages"][StageName.TRANSCRIBE.value]["error_json"]
+    )
+    assert error["code"] == "invalid_stage_output"
 
 
 def test_emotion_provider_receives_distinct_aligned_temporary_customer_clips(

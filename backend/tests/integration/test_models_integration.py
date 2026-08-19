@@ -221,8 +221,8 @@ def test_selected_real_adapter_boundaries_run_without_weights_or_network(tmp_pat
 
     class Word:
         def __init__(self, index: int) -> None:
-            self.start = index * 10.0
-            self.end = (index + 1) * 10.0
+            self.start = index * 10.0 + 1.0
+            self.end = index * 10.0 + 4.0
             self.word = f" 발화{index}"
 
     class WhisperSegment:
