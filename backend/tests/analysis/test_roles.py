@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from voxdelta.analysis.roles import suggest_roles
 from voxdelta.domain.models import Role, Utterance
 
@@ -88,6 +90,42 @@ def test_suggest_roles_counts_only_explicit_opening_self_introduction() -> None:
     ]
 
     assert suggest_roles(utterances) == {"S1": Role.AGENT, "S2": Role.CUSTOMER}
+
+
+@pytest.mark.parametrize(
+    "introduction",
+    [
+        "안녕하세요, 김민수입니다.",
+        "안녕하십니까? 홍길동입니다",
+    ],
+)
+def test_suggest_roles_counts_common_greeted_name_introductions(introduction: str) -> None:
+    utterances = [
+        _utterance("s1-first", "S1", 0.0, introduction),
+        _utterance("s2-first", "S2", 0.5, "문의가 있습니다"),
+    ]
+
+    assert suggest_roles(utterances) == {"S1": Role.AGENT, "S2": Role.CUSTOMER}
+
+
+@pytest.mark.parametrize(
+    "non_introduction",
+    [
+        "현재 처리 상태입니다.",
+        "약관상 환불 불가입니다.",
+        "안녕하세요, 정책입니다.",
+        "안녕하십니까? 이용약관입니다.",
+    ],
+)
+def test_suggest_roles_does_not_score_policy_or_status_sentences(
+    non_introduction: str,
+) -> None:
+    utterances = [
+        _utterance("s1-first", "S1", 0.0, non_introduction),
+        _utterance("s2-first", "S2", 0.5, "문의가 있습니다"),
+    ]
+
+    assert suggest_roles(utterances) is None
 
 
 def test_suggest_roles_does_not_treat_non_opening_or_generic_imnida_as_introduction() -> None:

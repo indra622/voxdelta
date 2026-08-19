@@ -8,7 +8,17 @@ from voxdelta.domain.models import Role, Utterance
 
 _OPENING_SECONDS = 30.0
 _AGENT_CUES = ("상담원", "고객센터", "무엇을 도와", "도와드리")
-_SELF_INTRODUCTION = re.compile(r"(?:저는|제\s*이름은)\s+\S(?:.*\S)?입니다[.!?…]*$")
+_EXPLICIT_SELF_INTRODUCTION = re.compile(r"(?:저는|제\s*이름은)\s+\S(?:.*\S)?입니다[.!?…]*$")
+_GREETED_NAME_INTRODUCTION = re.compile(
+    r"^(?:안녕하세요|안녕하십니까)[,.!?\s]+[가-힣]{3}입니다[.!?…]*$"
+)
+
+
+def _is_self_introduction(transcript: str) -> bool:
+    return bool(
+        _EXPLICIT_SELF_INTRODUCTION.search(transcript)
+        or _GREETED_NAME_INTRODUCTION.fullmatch(transcript)
+    )
 
 
 def suggest_roles(utterances: list[Utterance]) -> dict[str, Role] | None:
@@ -37,7 +47,7 @@ def suggest_roles(utterances: list[Utterance]) -> dict[str, Role] | None:
                 cues.add(cue)
         if utterance.speaker_id not in first_turn_seen:
             first_turn_seen.add(utterance.speaker_id)
-            if _SELF_INTRODUCTION.search(transcript):
+            if _is_self_introduction(transcript):
                 cues.add("self-introduction")
 
     scores = {speaker_id: len(cues) for speaker_id, cues in cues_by_speaker.items()}

@@ -43,8 +43,10 @@ Task 4 and Task 5 use one state-mapping implementation.
 - Role suggestion requires exactly two speakers across the entire call, while cue
   inspection is limited to utterances starting before 30 seconds.
 - Each literal cue scores at most once per speaker. The self-introduction cue is
-  deliberately narrow: only a speaker's first opening turn and an explicit
-  `저는 ...입니다` or `제 이름은 ...입니다` ending count.
+  deliberately bounded to a speaker's first opening turn. Explicit
+  `저는 ...입니다` / `제 이름은 ...입니다` forms and greeted three-syllable Korean
+  name forms such as `안녕하세요, 김민수입니다.` count; generic policy and status
+  sentences ending in `입니다` do not.
 - Suggestions are proposals only. Input `Utterance.role` values are never changed.
 - Summary emotions are aligned by unique customer utterance ID and then ordered by the
   deterministic utterance chronology. Only finite, present smoothed intensities count
@@ -99,6 +101,74 @@ zero customers, deterministic peak ties, and transition counts.
 ```text
 cd backend && uv run pytest -v
 279 passed in 3.02s
+
+cd backend && uv run ruff check .
+All checks passed!
+
+cd backend && uv run ruff format --check .
+37 files already formatted
+
+cd backend && uv run mypy src
+Success: no issues found in 23 source files
+
+git diff --check
+exit code 0
+```
+
+## Review Follow-up: Opening Introductions and Unique Transition Evidence
+
+The Task 5 review identified two contract gaps in commit `f7979f4`:
+
+- The opening self-introduction matcher required `저는` or `제 이름은`, so ordinary
+  first-turn forms such as `안녕하세요, 김민수입니다.` were not scored.
+- `build_transitions` rejected duplicate emotion IDs but did not reject duplicate
+  utterance IDs, allowing ambiguous customer, agent, or unknown-turn evidence.
+
+### Follow-up RED
+
+Regression tests were added before either production change:
+
+```text
+cd backend && uv run pytest tests/analysis/test_roles.py \
+  tests/analysis/test_transitions.py -v \
+  -k 'common_greeted_name_introductions or policy_or_status_sentences or duplicate_utterance_ids'
+9 selected: 5 failed, 4 passed
+```
+
+Both greeted-name introductions returned `None`, and duplicate customer, agent, and
+unknown utterance IDs all failed to raise. The four negative policy/status examples
+already passed, confirming that the required broadening could remain narrow.
+
+### Follow-up GREEN
+
+- Greeted-name matching now requires an opening greeting plus a three-syllable Hangul
+  name immediately before `입니다`. Explicit-marker forms remain supported. The rule
+  still runs only on each speaker's first utterance starting before 30 seconds.
+- Transition construction now validates global utterance-ID uniqueness at function
+  entry, before emotion lookup or chronological sorting, regardless of the duplicate
+  turns' roles.
+
+```text
+cd backend && uv run pytest tests/analysis/test_roles.py -v
+13 passed in 0.03s
+
+cd backend && uv run pytest tests/analysis/test_transitions.py -v
+20 passed in 0.03s
+
+cd backend && uv run pytest tests/analysis -v
+71 passed in 0.05s
+```
+
+The follow-up adds positive coverage for `안녕하세요, 김민수입니다.` and
+`안녕하십니까? 홍길동입니다`, negative coverage for generic status/policy and
+greeted non-name nouns, and duplicate-ID coverage for customer, agent, and unknown
+roles.
+
+### Follow-up Verification
+
+```text
+cd backend && uv run pytest -v
+288 passed in 3.00s
 
 cd backend && uv run ruff check .
 All checks passed!

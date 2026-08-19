@@ -165,6 +165,20 @@ def test_build_transitions_rejects_duplicate_emotion_ids_even_when_unused() -> N
         build_transitions(utterances, emotions)
 
 
+@pytest.mark.parametrize("duplicate_role", [Role.CUSTOMER, Role.AGENT, Role.UNKNOWN])
+def test_build_transitions_rejects_duplicate_utterance_ids_for_every_role(
+    duplicate_role: Role,
+) -> None:
+    utterances = [
+        _utterance("duplicate", 0.0, duplicate_role),
+        _utterance("middle", 1.0, Role.AGENT),
+        _utterance("duplicate", 2.0, duplicate_role),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate utterance id: duplicate"):
+        build_transitions(utterances, [])
+
+
 def test_build_transitions_rejects_non_finite_smoothed_intensity() -> None:
     utterances = [
         _utterance("c1", 0.0, Role.CUSTOMER),

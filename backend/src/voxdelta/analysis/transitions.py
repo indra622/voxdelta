@@ -36,6 +36,12 @@ def build_transitions(
     to the raw intensity.
     """
 
+    utterance_ids: set[str] = set()
+    for utterance in utterances:
+        if utterance.id in utterance_ids:
+            raise ValueError(f"duplicate utterance id: {utterance.id}")
+        utterance_ids.add(utterance.id)
+
     emotion_by_id: dict[str, EmotionResult] = {}
     for emotion in emotions:
         if emotion.utterance_id in emotion_by_id:
