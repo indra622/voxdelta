@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from voxdelta.domain.models import AnalysisReport, AudioAsset, Role, Utterance
+from voxdelta.domain.models import AnalysisReport, AudioAsset, EmotionLabel, Role, Utterance
 from voxdelta.providers.base import (
     DiarizationProvider,
     EmotionProvider,
@@ -24,6 +24,7 @@ from voxdelta.providers.fake import (
     FakeReportSummaryProvider,
     FakeResponseStrategyProvider,
     FakeTranscriptionProvider,
+    _derive_operational_state,
 )
 
 
@@ -51,6 +52,27 @@ def _utterance(transcript: str) -> Utterance:
     )
 
 
+def _probabilities(
+    *,
+    happiness: float,
+    anger: float,
+    disgust: float,
+    fear: float,
+    neutral: float,
+    sadness: float,
+    surprise: float,
+) -> dict[EmotionLabel, float]:
+    return {
+        "happiness": happiness,
+        "anger": anger,
+        "disgust": disgust,
+        "fear": fear,
+        "neutral": neutral,
+        "sadness": sadness,
+        "surprise": surprise,
+    }
+
+
 def test_fake_providers_conform_to_runtime_protocols_and_local_provenance() -> None:
     providers = (
         (FakeDiarizationProvider(), DiarizationProvider),
@@ -70,26 +92,51 @@ def test_fake_providers_conform_to_runtime_protocols_and_local_provenance() -> N
         assert provider.provenance.schema_version == "1"
 
 
-@pytest.mark.parametrize("duration_seconds", [None, 0.0, 0.001, 0.5, 65.0])
-def test_fake_diarizer_returns_two_ordered_speakers_for_edge_durations(
+@pytest.mark.parametrize("duration_seconds", [None, 0.0, -1.0, math.inf, math.nan])
+def test_fake_diarizer_rejects_missing_non_finite_or_non_positive_duration(
     duration_seconds: float | None,
+) -> None:
+    provider = FakeDiarizationProvider()
+    asset = _asset().model_copy(update={"duration_seconds": duration_seconds})
+
+    with pytest.raises(ValueError, match="duration_seconds must be finite and positive"):
+        provider.diarize(asset)
+
+
+def test_fake_diarizer_rejects_duration_too_small_for_six_positive_segments() -> None:
+    duration_seconds = math.nextafter(0.0, 1.0)
+    asset = _asset(duration_seconds)
+
+    with pytest.raises(ValueError, match="too small for six positive segments"):
+        FakeDiarizationProvider().diarize(asset)
+
+
+@pytest.mark.parametrize("duration_seconds", [1e-300, 0.001, 0.5, 65.0])
+def test_fake_diarizer_returns_six_exactly_bounded_alternating_segments(
+    duration_seconds: float,
 ) -> None:
     provider = FakeDiarizationProvider()
     asset = _asset(duration_seconds)
     segments = provider.diarize(asset)
 
     assert segments == provider.diarize(asset)
-    assert {segment.speaker_id for segment in segments} == {"SPEAKER_00", "SPEAKER_01"}
-    assert all(segment.start >= 0 for segment in segments)
-    assert all(segment.end > segment.start for segment in segments)
+    assert len(segments) == 6
+    assert [segment.speaker_id for segment in segments] == [
+        "SPEAKER_00",
+        "SPEAKER_01",
+        "SPEAKER_00",
+        "SPEAKER_01",
+        "SPEAKER_00",
+        "SPEAKER_01",
+    ]
+    assert segments[0].start == 0.0
+    assert segments[-1].end == duration_seconds
+    assert all(0.0 <= segment.start < segment.end <= duration_seconds for segment in segments)
     assert all(segment.confidence == 1.0 for segment in segments)
     assert all(
         current.end == following.start
         for current, following in zip(segments, segments[1:], strict=False)
     )
-
-    if duration_seconds is not None and duration_seconds > 0:
-        assert segments[-1].end == duration_seconds
 
 
 def test_fake_transcript_is_ordered_and_bound_to_diarization_segments() -> None:
@@ -135,6 +182,121 @@ def test_fake_emotion_is_deterministic_without_mutating_global_random_state() ->
     assert sum(first.probabilities.values()) == pytest.approx(1.0, abs=1e-6)
     assert first.provider == provider.provenance
     assert first.provider.schema_version == "1"
+
+
+def test_fake_emotion_uses_dominant_grouped_score_as_confidence() -> None:
+    result = FakeEmotionProvider().analyze("u6", Path("slice.wav"), "x")
+    probabilities = result.probabilities
+    dissatisfied = sum(probabilities[label] for label in ("sadness", "disgust", "fear"))
+    expected_confidence = max(
+        probabilities["happiness"],
+        probabilities["neutral"],
+        probabilities["anger"],
+        dissatisfied,
+    )
+
+    assert result.confidence == pytest.approx(expected_confidence)
+    assert result.confidence < 0.55
+    assert result.operational_state == "uncertain"
+
+
+@pytest.mark.parametrize(
+    ("probabilities", "expected_state"),
+    [
+        (
+            _probabilities(
+                happiness=0.6,
+                anger=0.05,
+                disgust=0.05,
+                fear=0.05,
+                neutral=0.1,
+                sadness=0.05,
+                surprise=0.1,
+            ),
+            "satisfied",
+        ),
+        (
+            _probabilities(
+                happiness=0.1,
+                anger=0.05,
+                disgust=0.05,
+                fear=0.05,
+                neutral=0.6,
+                sadness=0.05,
+                surprise=0.1,
+            ),
+            "stable",
+        ),
+        (
+            _probabilities(
+                happiness=0.05,
+                anger=0.6,
+                disgust=0.05,
+                fear=0.05,
+                neutral=0.1,
+                sadness=0.05,
+                surprise=0.1,
+            ),
+            "escalated",
+        ),
+        (
+            _probabilities(
+                happiness=0.15,
+                anger=0.05,
+                disgust=0.21,
+                fear=0.2,
+                neutral=0.05,
+                sadness=0.19,
+                surprise=0.15,
+            ),
+            "dissatisfied",
+        ),
+    ],
+)
+def test_operational_state_compares_four_canonical_scores(
+    probabilities: dict[EmotionLabel, float], expected_state: str
+) -> None:
+    state, confidence = _derive_operational_state(probabilities)
+
+    assert state == expected_state
+    assert confidence == pytest.approx(0.6)
+
+
+def test_operational_state_confidence_threshold_is_inclusive() -> None:
+    probabilities = _probabilities(
+        happiness=0.15,
+        anger=0.1,
+        disgust=0.2,
+        fear=0.15,
+        neutral=0.1,
+        sadness=0.2,
+        surprise=0.1,
+    )
+
+    state, confidence = _derive_operational_state(probabilities)
+
+    assert confidence == pytest.approx(0.55)
+    assert state == "dissatisfied"
+
+
+@pytest.mark.parametrize("surprise", [0.2, 0.21])
+def test_operational_state_treats_surprise_tie_or_dominance_as_uncertain(
+    surprise: float,
+) -> None:
+    probabilities = _probabilities(
+        happiness=0.2 if surprise == 0.2 else 0.19,
+        anger=0.02,
+        disgust=0.18,
+        fear=0.18,
+        neutral=0.03,
+        sadness=0.19,
+        surprise=surprise,
+    )
+
+    state, confidence = _derive_operational_state(probabilities)
+
+    assert confidence == pytest.approx(0.55)
+    assert state == "uncertain"
 
 
 def test_fake_emotion_is_stable_across_python_hash_seeds() -> None:

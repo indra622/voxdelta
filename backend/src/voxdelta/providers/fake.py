@@ -29,8 +29,8 @@ from voxdelta.providers.base import (
 
 _MODEL_VERSION = "deterministic-v1"
 _SCHEMA_VERSION = "1"
-_FALLBACK_DURATION_SECONDS = 2.0
-_SEGMENT_TARGET_SECONDS = 30.0
+_FAKE_SEGMENT_COUNT = 6
+_CONFIDENCE_THRESHOLD = 0.55
 _EMOTION_LABELS: tuple[EmotionLabel, ...] = (
     "happiness",
     "anger",
@@ -45,6 +45,11 @@ _NEGATIVE_EMOTION_LABELS: tuple[EmotionLabel, ...] = (
     "disgust",
     "fear",
     "sadness",
+)
+_DISSATISFIED_EMOTION_LABELS: tuple[EmotionLabel, ...] = (
+    "sadness",
+    "disgust",
+    "fear",
 )
 _TRANSCRIPT_LINES = (
     "안녕하세요. 문의 내용을 말씀해 주세요.",
@@ -66,6 +71,28 @@ def _local_provenance(name: str) -> ProviderProvenance:
     )
 
 
+def _derive_operational_state(
+    probabilities: dict[EmotionLabel, float],
+) -> tuple[OperationalState, float]:
+    scores: tuple[tuple[OperationalState, float], ...] = (
+        ("satisfied", probabilities["happiness"]),
+        ("stable", probabilities["neutral"]),
+        (
+            "dissatisfied",
+            math.fsum(probabilities[label] for label in _DISSATISFIED_EMOTION_LABELS),
+        ),
+        ("escalated", probabilities["anger"]),
+    )
+    # max() keeps the first item on ties, making the specification order above the tie-break.
+    state, confidence = max(scores, key=lambda item: item[1])
+    non_surprise_peak = max(
+        probabilities[label] for label in _EMOTION_LABELS if label != "surprise"
+    )
+    if probabilities["surprise"] >= non_surprise_peak or confidence < _CONFIDENCE_THRESHOLD:
+        return "uncertain", confidence
+    return state, confidence
+
+
 class FakeDiarizationProvider(DiarizationProvider):
     """Produce a bounded alternating two-speaker timeline."""
 
@@ -73,15 +100,18 @@ class FakeDiarizationProvider(DiarizationProvider):
 
     def diarize(self, asset: AudioAsset) -> list[SpeakerSegment]:
         duration = asset.duration_seconds
-        if duration is None or not math.isfinite(duration) or duration / 2 <= 0:
-            duration = _FALLBACK_DURATION_SECONDS
+        if duration is None or not math.isfinite(duration) or duration <= 0:
+            raise ValueError("duration_seconds must be finite and positive")
 
-        segment_count = max(2, math.ceil(duration / _SEGMENT_TARGET_SECONDS))
-        segment_seconds = duration / segment_count
+        boundaries = [
+            duration * (index / _FAKE_SEGMENT_COUNT) for index in range(_FAKE_SEGMENT_COUNT)
+        ]
+        boundaries.append(duration)
+        if any(start >= end for start, end in zip(boundaries, boundaries[1:], strict=False)):
+            raise ValueError("duration_seconds is too small for six positive segments")
+
         segments: list[SpeakerSegment] = []
-        for index in range(segment_count):
-            start = index * segment_seconds
-            end = duration if index == segment_count - 1 else (index + 1) * segment_seconds
+        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:], strict=False)):
             segments.append(
                 SpeakerSegment(
                     start=start,
@@ -135,22 +165,13 @@ class FakeEmotionProvider(EmotionProvider):
         }
 
         negative_intensity = math.fsum(probabilities[label] for label in _NEGATIVE_EMOTION_LABELS)
-        dominant = max(_EMOTION_LABELS, key=probabilities.__getitem__)
-        state_by_emotion: dict[EmotionLabel, OperationalState] = {
-            "happiness": "satisfied",
-            "anger": "escalated",
-            "disgust": "dissatisfied",
-            "fear": "dissatisfied",
-            "neutral": "stable",
-            "sadness": "dissatisfied",
-            "surprise": "uncertain",
-        }
+        operational_state, confidence = _derive_operational_state(probabilities)
         return EmotionResult(
             utterance_id=utterance_id,
             probabilities=probabilities,
-            operational_state=state_by_emotion[dominant],
+            operational_state=operational_state,
             negative_intensity=negative_intensity,
-            confidence=0.85,
+            confidence=confidence,
             provider=self.provenance,
         )
 
