@@ -278,6 +278,19 @@ async def test_job_routes_require_capability_and_reject_untrusted_host_or_origin
             runner=runner,
             api_capability_token=SecretStr("x" * 31),
         )
+    for invalid_token in (
+        "x" * 31 + " ",
+        "x" * 31 + "\x01",
+        "x" * 31 + "\x7f",
+        "x" * 31 + "한",
+    ):
+        with pytest.raises(ValueError, match="visible HTTP-header ASCII"):
+            create_app(
+                repository=repository,
+                artifacts=artifacts,
+                runner=runner,
+                api_capability_token=SecretStr(invalid_token),
+            )
     app = create_app(
         repository=repository,
         artifacts=artifacts,
@@ -661,7 +674,17 @@ async def test_blocked_preflight_does_not_block_get_and_cancellation_cleans_all_
     async with client_for(app) as client:
         upload_task = asyncio.create_task(upload(client))
         assert await asyncio.to_thread(entered.wait, 5)
+        workspaces = list((artifacts.root / ".incoming").glob(".ingest-*"))
+        assert len(workspaces) == 1
+        lease = workspaces[0] / ".lease"
+        assert stat.S_IMODE(lease.stat().st_mode) == 0o600
         providers = await asyncio.wait_for(client.get("/api/config/providers"), timeout=0.5)
+        upload_task.cancel()
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if upload_task.cancelling() == 0:
+                break
+        assert upload_task.cancelling() == 0
         upload_task.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -672,6 +695,94 @@ async def test_blocked_preflight_does_not_block_get_and_cancellation_cleans_all_
     if artifacts.root.exists():
         assert not list((artifacts.root / ".incoming").glob("*"))
         assert not [path for path in artifacts.root.iterdir() if len(path.name) == 32]
+    assert not any(
+        artifacts.root in lease_path.parents
+        for lease_path in artifacts_module._ACTIVE_ARTIFACT_LEASES
+    )
+
+
+def test_portable_reconciliation_preserves_active_and_collects_abandoned_workspaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "fcntl", None)
+    artifacts = ArtifactStore(tmp_path / "jobs")
+    incoming = artifacts.root / ".incoming"
+    incoming.mkdir(mode=0o700, parents=True)
+    active = incoming / ".ingest-active"
+    abandoned = incoming / ".ingest-abandoned"
+    legacy_old = incoming / ".ingest-legacy-old"
+    legacy_recent = incoming / ".ingest-legacy-recent"
+    for workspace in (active, abandoned, legacy_old, legacy_recent):
+        workspace.mkdir()
+    descriptor = artifacts_module._acquire_artifact_lease(active)
+    (abandoned / ".lease").write_text(
+        json.dumps({"pid": 2_147_483_647, "owner_token": "crashed"}),
+        encoding="utf-8",
+    )
+    for workspace in (active, abandoned, legacy_old):
+        os.utime(workspace, (0, 0))
+    os.utime(legacy_recent, (9_500, 9_500))
+
+    try:
+        removed = artifacts.remove_stale_ingest_workspaces(lease_seconds=10, now=10_000)
+        assert removed == 2
+        assert active.is_dir()
+        assert not abandoned.exists()
+        assert not legacy_old.exists()
+        assert legacy_recent.is_dir()
+    finally:
+        artifacts_module._release_artifact_lease(active, descriptor)
+
+    os.utime(active, (0, 0))
+    assert artifacts.remove_stale_ingest_workspaces(lease_seconds=10, now=10_000) == 1
+    assert not active.exists()
+
+
+def test_portable_generation_cleanup_collects_crashed_but_not_active_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "fcntl", None)
+    artifacts = ArtifactStore(tmp_path / "jobs")
+    job_id = "a" * 32
+    job_dir = artifacts.job_dir(job_id)
+    kept = job_dir / "audio-kept"
+    crashed = job_dir / "audio-crashed"
+    active = job_dir / "audio-active"
+    active_workspace = job_dir / ".ingest-active"
+    for generation in (kept, crashed, active_workspace):
+        generation.mkdir()
+        (generation / "mixed.wav").write_bytes(b"audio")
+    (crashed / ".lease").write_text(
+        json.dumps({"pid": 2_147_483_647, "owner_token": "crashed"}),
+        encoding="utf-8",
+    )
+    descriptor = artifacts_module._acquire_artifact_lease(active_workspace)
+    with artifacts_module._relocate_artifact_lease(active_workspace, active):
+        os.replace(active_workspace, active)
+
+    try:
+        assert (
+            artifacts.remove_unreferenced_audio_generations(
+                job_id,
+                (str(kept / "mixed.wav"),),
+            )
+            == 1
+        )
+        assert not crashed.exists()
+        assert active.is_dir()
+    finally:
+        artifacts_module._release_artifact_lease(active, descriptor)
+
+    assert (
+        artifacts.remove_unreferenced_audio_generations(
+            job_id,
+            (str(kept / "mixed.wav"),),
+        )
+        == 1
+    )
+    assert not active.exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="active workspace flock is POSIX-specific")

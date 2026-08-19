@@ -22,12 +22,12 @@ from typing import Any, BinaryIO, Literal
 from uuid import uuid4
 
 from voxdelta.domain.models import AudioAsset
-from voxdelta.jobs.artifacts import ArtifactStore
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback keeps process ownership only
-    fcntl = None  # type: ignore[assignment]
+from voxdelta.jobs.artifacts import (
+    ArtifactStore,
+    _acquire_artifact_lease,
+    _release_artifact_lease,
+    _relocate_artifact_lease,
+)
 
 ChannelPreference = Literal["auto", "mixed", "separate"]
 
@@ -62,37 +62,21 @@ class PreparedAudio:
         """Release the workspace lease and remove media that was never published."""
 
         if self.lease_descriptor >= 0:
-            _release_workspace_lease(self.workspace, self.lease_descriptor)
+            _release_artifact_lease(self.workspace, self.lease_descriptor)
             self.lease_descriptor = -1
         if not self.published and self.workspace.exists() and not self.workspace.is_symlink():
             shutil.rmtree(self.workspace, ignore_errors=True)
 
 
-def _release_workspace_lease(workspace: Path, descriptor: int) -> None:
-    try:
-        (workspace / ".lease").unlink(missing_ok=True)
-    except OSError:
-        pass
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
-
-
 def _create_ingest_workspace(parent: Path) -> tuple[Path, int]:
     workspace = Path(tempfile.mkdtemp(dir=parent, prefix=".ingest-"))
-    lease = workspace / ".lease"
-    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     descriptor = -1
     try:
-        descriptor = os.open(lease, flags, 0o600)
-        os.fchmod(descriptor, 0o600)
-        if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        descriptor = _acquire_artifact_lease(workspace)
         return workspace, descriptor
     except BaseException:
         if descriptor >= 0:
-            _release_workspace_lease(workspace, descriptor)
+            _release_artifact_lease(workspace, descriptor)
         shutil.rmtree(workspace, ignore_errors=True)
         raise
 
@@ -498,7 +482,7 @@ class AudioService:
             _unlink_all(temporary_paths)
             if workspace is not None and not prepared:
                 if lease_descriptor >= 0:
-                    _release_workspace_lease(workspace, lease_descriptor)
+                    _release_artifact_lease(workspace, lease_descriptor)
                 shutil.rmtree(workspace, ignore_errors=True)
         if workspace is None:
             raise AudioRejected(_DECODABILITY_ERROR)
@@ -538,11 +522,12 @@ class AudioService:
             raise AudioRejected(_DECODABILITY_ERROR)
         generation = job_directory / f"audio-{uuid4().hex}"
         try:
-            os.replace(workspace, generation)
+            with _relocate_artifact_lease(workspace, generation):
+                os.replace(workspace, generation)
+            prepared.workspace = generation
             _fsync_directory(job_directory)
         except OSError:
             raise AudioRejected(_DECODABILITY_ERROR) from None
-        prepared.workspace = generation
         prepared.published = True
         if hold_generation_lease:
             with self._generation_leases_lock:
@@ -604,7 +589,7 @@ class AudioService:
             descriptor = self._generation_leases.pop(generation, None)
         if descriptor is None:
             return
-        _release_workspace_lease(generation, descriptor)
+        _release_artifact_lease(generation, descriptor)
         if generation.is_dir():
             try:
                 _fsync_directory(generation)

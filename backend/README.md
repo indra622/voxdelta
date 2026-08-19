@@ -66,8 +66,8 @@ Application settings are read from `VOXDELTA_` process-environment variables. Uv
   `300`.
 - `VOXDELTA_MAX_ACTIVE_JOBS`: maximum incomplete jobs admitted at once; default `8`.
 - `VOXDELTA_API_CAPABILITY_TOKEN`: per-launch local API capability. Supply a fresh high-entropy
-  value of at least 32 ASCII characters without whitespace in the process environment; it is held
-  as a secret in memory and is never logged or persisted by VoxDelta.
+  value of at least 32 visible HTTP-header ASCII characters (`!` through `~`) in the process
+  environment; it is held as a secret in memory and is never logged or persisted by VoxDelta.
 
 The upload middleware separately caps the complete multipart request at the configured raw-file
 limit plus 64 KiB of multipart overhead. The stored file itself may never exceed the exact
@@ -146,6 +146,9 @@ POSIX even under a permissive umask. Startup reschedules pristine pending jobs a
 claims after the claim lease; live claims are never stolen. A successfully published normalize
 retry garbage-collects obsolete `audio-*` generations. POSIX readers retain their already-open
 descriptor; Windows may defer one generation's cleanup until a later retry after readers close.
+Active decode/generation workspaces carry private PID/owner records and use `flock` where
+available; this preserves live owners and lets abandoned work be collected on other platforms.
+Pre-lease `.ingest-*` upgrade residue is retained for a one-hour safety grace before cleanup.
 
 `data/jobs/.incoming/`, `.locks/`, and `.deleted/` are private control directories used for
 durable upload admission, cross-process job coordination, and deletion tombstones. Empty control

@@ -398,6 +398,36 @@ def _cleanup_incoming_upload(
             pass
 
 
+async def _await_preflight_task(
+    task: asyncio.Task[PreparedAudio],
+) -> PreparedAudio:
+    """Drain a bounded worker through repeated cancellation and never lose its result."""
+
+    cancelled = False
+    result: PreparedAudio | None = None
+    worker_error: BaseException | None = None
+    while result is None and worker_error is None:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                while current.cancelling():
+                    current.uncancel()
+        except BaseException as error:
+            worker_error = error
+    if cancelled:
+        if result is not None:
+            result.discard()
+        raise asyncio.CancelledError
+    if worker_error is not None:
+        raise worker_error
+    if result is None:  # pragma: no cover - loop invariants guarantee a result or error
+        raise RuntimeError("preflight worker ended without a result")
+    return result
+
+
 def _parse_range(raw: str | None, size: int) -> tuple[int, int] | None:
     if raw is None:
         return None
@@ -549,13 +579,12 @@ def create_app(
     if max_active_jobs <= 0:
         raise ValueError("max_active_jobs must be positive")
     raw_capability_token = api_capability_token.get_secret_value()
-    if (
-        len(raw_capability_token) < 32
-        or not raw_capability_token.isascii()
-        or any(character.isspace() for character in raw_capability_token)
+    if len(raw_capability_token) < 32 or any(
+        not 0x21 <= ord(character) <= 0x7E for character in raw_capability_token
     ):
         raise ValueError(
-            "api capability token must contain at least 32 ASCII characters without whitespace"
+            "api capability token must contain at least 32 ASCII characters, all in the visible "
+            "HTTP-header ASCII range 0x21-0x7E"
         )
 
     recovery_tasks: set[asyncio.Task[None]] = set()
@@ -716,14 +745,8 @@ def create_app(
         prepared_audio: PreparedAudio | None = None
         preflight_task = asyncio.create_task(asyncio.to_thread(runner.preflight_audio, incoming))
         try:
-            prepared_audio = await asyncio.shield(preflight_task)
+            prepared_audio = await _await_preflight_task(preflight_task)
         except asyncio.CancelledError:
-            try:
-                late_prepared = await preflight_task
-            except BaseException:
-                pass
-            else:
-                late_prepared.discard()
             _cleanup_incoming_upload(artifacts, None, incoming)
             raise
         except AudioRejected:

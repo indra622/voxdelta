@@ -13,7 +13,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from time import time
 from typing import TypeVar
+from uuid import uuid4
 
 import orjson
 from pydantic import BaseModel
@@ -46,6 +48,8 @@ _LINKED_JOB_DIRECTORY_ERROR = (
 _OPERATION_LOCK_VALIDATION_ERROR = "job operation lock could not be validated safely"
 _TOMBSTONE_VALIDATION_ERROR = "job deletion tombstone could not be validated safely"
 _INCOMING_VALIDATION_ERROR = "incoming upload could not be validated safely"
+_LEGACY_ARTIFACT_LEASE_GRACE_SECONDS = 3600.0
+_PROCESS_OWNER_TOKEN = uuid4().hex
 
 
 @dataclass(slots=True)
@@ -65,6 +69,8 @@ class _IncomingOwner:
 
 _INCOMING_OWNERS: dict[Path, _IncomingOwner] = {}
 _INCOMING_OWNERS_GUARD = threading.Lock()
+_ACTIVE_ARTIFACT_LEASES: dict[Path, str] = {}
+_ACTIVE_ARTIFACT_LEASES_GUARD = threading.Lock()
 
 
 @contextmanager
@@ -90,6 +96,147 @@ def _operation_process_lock(path: Path) -> Iterator[None]:
 
 def _incoming_owner_key(path: Path) -> Path:
     return path if path.is_absolute() else path.absolute()
+
+
+def _artifact_lease_key(directory: Path) -> Path:
+    lexical = directory if directory.is_absolute() else directory.absolute()
+    return lexical / ".lease"
+
+
+def _acquire_artifact_lease(directory: Path) -> int:
+    """Create a durable owner record plus the strongest available process lock."""
+
+    lease = _artifact_lease_key(directory)
+    with _ACTIVE_ARTIFACT_LEASES_GUARD:
+        if lease in _ACTIVE_ARTIFACT_LEASES:
+            raise ValueError("artifact workspace already has an active owner")
+        _ACTIVE_ARTIFACT_LEASES[lease] = _PROCESS_OWNER_TOKEN
+    descriptor = -1
+    lease_created = False
+    try:
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lease, flags, 0o600)
+        lease_created = True
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+        payload = orjson.dumps(
+            {
+                "pid": os.getpid(),
+                "owner_token": _PROCESS_OWNER_TOKEN,
+            }
+        )
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("artifact lease write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        if fcntl is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if lease_created:
+            try:
+                lease.unlink(missing_ok=True)
+            except OSError:
+                pass
+        with _ACTIVE_ARTIFACT_LEASES_GUARD:
+            _ACTIVE_ARTIFACT_LEASES.pop(lease, None)
+        raise
+
+
+def _release_artifact_lease(directory: Path, descriptor: int) -> None:
+    """Release one lease without letting cleanup errors mask pipeline state."""
+
+    lease = _artifact_lease_key(directory)
+    try:
+        lease.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+    with _ACTIVE_ARTIFACT_LEASES_GUARD:
+        _ACTIVE_ARTIFACT_LEASES.pop(lease, None)
+
+
+@contextmanager
+def _relocate_artifact_lease(source: Path, destination: Path) -> Iterator[None]:
+    """Move the process owner registration atomically with its directory rename."""
+
+    source_lease = _artifact_lease_key(source)
+    destination_lease = _artifact_lease_key(destination)
+    with _ACTIVE_ARTIFACT_LEASES_GUARD:
+        owner_token = _ACTIVE_ARTIFACT_LEASES.get(source_lease)
+        if owner_token is None or destination_lease in _ACTIVE_ARTIFACT_LEASES:
+            raise ValueError("artifact workspace lease cannot be relocated safely")
+        yield
+        del _ACTIVE_ARTIFACT_LEASES[source_lease]
+        _ACTIVE_ARTIFACT_LEASES[destination_lease] = owner_token
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def _portable_lease_owner_is_active(path: Path) -> bool | None:
+    """Return active/dead for a valid record, or unknown for a legacy record."""
+
+    key = path if path.is_absolute() else path.absolute()
+    with _ACTIVE_ARTIFACT_LEASES_GUARD:
+        if key in _ACTIVE_ARTIFACT_LEASES:
+            return True
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            _is_link_like(path)
+            or not stat.S_ISREG(opened.st_mode)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            return None
+        payload = os.read(descriptor, 4097)
+        if len(payload) > 4096:
+            return None
+        parsed = orjson.loads(payload)
+    except (FileNotFoundError, OSError, orjson.JSONDecodeError):
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(parsed, dict):
+        return None
+    pid = parsed.get("pid")
+    owner_token = parsed.get("owner_token")
+    if not isinstance(pid, int) or isinstance(pid, bool) or not isinstance(owner_token, str):
+        return None
+    if pid == os.getpid():
+        # A live lease in this process is always registered. An unregistered record belongs to
+        # an abandoned operation or to a prior process that reused this PID.
+        return False
+    return _pid_is_alive(pid)
 
 
 def _register_incoming_owner(path: Path, descriptor: int) -> None:
@@ -205,6 +352,27 @@ def _exclusive_posix_lease(path: Path) -> Iterator[bool]:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+@contextmanager
+def _collectable_artifact_lease(path: Path, *, legacy_expired: bool) -> Iterator[bool]:
+    """Fence active owners on POSIX and use durable owner records everywhere else."""
+
+    if _is_link_like(path):
+        yield False
+        return
+    if not path.exists():
+        yield legacy_expired
+        return
+    if fcntl is not None:
+        with _exclusive_posix_lease(path) as acquired:
+            yield acquired
+        return
+    owner_active = _portable_lease_owner_is_active(path)
+    if owner_active is None:
+        yield legacy_expired
+        return
+    yield not owner_active
 
 
 def _is_link_like(path: Path) -> bool:
@@ -678,13 +846,13 @@ class ArtifactStore:
     def remove_stale_ingest_workspaces(self, *, lease_seconds: float, now: float) -> int:
         """Remove expired abandoned decodes while preserving every locked active workspace.
 
-        Cross-process lease inspection uses ``flock``. Platforms without ``fcntl`` fail closed
-        and retain workspaces because they cannot distinguish a crashed owner from an active one.
+        Cross-process lease inspection uses ``flock`` when available and durable PID ownership
+        records elsewhere. Pre-lease upgrade residue receives a one-hour grace before collection.
         """
 
         if lease_seconds <= 0:
             raise ValueError("reconciliation lease must be positive")
-        if fcntl is None or not self.root.is_dir() or _is_link_like(self.root):
+        if not self.root.is_dir() or _is_link_like(self.root):
             return 0
         parents: list[Path] = []
         incoming = self._control_directory(
@@ -718,7 +886,11 @@ class ArtifactStore:
                     or now - metadata.st_mtime < lease_seconds
                 ):
                     continue
-                with _exclusive_posix_lease(workspace / ".lease") as acquired:
+                legacy_expired = now - metadata.st_mtime >= _LEGACY_ARTIFACT_LEASE_GRACE_SECONDS
+                with _collectable_artifact_lease(
+                    workspace / ".lease",
+                    legacy_expired=legacy_expired,
+                ) as acquired:
                     if not acquired:
                         continue
                     try:
@@ -788,7 +960,11 @@ class ArtifactStore:
                 continue
             lease = candidate / ".lease"
             if lease.exists() or _is_link_like(lease):
-                with _exclusive_posix_lease(lease) as acquired:
+                legacy_expired = time() - metadata.st_mtime >= _LEGACY_ARTIFACT_LEASE_GRACE_SECONDS
+                with _collectable_artifact_lease(
+                    lease,
+                    legacy_expired=legacy_expired,
+                ) as acquired:
                     if not acquired:
                         continue
                     try:
