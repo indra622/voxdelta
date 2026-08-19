@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import math
+
+import pytest
+from pydantic import ValidationError
+
+from voxdelta.evaluation.selection import (
+    CandidateMetrics,
+    select_asr_candidate,
+)
+
+
+def _candidate(
+    candidate_id: str,
+    provider: str,
+    *,
+    cer: float | None,
+    latency: float | None = 100.0,
+    memory: float | None = 1000.0,
+    completion: float = 1.0,
+    task: str = "asr",
+) -> CandidateMetrics:
+    return CandidateMetrics(
+        candidate_id=candidate_id,
+        task=task,  # type: ignore[arg-type]
+        provider=provider,
+        model=candidate_id,
+        completion_rate=completion,
+        median_latency_ms=latency,
+        peak_rss_mb=memory,
+        cer=cer,
+    )
+
+
+def test_qwen_wins_at_exact_absolute_cer_improvement() -> None:
+    decision = select_asr_candidate(
+        [
+            _candidate("stable", "faster-whisper", cer=0.20),
+            _candidate("modern", "qwen3-asr", cer=0.19, latency=200.0),
+        ]
+    )
+
+    assert decision.selected_candidate_id == "modern"
+    assert decision.candidate_status == {"stable": "rejected", "modern": "eligible"}
+    assert set(decision.reasons) == {"stable", "modern"}
+
+
+def test_qwen_loses_near_tie_when_slower_than_two_times() -> None:
+    decision = select_asr_candidate(
+        [
+            _candidate("stable", "faster-whisper", cer=0.20, latency=100.0),
+            _candidate("modern", "qwen3-asr", cer=0.195, latency=200.01),
+        ]
+    )
+
+    assert decision.selected_candidate_id == "stable"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        _candidate("memory", "qwen3-asr", cer=0.1, memory=18432.01),
+        _candidate("completion", "qwen3-asr", cer=0.1, completion=0.949999),
+        _candidate("missing", "qwen3-asr", cer=None),
+    ],
+)
+def test_unavailable_gate_records_reason(candidate: CandidateMetrics) -> None:
+    decision = select_asr_candidate([candidate])
+
+    assert decision.selected_candidate_id is None
+    assert decision.candidate_status[candidate.candidate_id] == "unavailable"
+    assert decision.reasons[candidate.candidate_id]
+
+
+def test_explicit_unavailable_reason_is_preserved_safely() -> None:
+    candidate = _candidate("qwen", "qwen3-asr", cer=0.1).model_copy(
+        update={"unavailable_reason": "provider_runtime_unsupported"}
+    )
+    decision = select_asr_candidate([candidate])
+    assert decision.candidate_status == {"qwen": "unavailable"}
+    assert decision.reasons == {"qwen": "provider_runtime_unsupported"}
+
+
+def test_duplicate_ids_and_non_asr_tasks_are_rejected() -> None:
+    same = _candidate("same", "faster-whisper", cer=0.1)
+    with pytest.raises(ValueError, match="duplicate"):
+        select_asr_candidate([same, same])
+    with pytest.raises(ValueError, match="asr"):
+        select_asr_candidate([_candidate("emotion", "x", cer=0.1, task="emotion")])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("completion_rate", "1"),
+        ("completion_rate", True),
+        ("cer", math.nan),
+        ("cer", math.inf),
+        ("median_latency_ms", math.nan),
+        ("peak_rss_mb", math.inf),
+    ],
+)
+def test_candidate_contract_is_strict_and_finite(field: str, value: object) -> None:
+    payload = {
+        "candidate_id": "candidate",
+        "task": "asr",
+        "provider": "provider",
+        "model": "model",
+        "completion_rate": 1.0,
+        "cer": 0.1,
+    }
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        CandidateMetrics.model_validate(payload)

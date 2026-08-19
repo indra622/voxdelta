@@ -23,6 +23,7 @@ ProviderErrorCode = Literal[
     "missing_pyannote_api_key",
     "provider_timeout",
     "provider_unavailable",
+    "provider_runtime_unsupported",
     "unsupported_speaker_count",
 ]
 
@@ -32,8 +33,9 @@ _PROVIDER_ERROR_MESSAGES: dict[ProviderErrorCode, str] = {
     "invalid_provider_output": "The diarization provider returned invalid output.",
     "missing_huggingface_token": "A Hugging Face token is required for this model.",
     "missing_pyannote_api_key": "A pyannoteAI API key is required for this provider.",
-    "provider_timeout": "The diarization provider timed out.",
-    "provider_unavailable": "The diarization provider is unavailable.",
+    "provider_timeout": "The provider timed out.",
+    "provider_unavailable": "The provider is unavailable.",
+    "provider_runtime_unsupported": "The selected provider is unsupported on this runtime.",
     "unsupported_speaker_count": "Exactly two observed speakers are required.",
 }
 
