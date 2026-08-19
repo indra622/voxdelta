@@ -39,6 +39,63 @@ def test_job_stage_survives_repository_reopen(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission contract")
+def test_repository_forces_private_database_parent_and_sidecars_under_permissive_umask(
+    tmp_path: Path,
+) -> None:
+    data = tmp_path / "runtime"
+    database = data / "voxdelta.sqlite3"
+    previous = os.umask(0o022)
+    try:
+        repository = JobRepository(database)
+        for suffix in ("-journal", "-wal", "-shm"):
+            sidecar = Path(f"{database}{suffix}")
+            sidecar.write_bytes(b"")
+            sidecar.chmod(0o644)
+        JobRepository(database)
+        repository.create_job("sample.wav")
+    finally:
+        os.umask(previous)
+
+    assert data.stat().st_mode & 0o777 == 0o700
+    assert database.stat().st_mode & 0o777 == 0o600
+    for suffix in ("-journal", "-wal", "-shm"):
+        sidecar = Path(f"{database}{suffix}")
+        if sidecar.exists():
+            assert sidecar.stat().st_mode & 0o777 == 0o600
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("UPDATE jobs SET updated_at = updated_at")
+        journal = Path(f"{database}-journal")
+        if journal.exists():
+            assert journal.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("unsafe_kind", ["database_symlink", "sidecar_symlink", "directory"])
+def test_repository_rejects_link_or_nonregular_database_state(
+    tmp_path: Path,
+    unsafe_kind: str,
+) -> None:
+    data = tmp_path / "runtime"
+    data.mkdir()
+    database = data / "voxdelta.sqlite3"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"sentinel")
+    if unsafe_kind == "database_symlink":
+        database.symlink_to(outside)
+    elif unsafe_kind == "sidecar_symlink":
+        database.touch()
+        Path(f"{database}-wal").symlink_to(outside)
+    else:
+        database.mkdir()
+
+    with pytest.raises(ValueError, match="database"):
+        JobRepository(database)
+
+    assert outside.read_bytes() == b"sentinel"
+
+
 def test_create_job_initializes_every_stage_as_pending(tmp_path: Path) -> None:
     repository = JobRepository(tmp_path / "voxdelta.sqlite3")
 

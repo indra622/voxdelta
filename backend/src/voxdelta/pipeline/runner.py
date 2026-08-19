@@ -22,9 +22,10 @@ from voxdelta.analysis.emotions import median_smooth
 from voxdelta.analysis.roles import suggest_roles
 from voxdelta.analysis.summary import InsufficientEmotionCoverage, build_call_summary
 from voxdelta.analysis.transitions import build_transitions
-from voxdelta.audio.service import AudioRejected, AudioService, ChannelPreference
+from voxdelta.audio.service import AudioRejected, AudioService, ChannelPreference, PreparedAudio
 from voxdelta.domain.models import (
     AnalysisReport,
+    AudioAsset,
     CallSummary,
     ProviderProvenance,
     Role,
@@ -659,31 +660,7 @@ class PipelineRunner:
                 job_id,
                 channel_preference=cast(ChannelPreference, preference),
             )
-            normalized_media = tuple(
-                MediaReference(path=path, sha256=self._hash_trusted_media(job_id, path))
-                for path in asset.normalized_paths
-            )
-            mixed_path = (
-                str(Path(asset.normalized_paths[0]).parent / "mixed.wav")
-                if asset.channel_mode == "separate"
-                else asset.normalized_paths[0]
-            )
-            mixed_preview = (
-                normalized_media[0]
-                if asset.channel_mode == "mixed"
-                else MediaReference(
-                    path=mixed_path,
-                    sha256=self._hash_trusted_media(job_id, mixed_path),
-                )
-            )
-            return NormalizeArtifact(
-                cache_key=cache_key,
-                upstream_hashes=upstream_hashes,
-                provider=provider,
-                asset=asset,
-                normalized_media=normalized_media,
-                mixed_preview=mixed_preview,
-            )
+            return self._normalize_artifact(job_id, asset, cache_key, upstream_hashes)
         if stage == StageName.DIARIZE:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
             self._diagnostic(
@@ -862,6 +839,124 @@ class PipelineRunner:
             )
         raise KeyError(stage)
 
+    def _normalize_artifact(
+        self,
+        job_id: str,
+        asset: AudioAsset,
+        cache_key: str,
+        upstream_hashes: tuple[str, ...],
+    ) -> NormalizeArtifact:
+        normalized_media = tuple(
+            MediaReference(path=path, sha256=self._hash_trusted_media(job_id, path))
+            for path in asset.normalized_paths
+        )
+        mixed_path = (
+            str(Path(asset.normalized_paths[0]).parent / "mixed.wav")
+            if asset.channel_mode == "separate"
+            else asset.normalized_paths[0]
+        )
+        mixed_preview = (
+            normalized_media[0]
+            if asset.channel_mode == "mixed"
+            else MediaReference(
+                path=mixed_path,
+                sha256=self._hash_trusted_media(job_id, mixed_path),
+            )
+        )
+        return NormalizeArtifact(
+            cache_key=cache_key,
+            upstream_hashes=upstream_hashes,
+            provider=None,
+            asset=asset,
+            normalized_media=normalized_media,
+            mixed_preview=mixed_preview,
+        )
+
+    def _gc_normalized_generations_if_current(
+        self,
+        job_id: str,
+        artifact: NormalizeArtifact,
+        artifact_hash: str,
+    ) -> None:
+        row = _stage_rows(self._repository.get_job(job_id))[StageName.NORMALIZE.value]
+        if (
+            row.get("status") != StageStatus.COMPLETED.value
+            or row.get("artifact_hash") != artifact_hash
+        ):
+            return
+        keep = tuple(
+            dict.fromkeys(
+                item.path for item in (*artifact.normalized_media, artifact.mixed_preview)
+            )
+        )
+        self._artifacts.remove_unreferenced_audio_generations(job_id, keep)
+
+    def admit_prepared_audio(
+        self,
+        job_id: str,
+        prepared_audio: PreparedAudio,
+        source_path: Path,
+    ) -> bool:
+        """Publish one preflighted normalization under the ordinary stage fence."""
+
+        with self._job_lock(job_id), self._artifacts.operation_lock(job_id):
+            claim = self._repository.claim_stage(job_id, StageName.NORMALIZE)
+            if claim is None:
+                return False
+            try:
+                cache_key, upstream_hashes = self._cache_key(job_id, StageName.NORMALIZE)
+                asset = self._audio.publish_prepared(prepared_audio, source_path, job_id)
+                artifact = self._normalize_artifact(
+                    job_id,
+                    asset,
+                    cache_key,
+                    upstream_hashes,
+                )
+                artifact = NormalizeArtifact.model_validate(artifact.model_dump(mode="python"))
+                if not self._artifact_semantics_are_valid(job_id, artifact):
+                    raise ValueError("stage artifact does not match its upstream contracts")
+                prepared_artifact = self._artifacts.prepare_model(
+                    job_id,
+                    StageName.NORMALIZE,
+                    artifact,
+                )
+                try:
+                    published = self._repository.publish_claimed_stage(
+                        claim,
+                        status=StageStatus.COMPLETED,
+                        artifact_path=prepared_artifact.target.name,
+                        cache_key=artifact.cache_key,
+                        artifact_hash=prepared_artifact.content_hash,
+                        role_confirmed=False,
+                        publish=prepared_artifact.publish,
+                    )
+                    if published:
+                        self._gc_normalized_generations_if_current(
+                            job_id,
+                            artifact,
+                            prepared_artifact.content_hash,
+                        )
+                    return published
+                finally:
+                    prepared_artifact.discard()
+            except Exception:
+                self._repository.fail_claimed_stage(
+                    claim,
+                    {"code": "audio_rejected", "message": "The uploaded audio was rejected."},
+                )
+                raise
+
+    def preflight_audio(self, upload_path: Path) -> PreparedAudio:
+        """Decode one private staged upload using the configured normalize policy."""
+
+        preference = self._stage_config(StageName.NORMALIZE).get("channel_preference")
+        if preference not in {"auto", "mixed", "separate"}:
+            raise ValueError("channel preference is invalid")
+        return self._audio.preflight(
+            upload_path,
+            channel_preference=cast(ChannelPreference, preference),
+        )
+
     def _execute_stage(self, job_id: str, stage: StageName) -> bool:
         with self._artifacts.operation_lock(job_id):
             claim = self._repository.claim_stage(job_id, stage)
@@ -893,6 +988,13 @@ class PipelineRunner:
                 prepared.discard()
             if not published:
                 return False
+            if stage == StageName.NORMALIZE and isinstance(artifact, NormalizeArtifact):
+                with self._artifacts.operation_lock(job_id):
+                    self._gc_normalized_generations_if_current(
+                        job_id,
+                        artifact,
+                        prepared.content_hash,
+                    )
             self._log(job_id, stage, status.value, started)
             return True
         except (

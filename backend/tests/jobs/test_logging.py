@@ -20,6 +20,13 @@ def test_redact_recurses_through_mappings_and_lists_case_insensitively() -> None
             {"accessTOKEN": "secret-2", "safe": "visible"},
             {"Authorization": "secret-3", "Transcript": "private speech"},
             {"provider_payload": {"deep": "private response"}},
+            {
+                "password": "secret-4",
+                "clientSecret": "secret-5",
+                "refresh_token": "secret-6",
+                "monkey_count": 7,
+                "tokenizer": "visible-model-config",
+            },
         ],
     }
 
@@ -29,6 +36,13 @@ def test_redact_recurses_through_mappings_and_lists_case_insensitively() -> None
             {"accessTOKEN": "[REDACTED]", "safe": "visible"},
             {"Authorization": "[REDACTED]", "Transcript": "[REDACTED]"},
             {"provider_payload": "[REDACTED]"},
+            {
+                "password": "[REDACTED]",
+                "clientSecret": "[REDACTED]",
+                "refresh_token": "[REDACTED]",
+                "monkey_count": 7,
+                "tokenizer": "visible-model-config",
+            },
         ],
     }
 

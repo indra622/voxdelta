@@ -15,6 +15,7 @@ import tempfile
 import wave
 from array import array
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 from uuid import uuid4
@@ -35,6 +36,24 @@ _DECODABILITY_ERROR = "audio is not decodable"
 
 class AudioRejected(ValueError):
     """A safe, user-facing rejection raised at the audio ingestion boundary."""
+
+
+@dataclass(slots=True)
+class PreparedAudio:
+    """Private decoded media staged for one later job-scoped atomic publication."""
+
+    workspace: Path
+    source_name: str
+    sha256: str
+    duration_seconds: float
+    channels: int
+    channel_mode: Literal["mixed", "separate"]
+    normalized_names: tuple[str, ...]
+    published: bool = False
+
+    def discard(self) -> None:
+        if not self.published and self.workspace.exists() and not self.workspace.is_symlink():
+            shutil.rmtree(self.workspace, ignore_errors=True)
 
 
 def _is_link_like(metadata: os.stat_result) -> bool:
@@ -284,6 +303,26 @@ def _read_pcm16_mono(path: Path) -> array[int]:
     return samples
 
 
+def _decoded_wav_duration(path: Path) -> float:
+    """Return authoritative media time from the normalized PCM frame count."""
+
+    try:
+        with wave.open(str(path), "rb") as audio:
+            if (
+                audio.getnchannels() != 1
+                or audio.getsampwidth() != 2
+                or audio.getframerate() != 16_000
+                or audio.getnframes() <= 0
+            ):
+                raise AudioRejected(_DECODABILITY_ERROR)
+            duration = audio.getnframes() / audio.getframerate()
+    except (EOFError, OSError, wave.Error, ZeroDivisionError):
+        raise AudioRejected(_DECODABILITY_ERROR) from None
+    if not math.isfinite(duration) or duration <= 0:
+        raise AudioRejected(_DECODABILITY_ERROR)
+    return duration
+
+
 def _channels_are_distinct(left_path: Path, right_path: Path) -> bool:
     left = _read_pcm16_mono(left_path)
     right = _read_pcm16_mono(right_path)
@@ -329,31 +368,33 @@ class AudioService:
         self._min_seconds = min_seconds
         self._max_seconds = max_seconds
 
-    def ingest(
+    def _prepare(
         self,
         upload_path: Path,
-        job_id: str,
+        workspace_parent: Path,
         channel_preference: ChannelPreference = "auto",
-    ) -> AudioAsset:
-        """Validate an upload and return metadata for its selected normalized channel mode."""
+        *,
+        source_file: BinaryIO | None = None,
+    ) -> PreparedAudio:
+        """Decode one stable source snapshot without publishing durable job media."""
 
         if upload_path.suffix.lower() not in _ALLOWED_EXTENSIONS:
             raise AudioRejected("unsupported extension")
         workspace: Path | None = None
         temporary_paths: list[Path] = []
-        published_generation: Path | None = None
 
         try:
-            with _open_trusted_source(upload_path) as source_file:
-                job_directory = self._store.job_dir(job_id)
-                workspace = Path(tempfile.mkdtemp(dir=job_directory, prefix=".ingest-"))
+            if source_file is None:
+                with _open_trusted_source(upload_path) as opened_source:
+                    workspace = Path(tempfile.mkdtemp(dir=workspace_parent, prefix=".ingest-"))
+                    staged_source, sha256 = _stage_source(
+                        opened_source, workspace, upload_path.suffix
+                    )
+            else:
+                workspace = Path(tempfile.mkdtemp(dir=workspace_parent, prefix=".ingest-"))
                 staged_source, sha256 = _stage_source(source_file, workspace, upload_path.suffix)
 
-            duration, channels, is_stereo = _probe(staged_source)
-            if duration < self._min_seconds:
-                raise AudioRejected(f"audio is shorter than {self._min_seconds} seconds")
-            if duration > self._max_seconds:
-                raise AudioRejected(f"audio exceeds {self._max_seconds} seconds")
+            _, channels, is_stereo = _probe(staged_source)
             if channel_preference == "separate" and channels == 1:
                 raise AudioRejected("separate channels requested for mono audio")
             if channel_preference == "separate" and not is_stereo:
@@ -364,6 +405,11 @@ class AudioService:
             _normalize_mixed(staged_source, mixed_temporary)
             mixed_output = workspace / "mixed.wav"
             os.replace(mixed_temporary, mixed_output)
+            duration = _decoded_wav_duration(mixed_output)
+            if duration < self._min_seconds:
+                raise AudioRejected(f"audio is shorter than {self._min_seconds} seconds")
+            if duration > self._max_seconds:
+                raise AudioRejected(f"audio exceeds {self._max_seconds} seconds")
 
             selected_mode: Literal["mixed", "separate"] = "mixed"
             left_temporary: Path | None = None
@@ -378,9 +424,6 @@ class AudioService:
                     left_temporary, right_temporary
                 ):
                     selected_mode = "separate"
-
-            if self._store.job_dir(job_id) != job_directory:
-                raise ValueError("job directory changed while audio was being normalized")
 
             normalized_names: tuple[str, ...]
             if selected_mode == "separate":
@@ -403,39 +446,95 @@ class AudioService:
             for name in dict.fromkeys(output_names):
                 _fsync_file(workspace / name)
             _fsync_directory(workspace)
-            if self._store.job_dir(job_id) != job_directory:
-                raise ValueError("job directory changed while audio was being normalized")
-
-            generation = job_directory / f"audio-{uuid4().hex}"
-            os.replace(workspace, generation)
-            published_generation = generation
-            workspace = None
-            _fsync_directory(job_directory)
-            normalized_paths = tuple(str(generation / name) for name in normalized_names)
         except AudioRejected:
-            _unlink_all(temporary_paths)
-            if published_generation is not None:
-                shutil.rmtree(published_generation, ignore_errors=True)
-            raise
-        except OSError:
-            _unlink_all(temporary_paths)
-            if published_generation is not None:
-                shutil.rmtree(published_generation, ignore_errors=True)
-            raise AudioRejected(_DECODABILITY_ERROR) from None
-        finally:
             _unlink_all(temporary_paths)
             if workspace is not None:
                 shutil.rmtree(workspace, ignore_errors=True)
+            raise
+        except OSError:
+            _unlink_all(temporary_paths)
+            if workspace is not None:
+                shutil.rmtree(workspace, ignore_errors=True)
+            raise AudioRejected(_DECODABILITY_ERROR) from None
+        finally:
+            _unlink_all(temporary_paths)
+        if workspace is None:
+            raise AudioRejected(_DECODABILITY_ERROR)
+        return PreparedAudio(
+            workspace=workspace,
+            source_name=upload_path.name,
+            sha256=sha256,
+            duration_seconds=duration,
+            channels=channels,
+            channel_mode=selected_mode,
+            normalized_names=normalized_names,
+        )
+
+    def preflight(
+        self,
+        upload_path: Path,
+        channel_preference: ChannelPreference = "auto",
+    ) -> PreparedAudio:
+        """Fully decode an incoming upload before durable job or database admission."""
+
+        return self._prepare(upload_path, upload_path.parent, channel_preference)
+
+    def publish_prepared(
+        self,
+        prepared: PreparedAudio,
+        upload_path: Path,
+        job_id: str,
+    ) -> AudioAsset:
+        """Atomically publish a preflighted generation beneath one validated job."""
+
+        job_directory = self._store.job_dir(job_id)
+        workspace = prepared.workspace
+        if workspace.is_symlink() or not workspace.is_dir():
+            raise AudioRejected(_DECODABILITY_ERROR)
+        generation = job_directory / f"audio-{uuid4().hex}"
+        try:
+            os.replace(workspace, generation)
+            _fsync_directory(job_directory)
+        except OSError:
+            raise AudioRejected(_DECODABILITY_ERROR) from None
+        prepared.workspace = generation
+        prepared.published = True
+        normalized_paths = tuple(str(generation / name) for name in prepared.normalized_names)
 
         return AudioAsset(
             source_name=upload_path.name,
             source_path=str(upload_path),
             normalized_paths=normalized_paths,
-            channel_mode=selected_mode,
-            duration_seconds=duration,
-            channels=channels,
-            sha256=sha256,
+            channel_mode=prepared.channel_mode,
+            duration_seconds=prepared.duration_seconds,
+            channels=prepared.channels,
+            sha256=prepared.sha256,
         )
 
+    def ingest(
+        self,
+        upload_path: Path,
+        job_id: str,
+        channel_preference: ChannelPreference = "auto",
+    ) -> AudioAsset:
+        """Validate an upload and return metadata for its selected normalized channel mode."""
 
-__all__ = ["AudioRejected", "AudioService", "ChannelPreference"]
+        if upload_path.suffix.lower() not in _ALLOWED_EXTENSIONS:
+            raise AudioRejected("unsupported extension")
+        with _open_trusted_source(upload_path) as source_file:
+            job_directory = self._store.job_dir(job_id)
+            prepared = self._prepare(
+                upload_path,
+                job_directory,
+                channel_preference,
+                source_file=source_file,
+            )
+        try:
+            if self._store.job_dir(job_id) != job_directory:
+                raise ValueError("job directory changed while audio was being normalized")
+            return self.publish_prepared(prepared, upload_path, job_id)
+        finally:
+            prepared.discard()
+
+
+__all__ = ["AudioRejected", "AudioService", "ChannelPreference", "PreparedAudio"]

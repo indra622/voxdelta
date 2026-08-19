@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from voxdelta.credentials import (
@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     min_audio_seconds: int = Field(default=60, gt=0)
     max_upload_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
     admission_reconciliation_lease_seconds: int = Field(default=300, gt=0)
+    max_active_jobs: int = Field(default=8, gt=0)
+    api_capability_token: SecretStr | None = None
 
     model_config = SettingsConfigDict(env_prefix="VOXDELTA_", extra="ignore")
 

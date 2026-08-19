@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import os
 from collections.abc import AsyncIterator, Callable
@@ -10,12 +11,14 @@ from contextlib import AbstractContextManager, asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from time import time
-from typing import Annotated, BinaryIO, cast
+from typing import Annotated, Any, BinaryIO, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import SecretStr
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -31,11 +34,12 @@ from voxdelta.api.schemas import (
     RoleCandidate,
     RoleConfirmation,
 )
+from voxdelta.audio.service import AudioRejected, PreparedAudio
 from voxdelta.config import Settings
-from voxdelta.domain.models import StageName
+from voxdelta.domain.models import AnalysisReport, StageName
 from voxdelta.jobs._ids import JobAbsenceProof
 from voxdelta.jobs.artifacts import ArtifactStore
-from voxdelta.jobs.repository import JobRepository
+from voxdelta.jobs.repository import JobCapacityExceeded, JobRepository
 from voxdelta.pipeline.runner import (
     PipelineRunner,
     PipelineStateError,
@@ -56,6 +60,25 @@ _PUBLIC_STAGE_ERRORS = {
     "invalid_stage_output": "The pipeline stage produced invalid data.",
     "unsupported_speaker_count": "Exactly two observed speakers are required.",
 }
+_CAPABILITY_HEADER = b"x-voxdelta-token"
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _error_responses(*statuses: int) -> dict[int | str, dict[str, Any]]:
+    return {
+        status: {
+            "model": PublicErrorEnvelope,
+            "description": "Sanitized public error",
+        }
+        for status in statuses
+    }
+
+
+_WAV_CONTENT = {
+    "audio/wav": {
+        "schema": {"type": "string", "format": "binary"},
+    }
+}
 
 
 class _UploadAdmissionError(ValueError):
@@ -68,6 +91,78 @@ class _UploadAdmissionError(ValueError):
 
 class _RequestBodyLimitExceeded(Exception):
     pass
+
+
+def _security_error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": {"code": code, "message": message}},
+    )
+
+
+def _host_name(raw: str) -> str | None:
+    try:
+        parsed = urlsplit(f"//{raw}")
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        return parsed.hostname.casefold() if parsed.hostname is not None else None
+    except ValueError:
+        return None
+
+
+def _origin_is_local(raw: str) -> bool:
+    try:
+        parsed = urlsplit(raw)
+        return (
+            parsed.scheme in {"http", "https"}
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.hostname is not None
+            and parsed.hostname.casefold() in _LOCAL_HOSTS
+            and not parsed.path.strip("/")
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
+class _LocalCapabilityMiddleware:
+    """Fence local job data from DNS rebinding, drive-by browsers, and other users."""
+
+    def __init__(self, app: ASGIApp, *, token: SecretStr) -> None:
+        self._app = app
+        self._token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        headers = scope.get("headers", [])
+        hosts = [value.decode("latin-1") for name, value in headers if name.lower() == b"host"]
+        if len(hosts) != 1 or _host_name(hosts[0]) not in _LOCAL_HOSTS:
+            await _security_error(400, "invalid_host", "The request host is not allowed.")(
+                scope, receive, send
+            )
+            return
+        origins = [value.decode("latin-1") for name, value in headers if name.lower() == b"origin"]
+        if len(origins) > 1 or (origins and not _origin_is_local(origins[0])):
+            await _security_error(403, "origin_not_allowed", "The request origin is not allowed.")(
+                scope, receive, send
+            )
+            return
+        path = str(scope.get("path", ""))
+        if path.startswith("/api/jobs"):
+            supplied = [value for name, value in headers if name.lower() == _CAPABILITY_HEADER]
+            expected = self._token.get_secret_value().encode("utf-8")
+            if len(supplied) != 1 or not hmac.compare_digest(supplied[0], expected):
+                await _security_error(
+                    401,
+                    "capability_required",
+                    "A valid local API capability is required.",
+                )(scope, receive, send)
+                return
+        await self._app(scope, receive, send)
 
 
 def _upload_too_large_response() -> JSONResponse:
@@ -376,7 +471,11 @@ def reconcile_local_state(
         repository.discard_if_absent(job_id, discard_absent)
 
     recovered: list[str] = []
-    for job_id, source_name in repository.list_pristine_pending_jobs():
+    candidates = (
+        *repository.list_pristine_pending_jobs(),
+        *repository.list_expired_running_jobs(),
+    )
+    for job_id, source_name in candidates:
         if not artifacts.canonical_source_exists(job_id, source_name):
             continue
         recovered.append(job_id)
@@ -394,6 +493,8 @@ def create_app(
     runner: PipelineRunner | None = None,
     max_upload_bytes: int | None = None,
     reconciliation_lease_seconds: float | None = None,
+    api_capability_token: SecretStr | None = None,
+    max_active_jobs: int | None = None,
 ) -> FastAPI:
     """Create an isolated application, or construct safe local production dependencies."""
 
@@ -408,14 +509,28 @@ def create_app(
             max_upload_bytes = dependencies.max_upload_bytes
         if reconciliation_lease_seconds is None:
             reconciliation_lease_seconds = dependencies.admission_reconciliation_lease_seconds
+        if api_capability_token is None:
+            api_capability_token = dependencies.api_capability_token
+        if max_active_jobs is None:
+            max_active_jobs = dependencies.max_active_jobs
     if max_upload_bytes is None:
         max_upload_bytes = Settings().max_upload_bytes
     if reconciliation_lease_seconds is None:
         reconciliation_lease_seconds = Settings().admission_reconciliation_lease_seconds
+    if max_active_jobs is None:
+        max_active_jobs = Settings().max_active_jobs
+    if api_capability_token is None:
+        raise ValueError(
+            "VOXDELTA_API_CAPABILITY_TOKEN must configure a per-launch capability token"
+        )
     if max_upload_bytes <= 0:
         raise ValueError("max_upload_bytes must be positive")
     if reconciliation_lease_seconds <= 0:
         raise ValueError("reconciliation_lease_seconds must be positive")
+    if max_active_jobs <= 0:
+        raise ValueError("max_active_jobs must be positive")
+    if not api_capability_token.get_secret_value():
+        raise ValueError("api capability token must not be empty")
 
     recovery_tasks: set[asyncio.Task[None]] = set()
 
@@ -442,6 +557,7 @@ def create_app(
         _RequestBodyLimitMiddleware,
         max_bytes=max_upload_bytes + MULTIPART_OVERHEAD_BYTES,
     )
+    app.add_middleware(_LocalCapabilityMiddleware, token=api_capability_token)
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(
@@ -459,7 +575,39 @@ def create_app(
             },
         )
 
-    @app.get("/api/config/providers", response_model=ProviderConfiguration)
+    @app.exception_handler(HTTPException)
+    async def public_http_error(request: Request, error: HTTPException) -> JSONResponse:
+        del request
+        detail = error.detail
+        if (
+            isinstance(detail, dict)
+            and isinstance(detail.get("code"), str)
+            and isinstance(detail.get("message"), str)
+        ):
+            public_detail = {
+                "code": detail["code"],
+                "message": detail["message"],
+            }
+        else:
+            public_detail = {
+                "code": "request_failed" if error.status_code < 500 else "internal_error",
+                "message": (
+                    "The request could not be completed."
+                    if error.status_code < 500
+                    else "The server could not complete the request."
+                ),
+            }
+        return JSONResponse(
+            status_code=error.status_code,
+            content={"detail": public_detail},
+            headers=error.headers,
+        )
+
+    @app.get(
+        "/api/config/providers",
+        response_model=ProviderConfiguration,
+        responses=_error_responses(400, 403),
+    )
     def provider_configuration() -> ProviderConfiguration:
         return ProviderConfiguration(stages=runner.provider_disclosures())
 
@@ -468,10 +616,7 @@ def create_app(
         status_code=202,
         response_model=JobCreated,
         responses={
-            422: {
-                "model": PublicErrorEnvelope,
-                "description": "Invalid request",
-            }
+            **_error_responses(400, 401, 403, 413, 422, 429, 500),
         },
     )
     async def create_job(
@@ -541,9 +686,31 @@ def create_app(
                 },
             ) from None
         assert incoming is not None
+        prepared_audio: PreparedAudio | None = None
+        try:
+            prepared_audio = runner.preflight_audio(incoming)
+        except AudioRejected:
+            _cleanup_incoming_upload(artifacts, None, incoming)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "audio_rejected",
+                    "message": "The uploaded audio was rejected.",
+                },
+            ) from None
+        except BaseException:
+            _cleanup_incoming_upload(artifacts, None, incoming)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "upload_failed",
+                    "message": "The upload could not be validated safely.",
+                },
+            ) from None
         try:
             destination = artifacts.adopt_incoming_upload(job_id, incoming, suffix)
         except BaseException:
+            prepared_audio.discard()
             _cleanup_incoming_upload(artifacts, None, incoming)
             raise HTTPException(
                 status_code=500,
@@ -557,7 +724,24 @@ def create_app(
                 str(destination),
                 diagnostic_capture=diagnostic_capture,
                 job_id=job_id,
+                max_active_jobs=max_active_jobs,
             )
+        except JobCapacityExceeded:
+            prepared_audio.discard()
+
+            def discard_capacity_rejected(proof: JobAbsenceProof) -> None:
+                artifacts._discard_unregistered_job_under_absence_proof(  # noqa: SLF001
+                    job_id, proof
+                )
+
+            repository.discard_if_absent(job_id, discard_capacity_rejected)
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "code": "job_capacity_reached",
+                    "message": "The local incomplete-job limit has been reached.",
+                },
+            ) from None
         except BaseException:
 
             def discard_adopted(proof: JobAbsenceProof) -> None:
@@ -575,6 +759,7 @@ def create_app(
             except BaseException:
                 committed = False
             if not committed:
+                prepared_audio.discard()
                 raise HTTPException(
                     status_code=500,
                     detail={
@@ -582,6 +767,17 @@ def create_app(
                         "message": "The upload could not be stored safely.",
                     },
                 ) from None
+        try:
+            if not runner.admit_prepared_audio(job_id, prepared_audio, destination):
+                raise RuntimeError("fresh normalization claim was unavailable")
+        except BaseException:
+            prepared_audio.discard()
+            try:
+                runner.mark_unhandled_failure(job_id)
+            except Exception:
+                pass
+        else:
+            prepared_audio.discard()
         try:
             background_tasks.add_task(_safe_background_run, runner, job_id)
         except BaseException:
@@ -592,19 +788,18 @@ def create_app(
                 pass
         return JobCreated(job_id=job_id, status_url=f"/api/jobs/{job_id}")
 
-    @app.get("/api/jobs/{job_id}", response_model=PublicJob)
+    @app.get(
+        "/api/jobs/{job_id}",
+        response_model=PublicJob,
+        responses=_error_responses(400, 401, 403, 404, 422, 500),
+    )
     def get_job(job_id: str) -> PublicJob:
         return _public_job(repository, runner, job_id)
 
     @app.post(
         "/api/jobs/{job_id}/roles",
         response_model=PublicJob,
-        responses={
-            422: {
-                "model": PublicErrorEnvelope,
-                "description": "Invalid request",
-            }
-        },
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
     )
     def confirm_roles(job_id: str, confirmation: RoleConfirmation) -> PublicJob:
         try:
@@ -622,12 +817,7 @@ def create_app(
     @app.post(
         "/api/jobs/{job_id}/retry",
         response_model=PublicJob,
-        responses={
-            422: {
-                "model": PublicErrorEnvelope,
-                "description": "Invalid request",
-            }
-        },
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
     )
     def retry(job_id: str, request: RetryRequest) -> PublicJob:
         try:
@@ -642,8 +832,12 @@ def create_app(
             raise _not_found() from None
         return _public_job(repository, runner, job_id)
 
-    @app.get("/api/jobs/{job_id}/report")
-    def report(job_id: str) -> dict[str, object]:
+    @app.get(
+        "/api/jobs/{job_id}/report",
+        response_model=AnalysisReport,
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def report(job_id: str) -> AnalysisReport:
         try:
             canonical = runner.report(job_id)
         except KeyError:
@@ -654,10 +848,18 @@ def create_app(
             raise _pipeline_error(409, error) from None
         except ValueError:
             raise _not_found() from None
-        return canonical.model_dump(mode="json")
+        return canonical
 
-    @app.get("/api/jobs/{job_id}/audio")
-    def audio_preview(job_id: str, request: Request) -> StreamingResponse:
+    @app.get(
+        "/api/jobs/{job_id}/audio",
+        response_class=StreamingResponse,
+        responses={
+            200: {"description": "Full normalized preview", "content": _WAV_CONTENT},
+            206: {"description": "Partial normalized preview", "content": _WAV_CONTENT},
+            **_error_responses(400, 401, 403, 404, 409, 416, 422, 500),
+        },
+    )
+    def audio_preview(job_id: str, request: Request) -> Response:
         context = runner.open_mixed_preview(job_id)
         try:
             opened = context.__enter__()
@@ -685,15 +887,18 @@ def create_app(
             selected = _parse_range(request.headers.get("range"), size)
         except ValueError:
             closer.close()
-            return StreamingResponse(
-                iter(()),
+            return JSONResponse(
                 status_code=416,
+                content={
+                    "detail": {
+                        "code": "range_not_satisfiable",
+                        "message": "The requested audio range is not satisfiable.",
+                    }
+                },
                 headers={
                     "Accept-Ranges": "bytes",
                     "Content-Range": f"bytes */{size}",
-                    "Content-Length": "0",
                 },
-                media_type="audio/wav",
             )
         if selected is None:
             start, end, status_code = 0, size - 1, 200
@@ -716,7 +921,11 @@ def create_app(
             closer=closer,
         )
 
-    @app.delete("/api/jobs/{job_id}", status_code=204)
+    @app.delete(
+        "/api/jobs/{job_id}",
+        status_code=204,
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
     def delete_job(job_id: str) -> Response:
         try:
             runner.delete_job(job_id)
@@ -729,7 +938,22 @@ def create_app(
     return app
 
 
-app = create_app()
+class _LazyProductionApplication:
+    """Initialize production storage only when the ASGI server starts serving."""
+
+    def __init__(self) -> None:
+        self._application: FastAPI | None = None
+        self._lock = asyncio.Lock()
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self._application is None:
+            async with self._lock:
+                if self._application is None:
+                    self._application = create_app()
+        await self._application(scope, receive, send)
+
+
+app = _LazyProductionApplication()
 
 
 __all__ = [

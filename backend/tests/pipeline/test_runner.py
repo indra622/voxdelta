@@ -708,6 +708,7 @@ def test_retry_normalize_never_deletes_original_source(tmp_path: Path) -> None:
     source = store.job_dir(job_id) / "source-upload.wav"
     shutil.copyfile(FIXTURE, source)
     normalize = store.read_model(job_id, StageName.NORMALIZE, NormalizeArtifact)
+    prior_generation = Path(normalize.asset.normalized_paths[0]).parent
     replacement = normalize.model_copy(
         update={"asset": normalize.asset.model_copy(update={"source_path": str(source)})}
     )
@@ -726,6 +727,11 @@ def test_retry_normalize_never_deletes_original_source(tmp_path: Path) -> None:
     assert result["stages"]["confirm_roles"]["status"] == "paused"
     assert source.exists()
     assert hashlib.sha256(source.read_bytes()).hexdigest() == normalize.asset.sha256
+    current = store.read_model(job_id, StageName.NORMALIZE, NormalizeArtifact)
+    current_generation = Path(current.asset.normalized_paths[0]).parent
+    assert current_generation != prior_generation
+    assert current_generation.is_dir()
+    assert not prior_generation.exists()
 
 
 def test_retry_rejects_invalid_stage_and_unknown_job_without_mutation(tmp_path: Path) -> None:

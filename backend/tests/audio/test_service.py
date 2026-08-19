@@ -219,7 +219,7 @@ def test_ingest_respects_non_stereo_probe_layout_when_present(
         calls.append(command[0])
         if command[0] == "ffprobe":
             return _completed(_probe_payload(channels=2, channel_layout="dual_mono"))
-        Path(command[-1]).write_bytes(b"normalized")
+        shutil.copyfile(MONO_FIXTURE, Path(command[-1]))
         return _completed()
 
     monkeypatch.setattr(service_module.subprocess, "run", fake_run)
@@ -270,6 +270,46 @@ def test_ingest_rejects_duration_outside_configured_bounds(
 ) -> None:
     with pytest.raises(AudioRejected, match=rf"^{message}$"):
         AudioService(tmp_path / "jobs", minimum, maximum).ingest(MONO_FIXTURE, "j1")
+
+    job_dir = tmp_path / "jobs" / "j1"
+    assert not job_dir.exists() or list(job_dir.iterdir()) == []
+
+
+def test_ingest_uses_decoded_audio_duration_not_longer_video_container(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "sidecar-video.m4a"
+    generated = tmp_path / "sidecar-video.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=16x16:r=1:d=65",
+            "-map",
+            "0:a:0",
+            "-map",
+            "1:v:0",
+            "-c:a",
+            "aac",
+            "-c:v",
+            "mpeg4",
+            str(generated),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    generated.replace(source)
+
+    with pytest.raises(AudioRejected, match=r"^audio is shorter than 60 seconds$"):
+        AudioService(tmp_path / "jobs", 60, 3600).ingest(source, "j1")
 
     job_dir = tmp_path / "jobs" / "j1"
     assert not job_dir.exists() or list(job_dir.iterdir()) == []
@@ -443,7 +483,7 @@ def test_ingest_uses_one_staged_snapshot_when_final_source_path_is_swapped(
             source.unlink()
             source.write_bytes(b"replacement bytes")
             return _completed(_probe_payload())
-        Path(command[-1]).write_bytes(b"normalized")
+        shutil.copyfile(MONO_FIXTURE, Path(command[-1]))
         return _completed()
 
     monkeypatch.setattr(service_module.subprocess, "run", swap_after_probe)
@@ -478,7 +518,7 @@ def test_ingest_uses_one_staged_snapshot_when_source_ancestor_symlink_is_swapped
             alias.unlink()
             alias.symlink_to(second, target_is_directory=True)
             return _completed(_probe_payload())
-        Path(command[-1]).write_bytes(b"normalized")
+        shutil.copyfile(MONO_FIXTURE, Path(command[-1]))
         return _completed()
 
     monkeypatch.setattr(service_module.subprocess, "run", swap_ancestor_after_probe)
@@ -542,7 +582,7 @@ def test_ingest_uses_argument_lists_and_bounded_subprocess_timeouts(
         calls.append((command, kwargs))
         if command[0] == "ffprobe":
             return _completed(_probe_payload())
-        Path(command[-1]).write_bytes(b"normalized")
+        shutil.copyfile(MONO_FIXTURE, Path(command[-1]))
         return _completed()
 
     monkeypatch.setattr(service_module.subprocess, "run", fake_run)

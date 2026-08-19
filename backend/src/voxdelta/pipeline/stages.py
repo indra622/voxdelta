@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
@@ -23,6 +22,7 @@ from voxdelta.domain.models import (
     StageName,
     Utterance,
 )
+from voxdelta.security import is_credential_key
 
 SCHEMA_VERSION: Literal["1"] = "1"
 STAGE_ORDER: tuple[StageName, ...] = tuple(StageName)
@@ -44,12 +44,6 @@ UPSTREAM_STAGES: dict[StageName, tuple[StageName, ...]] = {
 }
 
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
-_NON_IDENTIFIER = re.compile(r"[^a-zA-Z0-9]+")
-_CREDENTIAL_TOKENS = frozenset({"authorization", "key", "password", "secret", "token"})
-_COMPACT_CREDENTIAL_ALIASES = frozenset(
-    {"apikey", "accesstoken", "bearertoken", "clientsecret", "refreshtoken"}
-)
 
 
 def downstream_stages(stage: StageName) -> tuple[StageName, ...]:
@@ -72,11 +66,7 @@ def _canonical_cache_value(value: object) -> Any:
         for raw_key, item in value.items():
             if not isinstance(raw_key, str):
                 raise TypeError("cache configuration keys must be strings")
-            separated = _CAMEL_BOUNDARY.sub("_", raw_key)
-            normalized = _NON_IDENTIFIER.sub("_", separated).strip("_").casefold()
-            tokens = tuple(part for part in normalized.split("_") if part)
-            compact = "".join(tokens)
-            if _CREDENTIAL_TOKENS.intersection(tokens) or compact in _COMPACT_CREDENTIAL_ALIASES:
+            if is_credential_key(raw_key):
                 raise ValueError("credential-bearing cache configuration is not allowed")
             sanitized[raw_key] = _canonical_cache_value(item)
         return sanitized

@@ -64,6 +64,10 @@ Application settings are read from `VOXDELTA_` process-environment variables. Uv
 - `VOXDELTA_MAX_UPLOAD_BYTES`: maximum raw uploaded file size; default `1073741824` (1 GiB).
 - `VOXDELTA_ADMISSION_RECONCILIATION_LEASE_SECONDS`: stale admission recovery lease; default
   `300`.
+- `VOXDELTA_MAX_ACTIVE_JOBS`: maximum incomplete jobs admitted at once; default `8`.
+- `VOXDELTA_API_CAPABILITY_TOKEN`: per-launch local API capability. Supply a fresh high-entropy
+  value in the process environment; it is held as a secret in memory and is never logged or
+  persisted by VoxDelta.
 
 The upload middleware separately caps the complete multipart request at the configured raw-file
 limit plus 64 KiB of multipart overhead. The stored file itself may never exceed the exact
@@ -72,6 +76,7 @@ raw-file limit.
 Start the local-only server from `backend/`:
 
 ```bash
+export VOXDELTA_API_CAPABILITY_TOKEN="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 uv run uvicorn voxdelta.api.app:app \
   --host 127.0.0.1 \
   --port 8000 \
@@ -79,7 +84,11 @@ uv run uvicorn voxdelta.api.app:app \
 ```
 
 Open <http://127.0.0.1:8000/docs> for the generated OpenAPI interface. Binding to `127.0.0.1`
-keeps the development service off external network interfaces.
+keeps the development service off external network interfaces. Every `/api/jobs...` request must
+also send `X-VoxDelta-Token: $VOXDELTA_API_CAPABILITY_TOKEN`. Strict local `Host` and `Origin`
+checks block DNS-rebinding and drive-by browser requests; the custom token header is intentionally
+not a CORS-simple request header. `GET /api/config/providers`, `/docs`, and `/openapi.json` contain
+no job data and do not require the capability.
 
 ## HTTP API
 
@@ -94,10 +103,11 @@ invalid body.
   transmit nothing, and have no remote retention policy; non-provider stages have null provenance.
 - `POST /api/jobs` accepts multipart `file` (`.wav`, `.mp3`, or `.m4a`) and optional boolean
   `diagnostic_capture` (default `false`). It streams and privately stores a non-empty file,
-  creates a job, schedules local processing, and returns HTTP 202 with `job_id` and `status_url`.
-  Unsupported suffixes and empty uploads return 422; size violations return 413. Decodability and
-  duration are checked by the background normalize stage, so invalid audio can receive 202 and
-  then appear as a sanitized failed job. A 202 response does not mean analysis is complete.
+  fully decodes and validates the staged upload before durable job/database admission, reuses that
+  normalized generation, schedules local processing, and returns HTTP 202 with `job_id` and
+  `status_url`. Unsupported suffixes, empty/corrupt media, and decoded durations outside the
+  configured interval return 422 without a durable job; size violations return 413 and a full
+  incomplete-job quota returns 429. A 202 response does not mean analysis is complete.
 - `GET /api/jobs/{job_id}` returns public job status, the eight stage statuses, sanitized stage
   errors, timestamps, and the diagnostic flag. While `confirm_roles` is paused it also returns the
   two observed speaker IDs and, when the conservative heuristic has one, an unconfirmed suggested
@@ -129,6 +139,12 @@ With default settings, SQLite metadata is in `data/voxdelta.sqlite3` and each jo
 `data/jobs/<job_id>/`. A job directory can contain the private source upload, a generated
 `audio-<id>/` directory with normalized WAV media, versioned stage JSON (`<stage>.v1.json`), a
 redacted `pipeline.jsonl`, the canonical report artifact, and optional diagnostics.
+
+The runtime parent is private and SQLite database/journal/WAL files are forced to mode `0600` on
+POSIX even under a permissive umask. Startup reschedules pristine pending jobs and expired running
+claims after the claim lease; live claims are never stolen. A successfully published normalize
+retry garbage-collects obsolete `audio-*` generations. POSIX readers retain their already-open
+descriptor; Windows may defer one generation's cleanup until a later retry after readers close.
 
 `data/jobs/.incoming/`, `.locks/`, and `.deleted/` are private control directories used for
 durable upload admission, cross-process job coordination, and deletion tombstones. Empty control
@@ -166,6 +182,7 @@ set -euo pipefail
 
 SMOKE_ROOT="$(mktemp -d /tmp/voxdelta-smoke.XXXXXX)"
 mkdir -p "$SMOKE_ROOT/data"
+SMOKE_TOKEN="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 SERVER_PID=""
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -178,6 +195,7 @@ trap cleanup EXIT
 
 VOXDELTA_DATA_ROOT="$SMOKE_ROOT/data" \
 VOXDELTA_DATABASE_PATH="$SMOKE_ROOT/data/voxdelta.sqlite3" \
+VOXDELTA_API_CAPABILITY_TOKEN="$SMOKE_TOKEN" \
 uv run uvicorn voxdelta.api.app:app \
   --host 127.0.0.1 \
   --port 8765 \
@@ -199,12 +217,14 @@ UPLOAD_CODE="$(curl --connect-timeout 2 --max-time 60 -sS \
   -w '%{http_code}' \
   -F 'file=@tests/fixtures/synthetic_65s.wav;type=audio/wav' \
   -F 'diagnostic_capture=false' \
+  -H "X-VoxDelta-Token: $SMOKE_TOKEN" \
   http://127.0.0.1:8765/api/jobs)"
 test "$UPLOAD_CODE" = 202
 JOB_ID="$(jq -er '.job_id' "$SMOKE_ROOT/created.json")"
 
 for _ in $(seq 1 100); do
   curl --connect-timeout 2 --max-time 10 -fsS \
+    -H "X-VoxDelta-Token: $SMOKE_TOKEN" \
     "http://127.0.0.1:8765/api/jobs/$JOB_ID" \
     >"$SMOKE_ROOT/paused.json"
   if jq -e \
@@ -240,12 +260,14 @@ ROLE_CODE="$(curl --connect-timeout 2 --max-time 60 -sS \
   -o "$SMOKE_ROOT/role-response.json" \
   -w '%{http_code}' \
   -H 'Content-Type: application/json' \
+  -H "X-VoxDelta-Token: $SMOKE_TOKEN" \
   --data-binary @"$SMOKE_ROOT/roles.json" \
   "http://127.0.0.1:8765/api/jobs/$JOB_ID/roles")"
 test "$ROLE_CODE" = 200
 
 for _ in $(seq 1 100); do
   curl --connect-timeout 2 --max-time 10 -fsS \
+    -H "X-VoxDelta-Token: $SMOKE_TOKEN" \
     "http://127.0.0.1:8765/api/jobs/$JOB_ID" \
     >"$SMOKE_ROOT/completed.json"
   if jq -e '.status == "completed" and .stages.report.status == "completed"' \
@@ -262,12 +284,14 @@ RANGE_CODE="$(curl --connect-timeout 2 --max-time 30 -sS \
   -o "$SMOKE_ROOT/range.bin" \
   -w '%{http_code}' \
   -H 'Range: bytes=0-1023' \
+  -H "X-VoxDelta-Token: $SMOKE_TOKEN" \
   "http://127.0.0.1:8765/api/jobs/$JOB_ID/audio")"
 test "$RANGE_CODE" = 206
 grep -Eiq '^content-range: bytes 0-1023/[0-9]+' "$SMOKE_ROOT/range.headers"
 test "$(wc -c <"$SMOKE_ROOT/range.bin" | tr -d ' ')" = 1024
 
 curl --connect-timeout 2 --max-time 30 -fsS \
+  -H "X-VoxDelta-Token: $SMOKE_TOKEN" \
   "http://127.0.0.1:8765/api/jobs/$JOB_ID/report" \
   >"$SMOKE_ROOT/report.json"
 jq -e 'has("transitions") and (.utterances | length > 0)' \
@@ -277,6 +301,7 @@ DELETE_CODE="$(curl --connect-timeout 2 --max-time 30 -sS \
   -o /dev/null \
   -w '%{http_code}' \
   -X DELETE \
+  -H "X-VoxDelta-Token: $SMOKE_TOKEN" \
   "http://127.0.0.1:8765/api/jobs/$JOB_ID")"
 test "$DELETE_CODE" = 204
 
@@ -296,6 +321,6 @@ From `backend/`:
 uv run pytest -q
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy src
+uv run mypy src scripts
 uv lock --check
 ```

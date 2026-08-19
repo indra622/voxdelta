@@ -655,6 +655,48 @@ class ArtifactStore:
         except (OSError, ValueError):
             return False
 
+    def remove_unreferenced_audio_generations(
+        self,
+        job_id: str,
+        keep_paths: tuple[str, ...],
+    ) -> int:
+        """Best-effort remove obsolete direct audio generations after fenced publication."""
+
+        directory = self._job_path(job_id, create=False, require_directory=True)
+        keep: set[Path] = set()
+        for raw_path in keep_paths:
+            path = Path(raw_path)
+            generation = path.parent
+            if (
+                not path.is_absolute()
+                or generation.parent != directory
+                or not generation.name.startswith("audio-")
+                or _is_link_like(generation)
+                or not generation.is_dir()
+            ):
+                raise ValueError("retained audio path must belong to one direct generation")
+            keep.add(generation)
+        removed = 0
+        for candidate in directory.iterdir():
+            if candidate in keep or not candidate.name.startswith("audio-"):
+                continue
+            try:
+                metadata = candidate.lstat()
+            except OSError:
+                continue
+            if _is_link_like(candidate) or not stat.S_ISDIR(metadata.st_mode):
+                continue
+            try:
+                shutil.rmtree(candidate)
+                removed += 1
+            except OSError:
+                # Open descriptors remain valid on POSIX. Windows may defer cleanup until a
+                # later retry once active preview handles close.
+                continue
+        if removed:
+            _fsync_directory(directory)
+        return removed
+
     @contextmanager
     def operation_lock(self, job_id: str) -> Iterator[None]:
         """Serialize one job's claim/reset transitions across runner processes.

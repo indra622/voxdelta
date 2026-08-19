@@ -5,15 +5,20 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import threading
+import wave
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
 import pytest
 from fastapi import BackgroundTasks, FastAPI, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import SecretStr
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.requests import ClientDisconnect
 
@@ -28,6 +33,7 @@ from voxdelta.pipeline.stages import MediaReference, NormalizeArtifact, cache_ke
 from voxdelta.providers.fake import FakeDiarizationProvider
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "synthetic_65s.wav"
+TEST_CAPABILITY_TOKEN = "test-capability-token-with-enough-entropy"
 
 
 class UnexpectedDiarizer(FakeDiarizationProvider):
@@ -59,8 +65,9 @@ class FailingCreateRepository(JobRepository):
         diagnostic_capture: bool = False,
         *,
         job_id: str | None = None,
+        max_active_jobs: int | None = None,
     ) -> str:
-        del source_name, diagnostic_capture, job_id
+        del source_name, diagnostic_capture, job_id, max_active_jobs
         raise RuntimeError("private database create failure")
 
 
@@ -71,11 +78,13 @@ class CommitThenRaiseRepository(JobRepository):
         diagnostic_capture: bool = False,
         *,
         job_id: str | None = None,
+        max_active_jobs: int | None = None,
     ) -> str:
         created = super().create_job(
             source_name,
             diagnostic_capture=diagnostic_capture,
             job_id=job_id,
+            max_active_jobs=max_active_jobs,
         )
         raise RuntimeError(f"ambiguous commit for {created}")
 
@@ -116,6 +125,7 @@ def build_harness(
             artifacts=artifacts,
             runner=runner,
             max_upload_bytes=max_upload_bytes,
+            api_capability_token=SecretStr(TEST_CAPABILITY_TOKEN),
         ),
         repository,
         artifacts,
@@ -127,7 +137,8 @@ def build_harness(
 async def client_for(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
-        base_url="http://testserver",
+        base_url="http://localhost",
+        headers={"X-VoxDelta-Token": TEST_CAPABILITY_TOKEN},
     ) as client:
         yield client
 
@@ -180,7 +191,11 @@ async def raw_chunked_request(
         sent.append(message)
 
     boundary = b"voxdelta-boundary"
-    headers = [(b"content-type", b"multipart/form-data; boundary=" + boundary)]
+    headers = [
+        (b"host", b"localhost"),
+        (b"x-voxdelta-token", TEST_CAPABILITY_TOKEN.encode("ascii")),
+        (b"content-type", b"multipart/form-data; boundary=" + boundary),
+    ]
     if content_length_values is not None:
         headers.extend((b"content-length", value) for value in content_length_values)
     elif include_content_length:
@@ -196,7 +211,7 @@ async def raw_chunked_request(
         "query_string": b"",
         "headers": headers,
         "client": ("test", 1),
-        "server": ("test", 80),
+        "server": ("localhost", 80),
     }
     await app(scope, receive, send)  # type: ignore[arg-type]
     return sent, received, receive_calls
@@ -224,6 +239,113 @@ async def test_docs_and_provider_disclosures_are_public_and_secret_free(tmp_path
     )
     assert all("api_key" not in json.dumps(item).casefold() for item in payload["stages"])
     assert_no_private_paths(payload, tmp_path)
+
+
+def test_importing_production_api_module_creates_no_runtime_database(tmp_path: Path) -> None:
+    data_root = tmp_path / "isolated-data"
+    environment = {
+        **os.environ,
+        "VOXDELTA_DATA_ROOT": str(data_root),
+        "VOXDELTA_DATABASE_PATH": str(data_root / "voxdelta.sqlite3"),
+    }
+
+    subprocess.run(
+        [sys.executable, "-c", "import voxdelta.api.app"],
+        check=True,
+        capture_output=True,
+        env=environment,
+        timeout=15,
+    )
+
+    assert not data_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_job_routes_require_capability_and_reject_untrusted_host_or_origin(
+    tmp_path: Path,
+) -> None:
+    jobs_root = tmp_path / "jobs"
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    artifacts = ArtifactStore(jobs_root)
+    runner = PipelineRunner(repository, artifacts, AudioService(jobs_root, 60, 3600))
+    with pytest.raises(ValueError, match="capability token"):
+        create_app(repository=repository, artifacts=artifacts, runner=runner)
+    app = create_app(
+        repository=repository,
+        artifacts=artifacts,
+        runner=runner,
+        api_capability_token=SecretStr(TEST_CAPABILITY_TOKEN),
+    )
+    job_id = repository.create_job("private-source.wav")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://localhost",
+    ) as client:
+        missing = await client.get(f"/api/jobs/{job_id}")
+        wrong = await client.get(
+            f"/api/jobs/{job_id}",
+            headers={"X-VoxDelta-Token": "wrong"},
+        )
+        hostile_origin = await client.get(
+            f"/api/jobs/{job_id}",
+            headers={
+                "X-VoxDelta-Token": TEST_CAPABILITY_TOKEN,
+                "Origin": "https://attacker.example",
+            },
+        )
+        hostile_host = await client.get(
+            f"/api/jobs/{job_id}",
+            headers={
+                "X-VoxDelta-Token": TEST_CAPABILITY_TOKEN,
+                "Host": "attacker.example",
+            },
+        )
+        accepted = await client.get(
+            f"/api/jobs/{job_id}",
+            headers={"X-VoxDelta-Token": TEST_CAPABILITY_TOKEN},
+        )
+
+    assert missing.status_code == 401
+    assert wrong.status_code == 401
+    assert hostile_origin.status_code == 403
+    assert hostile_host.status_code == 400
+    assert accepted.status_code == 200
+    assert "private-source" not in "".join(
+        response.text for response in (missing, wrong, hostile_origin, hostile_host)
+    )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_job_quota_rejects_second_admission_without_residue(
+    tmp_path: Path,
+) -> None:
+    jobs_root = tmp_path / "jobs"
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    artifacts = ArtifactStore(jobs_root)
+    runner = PipelineRunner(repository, artifacts, AudioService(jobs_root, 60, 3600))
+    app = create_app(
+        repository=repository,
+        artifacts=artifacts,
+        runner=runner,
+        api_capability_token=SecretStr(TEST_CAPABILITY_TOKEN),
+        max_active_jobs=1,
+    )
+    headers = {"X-VoxDelta-Token": TEST_CAPABILITY_TOKEN}
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://localhost",
+        headers=headers,
+    ) as client:
+        first = await upload(client)
+        second = await upload(client)
+
+    assert first.status_code == 202
+    assert second.status_code == 429
+    assert second.json()["detail"]["code"] == "job_capacity_reached"
+    assert job_count(repository) == 1
+    assert len(list(artifacts.root.glob("[0-9a-f]" * 32))) == 1
 
 
 @pytest.mark.asyncio
@@ -323,6 +445,39 @@ async def test_openapi_documents_uniform_request_validation_envelope(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_openapi_exactly_documents_report_audio_and_public_error_contracts(
+    tmp_path: Path,
+) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        schema = (await client.get("/openapi.json")).json()
+
+    paths = schema["paths"]
+    report = paths["/api/jobs/{job_id}/report"]["get"]["responses"]
+    assert report["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/AnalysisReport"
+    }
+    assert {"400", "401", "403", "404", "409"}.issubset(report)
+
+    audio = paths["/api/jobs/{job_id}/audio"]["get"]["responses"]
+    assert {"200", "206", "400", "401", "403", "404", "409", "416"}.issubset(audio)
+    for status in ("200", "206"):
+        assert audio[status]["content"]["audio/wav"]["schema"] == {
+            "type": "string",
+            "format": "binary",
+        }
+    for status in ("400", "401", "403", "404", "409", "416"):
+        assert audio[status]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/PublicErrorEnvelope"
+        }
+
+    create = paths["/api/jobs"]["post"]["responses"]
+    assert {"202", "400", "401", "403", "413", "422", "429", "500"}.issubset(create)
+    assert "HTTPValidationError" not in json.dumps(paths)
+
+
+@pytest.mark.asyncio
 async def test_upload_pauses_persists_diagnostic_false_and_never_trusts_filename(
     tmp_path: Path,
 ) -> None:
@@ -365,6 +520,92 @@ async def test_upload_rejects_unsupported_suffix_without_creating_job(tmp_path: 
         assert database.execute("SELECT COUNT(*) FROM jobs").fetchone() == (0,)
     assert not artifacts.root.exists()
     assert "call.exe" not in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "payload", "expected_code"),
+    [
+        ("corrupt.wav", b"not actually audio", "audio_rejected"),
+        ("short.wav", b"RIFF-invalid", "audio_rejected"),
+    ],
+)
+async def test_upload_preflight_rejects_invalid_audio_before_durable_admission(
+    tmp_path: Path,
+    name: str,
+    payload: bytes,
+    expected_code: str,
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        response = await client.post(
+            "/api/jobs",
+            files={"file": (name, payload, "audio/wav")},
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "code": expected_code,
+            "message": "The uploaded audio was rejected.",
+        }
+    }
+    assert job_count(repository) == 0
+    assert not list(artifacts.root.glob("[0-9a-f]" * 32)) if artifacts.root.exists() else True
+    assert not list((artifacts.root / ".incoming").glob("*"))
+
+
+@pytest.mark.asyncio
+async def test_upload_preflight_rejects_decoded_duration_before_durable_admission(
+    tmp_path: Path,
+) -> None:
+    short = tmp_path / "short.wav"
+    with wave.open(str(short), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\0\0" * 16_000)
+    app, repository, artifacts, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        response = await client.post(
+            "/api/jobs",
+            files={"file": ("short.wav", short.read_bytes(), "audio/wav")},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == {
+        "code": "audio_rejected",
+        "message": "The uploaded audio was rejected.",
+    }
+    assert job_count(repository) == 0
+    assert not list(artifacts.root.glob("[0-9a-f]" * 32)) if artifacts.root.exists() else True
+
+
+@pytest.mark.asyncio
+async def test_upload_reuses_preflight_normalization_without_decoding_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import voxdelta.audio.service as audio_module
+
+    calls = 0
+    original = audio_module._normalize_mixed
+
+    def count_normalization(source: Path, target: Path) -> None:
+        nonlocal calls
+        calls += 1
+        original(source, target)
+
+    monkeypatch.setattr(audio_module, "_normalize_mixed", count_normalization)
+    app, _, _, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        response = await upload(client)
+
+    assert response.status_code == 202
+    assert calls == 1
 
 
 @pytest.mark.asyncio
@@ -738,7 +979,7 @@ async def test_scheduling_claim_then_raise_keeps_job_and_terminalizes_it(
     ) -> None:
         del self, function, kwargs
         job_id = str(args[-1])
-        assert repository.claim_stage(job_id, StageName.NORMALIZE) is not None
+        assert repository.claim_stage(job_id, StageName.DIARIZE) is not None
         raise RuntimeError("scheduler failed after claim")
 
     monkeypatch.setattr(BackgroundTasks, "add_task", claim_then_raise)
@@ -811,6 +1052,52 @@ def test_reconciliation_cleans_only_stale_absent_state_and_recovers_pending_job(
     assert repository.get_job(claimed_id)["status"] == "running"
     assert (artifacts.root / ".deleted" / f"{tombstone_id}.tombstone").is_file()
     assert (artifacts.root / ".locks" / f"{lock_id}.lock").is_file()
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [StageName.NORMALIZE, StageName.DIARIZE, StageName.REPORT],
+)
+def test_reconciliation_schedules_expired_running_claims_but_never_live_claims(
+    stage: StageName,
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    current = [now]
+    repository = JobRepository(
+        tmp_path / "voxdelta.sqlite3",
+        clock=lambda: current[0],
+        claim_lease_seconds=30,
+    )
+    artifacts = ArtifactStore(tmp_path / "jobs")
+    runner = PipelineRunner(repository, artifacts, AudioService(artifacts.root, 60, 3600))
+
+    def create_claimed(job_id: str) -> None:
+        source = artifacts.job_dir(job_id) / "source-upload.wav"
+        source.write_bytes(FIXTURE.read_bytes())
+        repository.create_job(str(source), job_id=job_id)
+        assert repository.claim_stage(job_id, stage) is not None
+
+    expired = "1" * 32
+    live = "2" * 32
+    create_claimed(expired)
+    current[0] += timedelta(seconds=31)
+    create_claimed(live)
+    scheduled: list[str] = []
+
+    recovered = reconcile_local_state(
+        repository,
+        artifacts,
+        runner,
+        lease_seconds=10,
+        now=1000,
+        schedule=scheduled.append,
+    )
+
+    assert recovered == (expired,)
+    assert scheduled == [expired]
+    assert repository.get_job(expired)["stages"][stage.value]["status"] == "running"
+    assert repository.get_job(live)["stages"][stage.value]["status"] == "running"
 
 
 def test_symlink_root_is_canonical_for_persisted_source_and_pending_recovery(
@@ -1308,7 +1595,8 @@ async def test_delete_rmtree_failure_is_retryable_without_recreation(
     monkeypatch.setattr(artifacts_module.shutil, "rmtree", fail_once)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
-        base_url="http://testserver",
+        base_url="http://localhost",
+        headers={"X-VoxDelta-Token": TEST_CAPABILITY_TOKEN},
     ) as client:
         created = await upload(client)
         job_id = created.json()["job_id"]
@@ -1338,7 +1626,8 @@ async def test_delete_database_finalization_failure_is_retryable(
     app, _, artifacts, _ = build_harness(tmp_path, repository_override=repository)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
-        base_url="http://testserver",
+        base_url="http://localhost",
+        headers={"X-VoxDelta-Token": TEST_CAPABILITY_TOKEN},
     ) as client:
         created = await upload(client)
         job_id = created.json()["job_id"]
@@ -1458,7 +1747,8 @@ async def test_delete_syncs_artifact_root_before_database_finalization_and_retri
     monkeypatch.setattr(repository, "finalize_delete", tracking_finalize)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
-        base_url="http://testserver",
+        base_url="http://localhost",
+        headers={"X-VoxDelta-Token": TEST_CAPABILITY_TOKEN},
     ) as client:
         created = await upload(client)
         selected_job_id = created.json()["job_id"]
@@ -1508,6 +1798,7 @@ async def test_delete_fences_inflight_worker_from_a_separate_runner(
         repository=repository,
         artifacts=artifacts,
         runner=deleting_runner,
+        api_capability_token=SecretStr(TEST_CAPABILITY_TOKEN),
     )
     async with client_for(app) as client, client_for(deleting_app) as deleting_client:
         upload_task = __import__("asyncio").create_task(upload(client))

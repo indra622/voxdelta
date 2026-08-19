@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import stat
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +24,40 @@ from voxdelta.jobs._ids import (
 
 Clock = Callable[[], datetime]
 Publisher = Callable[[], None]
+_DATABASE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+
+
+def _is_link_like(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    file_attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(file_attributes & reparse_attribute)
+
+
+def _secure_regular_file(path: Path, *, create: bool) -> None:
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if create:
+        flags |= os.O_CREAT
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError:
+        raise ValueError("database files must be private regular non-link files") from None
+    try:
+        opened = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            _is_link_like(path)
+            or not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("database files must be private regular non-link files")
+        if os.name == "posix":
+            os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
 
 
 def _stages_are_pristine_pending(stages: list[sqlite3.Row]) -> bool:
@@ -53,6 +89,10 @@ class StageClaim:
     token: str
 
 
+class JobCapacityExceeded(RuntimeError):
+    """Raised when the bounded local incomplete-job quota is full."""
+
+
 class JobRepository:
     """Persist job metadata and resumable, fenced stage state in SQLite."""
 
@@ -65,8 +105,14 @@ class JobRepository:
     ) -> None:
         if claim_lease_seconds <= 0:
             raise ValueError("claim lease must be positive")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.path = path
+        selected = Path(path).expanduser().absolute()
+        selected.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _is_link_like(selected.parent) or not selected.parent.is_dir():
+            raise ValueError("database parent must be a private regular directory")
+        if os.name == "posix":
+            os.chmod(selected.parent, 0o700)
+        self.path = selected
+        self._secure_database_family(create_database=True)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._claim_lease = timedelta(seconds=claim_lease_seconds)
         self._initialize_schema()
@@ -129,10 +175,19 @@ class JobRepository:
                     database.execute(f"ALTER TABLE stages ADD COLUMN {name} {declaration}")
 
     def _connect(self) -> sqlite3.Connection:
+        self._secure_database_family(create_database=True)
         database = sqlite3.connect(self.path)
         database.row_factory = sqlite3.Row
         database.execute("PRAGMA foreign_keys = ON")
+        self._secure_database_family(create_database=False)
         return database
+
+    def _secure_database_family(self, *, create_database: bool) -> None:
+        _secure_regular_file(self.path, create=create_database)
+        for suffix in _DATABASE_SIDECAR_SUFFIXES:
+            sidecar = Path(f"{self.path}{suffix}")
+            if sidecar.exists() or _is_link_like(sidecar):
+                _secure_regular_file(sidecar, create=False)
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -146,13 +201,29 @@ class JobRepository:
         diagnostic_capture: bool = False,
         *,
         job_id: str | None = None,
+        max_active_jobs: int | None = None,
     ) -> str:
         """Create a pending job and all canonical pending stage rows atomically."""
 
         job_id = uuid.uuid4().hex if job_id is None else job_id
         validate_canonical_job_id(job_id)
+        if max_active_jobs is not None and max_active_jobs <= 0:
+            raise ValueError("active job limit must be positive")
         now = self._now().isoformat()
         with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            if max_active_jobs is not None:
+                active = int(
+                    database.execute(
+                        """
+                        SELECT COUNT(*) FROM jobs
+                        WHERE status NOT IN (?, ?, 'deleting')
+                        """,
+                        (StageStatus.COMPLETED.value, StageStatus.FAILED.value),
+                    ).fetchone()[0]
+                )
+                if active >= max_active_jobs:
+                    raise JobCapacityExceeded("incomplete job quota is full")
             database.execute(
                 """
                 INSERT INTO jobs (
@@ -241,6 +312,38 @@ class JobRepository:
                 ).fetchall()
                 source_name = str(job["source_name"])
                 if source_name and _stages_are_pristine_pending(stages):
+                    recovered.append((job_id, source_name))
+        return recovered
+
+    def list_expired_running_jobs(self) -> list[tuple[str, str]]:
+        """List jobs whose sole recoverable progress is fenced by an expired claim."""
+
+        now = self._now()
+        recovered: list[tuple[str, str]] = []
+        with self._connect() as database:
+            jobs = database.execute(
+                "SELECT id, source_name FROM jobs WHERE status = ? ORDER BY created_at, id",
+                (StageStatus.RUNNING.value,),
+            ).fetchall()
+            for job in jobs:
+                job_id = str(job["id"])
+                try:
+                    validate_canonical_job_id(job_id)
+                except ValueError:
+                    continue
+                running = database.execute(
+                    """
+                    SELECT claimed_at FROM stages
+                    WHERE job_id = ? AND status = ? AND claim_token IS NOT NULL
+                    """,
+                    (job_id, StageStatus.RUNNING.value),
+                ).fetchall()
+                source_name = str(job["source_name"])
+                if (
+                    source_name
+                    and len(running) == 1
+                    and self._claim_is_expired(running[0]["claimed_at"], now)
+                ):
                     recovered.append((job_id, source_name))
         return recovered
 

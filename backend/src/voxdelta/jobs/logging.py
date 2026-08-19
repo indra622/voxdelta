@@ -16,6 +16,7 @@ from uuid import uuid4
 import orjson
 
 from voxdelta.jobs.artifacts import ArtifactStore
+from voxdelta.security import is_credential_key, key_tokens
 
 try:
     import fcntl
@@ -24,7 +25,7 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
 
 _REDACTED = "[REDACTED]"
 _UNSERIALIZABLE = "[UNSERIALIZABLE]"
-_SENSITIVE_KEY_PARTS = ("key", "token", "authorization", "transcript", "payload")
+_SENSITIVE_CONTENT_TOKENS = frozenset({"transcript", "payload"})
 _SAFE_NAME = re.compile(r"[^a-z0-9_-]+")
 _PATH_LOCKS: dict[Path, threading.Lock] = {}
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -59,9 +60,10 @@ def redact(value: object) -> Any:
         for key, item in value.items():
             if not isinstance(key, str):
                 continue
-            folded = key.casefold()
             result[key] = (
-                _REDACTED if any(part in folded for part in _SENSITIVE_KEY_PARTS) else redact(item)
+                _REDACTED
+                if is_credential_key(key) or _SENSITIVE_CONTENT_TOKENS.intersection(key_tokens(key))
+                else redact(item)
             )
         return result
     if isinstance(value, (list, tuple)):

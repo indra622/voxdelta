@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pydantic import SecretStr
+
 from voxdelta.audio.service import AudioService
 from voxdelta.config import Settings
 from voxdelta.jobs.artifacts import ArtifactStore
@@ -18,6 +20,8 @@ class ApiDependencies:
     runner: PipelineRunner
     max_upload_bytes: int
     admission_reconciliation_lease_seconds: int
+    max_active_jobs: int
+    api_capability_token: SecretStr | None
 
 
 def build_dependencies(settings: Settings | None = None) -> ApiDependencies:
@@ -36,6 +40,8 @@ def build_dependencies(settings: Settings | None = None) -> ApiDependencies:
         runner=PipelineRunner(repository, artifacts, audio),
         max_upload_bytes=selected.max_upload_bytes,
         admission_reconciliation_lease_seconds=selected.admission_reconciliation_lease_seconds,
+        max_active_jobs=selected.max_active_jobs,
+        api_capability_token=selected.api_capability_token,
     )
 
 
