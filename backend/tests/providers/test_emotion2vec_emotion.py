@@ -44,6 +44,7 @@ def _checkpoint(path: Path) -> Path:
                 "schema_version": "1",
                 "architecture": "emotion2vec-plus",
                 "model_id": "iic/emotion2vec_plus_large",
+                "encoder_revision": "v2.0.4",
                 "encoder_hash": "b" * 64,
                 "embedding_size": 4,
                 "freeze_encoder": True,
@@ -65,12 +66,21 @@ def _checkpoint(path: Path) -> Path:
 class FakeFactory:
     def __init__(self, predictor: FakePredictor) -> None:
         self.predictor = predictor
-        self.calls: list[tuple[Path, str, str, bool]] = []
+        self.calls: list[tuple[Path, str, str, str, str, bool]] = []
 
     def __call__(
-        self, checkpoint: Path, *, encoder_id: str, device: str, freeze_encoder: bool
+        self,
+        checkpoint: Path,
+        *,
+        encoder_id: str,
+        encoder_revision: str,
+        encoder_hash: str,
+        device: str,
+        freeze_encoder: bool,
     ) -> FakePredictor:
-        self.calls.append((checkpoint, encoder_id, device, freeze_encoder))
+        self.calls.append(
+            (checkpoint, encoder_id, encoder_revision, encoder_hash, device, freeze_encoder)
+        )
         return self.predictor
 
 
@@ -94,6 +104,8 @@ def test_import_is_lazy_and_default_encoder_is_exact(tmp_path: Path) -> None:
         (
             (tmp_path / "checkpoint").resolve(),
             "iic/emotion2vec_plus_large",
+            "v2.0.4",
+            "b" * 64,
             "cpu",
             True,
         )
@@ -145,6 +157,7 @@ def test_malformed_checkpoint_metadata_is_safe(tmp_path: Path) -> None:
                 "schema_version": "1",
                 "architecture": "emotion2vec-plus",
                 "model_id": "wrong",
+                "encoder_revision": "v2.0.4",
                 "encoder_hash": "not-sha",
                 "embedding_size": 4,
                 "freeze_encoder": False,
@@ -172,3 +185,39 @@ def test_factory_failure_is_sanitized(tmp_path: Path) -> None:
         provider.analyze("utt", _wav(tmp_path / "audio.wav", 1), "secret")
     assert raised.value.code == "provider_unavailable"
     assert "private" not in str(raised.value).lower()
+
+
+@pytest.mark.parametrize("device", ["cpu", "mps", "cuda"])
+def test_default_encoder_factory_passes_device_and_pinned_revision(
+    monkeypatch: pytest.MonkeyPatch, device: str
+) -> None:
+    from voxdelta.providers import emotion2vec_emotion as module
+
+    calls: list[dict[str, object]] = []
+
+    class Funasr:
+        @staticmethod
+        def AutoModel(**kwargs: object) -> object:
+            calls.append(kwargs)
+            return object()
+
+    monkeypatch.setattr(module, "import_module", lambda name: Funasr())
+    module._default_encoder_factory("iic/emotion2vec_plus_large", revision="v2.0.4", device=device)
+
+    assert calls == [
+        {
+            "model": "iic/emotion2vec_plus_large",
+            "model_revision": "v2.0.4",
+            "device": device,
+            "disable_update": True,
+        }
+    ]
+
+
+def test_encoder_hash_mismatch_fails_safely() -> None:
+    from voxdelta.providers.emotion2vec_emotion import _verify_encoder_identity
+
+    with pytest.raises(ProviderError) as raised:
+        _verify_encoder_identity(object(), expected_hash="a" * 64, hasher=lambda _encoder: "b" * 64)
+
+    assert raised.value.code == "invalid_local_checkpoint"

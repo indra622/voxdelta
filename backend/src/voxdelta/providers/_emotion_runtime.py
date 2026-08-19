@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-import resource
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -40,6 +40,7 @@ class CheckpointInfo:
     path: Path
     architecture: Architecture
     model_id: str
+    encoder_revision: str | None
     encoder_hash: str | None
     freeze_encoder: bool | None
 
@@ -61,6 +62,22 @@ def activate_candidate(owner: object, unload: Callable[[], None]) -> None:
             pass
 
 
+def prepare_candidate_load(owner: object) -> None:
+    """Evict any prior candidate before a new model factory allocates memory."""
+
+    global _ACTIVE_OWNER, _ACTIVE_UNLOAD
+    if _ACTIVE_OWNER == id(owner):
+        return
+    previous = _ACTIVE_UNLOAD
+    _ACTIVE_OWNER = None
+    _ACTIVE_UNLOAD = None
+    if previous is not None:
+        try:
+            previous()
+        except Exception:
+            pass
+
+
 def release_candidate(owner: object) -> None:
     global _ACTIVE_OWNER, _ACTIVE_UNLOAD
     if _ACTIVE_OWNER == id(owner):
@@ -75,6 +92,18 @@ def _sha(value: object) -> bool:
         and value.lower() == value
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _invalid_json_constant(value: str) -> None:
+    del value
+    raise ValueError
+
+
+def _load_strict_json(path: Path) -> object:
+    raw = read_trusted_regular_file(path)
+    if len(raw) > 1024 * 1024:
+        raise ValueError
+    return json.loads(raw, parse_constant=_invalid_json_constant)
 
 
 def validate_checkpoint(
@@ -100,20 +129,22 @@ def validate_checkpoint(
             (resolved / name).is_symlink() or not (resolved / name).is_file() for name in required
         ):
             raise ValueError
-        config = json.loads(read_trusted_regular_file(resolved / "config.json"))
-        mapping = json.loads(read_trusted_regular_file(resolved / "label_mapping.json"))
-        metrics = json.loads(read_trusted_regular_file(resolved / "metrics.json"))
+        config = _load_strict_json(resolved / "config.json")
+        mapping = _load_strict_json(resolved / "label_mapping.json")
+        metrics = _load_strict_json(resolved / "metrics.json")
         weights = read_trusted_regular_file(resolved / "model.safetensors")
         expected_mapping = {str(index): label for index, label in enumerate(CANONICAL_LABELS)}
         expected_config_keys = {"schema_version", "architecture", "model_id", "labels"}
         if architecture == "emotion2vec-plus":
-            expected_config_keys.update({"embedding_size", "encoder_hash", "freeze_encoder"})
+            expected_config_keys.update(
+                {"embedding_size", "encoder_hash", "encoder_revision", "freeze_encoder"}
+            )
         allowed_metric_keys = {
             "macro_f1",
             "validation_hash",
-            "embedding_size",
             "expected_calibration_error",
         }
+        required_metric_keys = {"macro_f1", "validation_hash"}
         if (
             not isinstance(config, dict)
             or set(config) != expected_config_keys
@@ -123,32 +154,50 @@ def validate_checkpoint(
             or config.get("labels") != list(CANONICAL_LABELS)
             or mapping != expected_mapping
             or not isinstance(metrics, dict)
+            or not required_metric_keys.issubset(metrics)
             or not set(metrics).issubset(allowed_metric_keys)
             or not _sha(metrics.get("validation_hash"))
-            or isinstance(metrics.get("macro_f1"), bool)
-            or not isinstance(metrics.get("macro_f1"), (int, float))
-            or not math.isfinite(float(metrics["macro_f1"]))
-            or not 0 <= float(metrics["macro_f1"]) <= 1
+            or type(metrics.get("macro_f1")) is not float
+            or not math.isfinite(metrics["macro_f1"])
+            or not 0 <= metrics["macro_f1"] <= 1
+            or (
+                "expected_calibration_error" in metrics
+                and (
+                    type(metrics["expected_calibration_error"]) is not float
+                    or not math.isfinite(metrics["expected_calibration_error"])
+                    or not 0 <= metrics["expected_calibration_error"] <= 1
+                )
+            )
             or not weights
         ):
             raise ValueError
+        encoder_revision: str | None = None
         encoder_hash: str | None = None
         freeze_encoder: bool | None = None
         if architecture == "emotion2vec-plus":
             embedding_size = config.get("embedding_size")
             if (
                 not _sha(config.get("encoder_hash"))
+                or config.get("encoder_revision") != "v2.0.4"
                 or config.get("freeze_encoder") is not True
                 or isinstance(embedding_size, bool)
                 or not isinstance(embedding_size, int)
                 or embedding_size <= 0
             ):
                 raise ValueError
+            encoder_revision = cast(str, config["encoder_revision"])
             encoder_hash = cast(str, config["encoder_hash"])
             freeze_encoder = True
         elif "encoder_hash" in config or "freeze_encoder" in config:
             raise ValueError
-        return CheckpointInfo(resolved, architecture, model_id, encoder_hash, freeze_encoder)
+        return CheckpointInfo(
+            resolved,
+            architecture,
+            model_id,
+            encoder_revision,
+            encoder_hash,
+            freeze_encoder,
+        )
     except Exception:
         raise ProviderError("invalid_local_checkpoint") from None
 
@@ -176,10 +225,24 @@ def default_inference_context() -> AbstractContextManager[object]:
     return cast(AbstractContextManager[object], import_module("torch").inference_mode())
 
 
+def rss_megabytes(raw_rss: int | float, platform: str) -> float:
+    value = float(raw_rss)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("invalid rss")
+    return value / (1024 * 1024) if platform == "darwin" else value / 1024
+
+
 def default_rss_probe() -> float:
-    maximum = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    # Darwin reports bytes; Linux reports KiB.
-    return maximum / (1024 * 1024) if maximum > 1024 * 1024 else maximum / 1024
+    try:
+        if sys.platform == "win32":
+            psutil = import_module("psutil")
+            process = psutil.Process()
+            return float(process.memory_info().rss) / (1024 * 1024)
+        resource = import_module("resource")
+        maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss_megabytes(maximum, sys.platform)
+    except Exception:
+        return 0.0
 
 
 def _probabilities(window_logits: Sequence[Sequence[float]]) -> dict[EmotionLabel, float]:
@@ -194,13 +257,16 @@ def _probabilities(window_logits: Sequence[Sequence[float]]) -> dict[EmotionLabe
         if len(row) != len(CANONICAL_LABELS) or any(not math.isfinite(value) for value in row):
             raise ProviderError("invalid_provider_output")
         normalized.append(row)
-    means = tuple(
-        math.fsum(row[index] for row in normalized) / len(normalized)
-        for index in range(len(CANONICAL_LABELS))
-    )
-    peak = max(means)
-    exponentials = tuple(math.exp(value - peak) for value in means)
-    denominator = math.fsum(exponentials)
+    try:
+        means = tuple(
+            math.fsum(row[index] for row in normalized) / len(normalized)
+            for index in range(len(CANONICAL_LABELS))
+        )
+        peak = max(means)
+        exponentials = tuple(math.exp(value - peak) for value in means)
+        denominator = math.fsum(exponentials)
+    except (OverflowError, ValueError):
+        raise ProviderError("invalid_provider_output") from None
     if not math.isfinite(denominator) or denominator <= 0:
         raise ProviderError("invalid_provider_output")
     values = tuple(value / denominator for value in exponentials)

@@ -18,6 +18,7 @@ from voxdelta.providers._emotion_runtime import (
     default_hardware_probe,
     default_inference_context,
     default_rss_probe,
+    prepare_candidate_load,
     release_candidate,
     select_device,
     validate_checkpoint,
@@ -109,6 +110,7 @@ class Wav2VecEmotionProvider:
         if self._predictor is not None:
             return self._predictor
         device = select_device(self._requested_device, self._hardware_probe)
+        prepare_candidate_load(self)
         try:
             self._predictor = self._factory(self._checkpoint.path, model_id=MODEL_ID, device=device)
         except ProviderError:

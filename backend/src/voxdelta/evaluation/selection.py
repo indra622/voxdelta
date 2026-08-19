@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from math import isfinite
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -137,12 +137,14 @@ def _decision(
     status: dict[str, CandidateStatus],
     reasons: dict[str, str],
 ) -> SelectionDecision:
+    ordered_status = {candidate_id: status[candidate_id] for candidate_id in sorted(status)}
+    ordered_reasons = {candidate_id: reasons[candidate_id] for candidate_id in sorted(reasons)}
     return SelectionDecision(
         selected_candidate_id=None if selected is None else selected.candidate_id,
         selected_provider=None if selected is None else selected.provider,
         selected_model=None if selected is None else selected.model,
-        candidate_status=status,
-        reasons=reasons,
+        candidate_status=ordered_status,
+        reasons=ordered_reasons,
     )
 
 
@@ -222,19 +224,48 @@ def select_emotion_candidate(candidates: list[CandidateMetrics]) -> SelectionDec
             item.candidate_id,
         )
 
-    stable = sorted(
+    stable_all = sorted(
         (candidate for candidate in eligible if candidate.provider == "wav2vec-xls-r"),
         key=ranking,
     )
-    modern = sorted(
+    modern_all = sorted(
         (candidate for candidate in eligible if candidate.provider == "emotion2vec-plus"),
         key=ranking,
     )
-    supported_ids = {candidate.candidate_id for candidate in (*stable, *modern)}
+    supported_ids = {candidate.candidate_id for candidate in (*stable_all, *modern_all)}
     for candidate in eligible:
         if candidate.candidate_id not in supported_ids:
             status[candidate.candidate_id] = "rejected"
             reasons[candidate.candidate_id] = "unsupported_emotion_candidate_provider"
+
+    stable = list(stable_all)
+    modern = list(modern_all)
+    if stable and modern:
+        minimum_stable_ece = min(
+            cast(float, candidate.expected_calibration_error) for candidate in stable
+        )
+        minimum_modern_ece = min(
+            cast(float, candidate.expected_calibration_error) for candidate in modern
+        )
+        stable = [
+            candidate
+            for candidate in stable
+            if cast(float, candidate.expected_calibration_error) <= minimum_modern_ece + 0.02
+        ]
+        modern = [
+            candidate
+            for candidate in modern
+            if cast(float, candidate.expected_calibration_error) <= minimum_stable_ece + 0.02
+        ]
+        viable_ids = {candidate.candidate_id for candidate in (*stable, *modern)}
+        for candidate in (*stable_all, *modern_all):
+            if candidate.candidate_id not in viable_ids:
+                status[candidate.candidate_id] = "rejected"
+                reasons[candidate.candidate_id] = (
+                    "emotion2vec_ece_regressed_above_0.02"
+                    if candidate.provider == "emotion2vec-plus"
+                    else "baseline_ece_regressed_above_0.02"
+                )
     for group in (stable, modern):
         for candidate in group[1:]:
             status[candidate.candidate_id] = "rejected"

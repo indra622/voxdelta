@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from typing import Never
 
 from voxdelta.evaluation.emotion_training import (
     Emotion2VecTrainingProfile,
@@ -16,8 +17,14 @@ from voxdelta.evaluation.emotion_training import (
 )
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> Never:
+        del message
+        raise TrainingError("invalid_training_profile")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train a local seven-emotion provider")
+    parser = _SafeArgumentParser(description="Train a local seven-emotion provider")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(
@@ -32,8 +39,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
     try:
+        arguments = _parser().parse_args(argv)
         profile: TrainingProfile
         if arguments.architecture == "wav2vec-xls-r":
             if (

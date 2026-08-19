@@ -43,6 +43,7 @@ def test_profiles_are_strict_and_exact() -> None:
     )
     modern = Emotion2VecTrainingProfile()
     assert modern.encoder_id == "iic/emotion2vec_plus_large"
+    assert modern.encoder_revision == "v2.0.4"
     assert modern.freeze_encoder is True
     assert (modern.hidden_size, modern.dropout, modern.learning_rate) == (256, 0.1, 1e-3)
     assert (modern.batch_size, modern.epochs, modern.early_stopping_patience) == (64, 20, 3)
@@ -103,6 +104,9 @@ def test_embedding_cache_key_is_collision_resistant_and_cache_fails_closed(
     assert base != embedding_cache_key("b" * 64, "iic/emotion2vec_plus_large", "v1")
     assert base != embedding_cache_key("a" * 64, "other", "v1")
     assert base != embedding_cache_key("a" * 64, "iic/emotion2vec_plus_large", "v2")
+    assert base != embedding_cache_key(
+        "a" * 64, "iic/emotion2vec_plus_large@v2.0.4#" + "b" * 64, "v1"
+    )
     with pytest.raises(ValueError):
         embedding_cache_key("not-sha", "encoder", "v1")
 
@@ -126,6 +130,31 @@ def test_embedding_cache_rejects_symlinked_ancestors(tmp_path: Path) -> None:
         EmbeddingCache(linked / "cache")
 
 
+@pytest.mark.parametrize("swap", ["root", "ancestor"])
+def test_embedding_cache_fails_closed_after_directory_swap(tmp_path: Path, swap: str) -> None:
+    from voxdelta.evaluation.emotion_training import EmbeddingCache
+
+    parent = tmp_path / "parent"
+    root = parent / "cache"
+    parent.mkdir()
+    cache = EmbeddingCache(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    if swap == "root":
+        original = parent / "original-cache"
+        root.rename(original)
+        root.symlink_to(outside, target_is_directory=True)
+    else:
+        original = tmp_path / "original-parent"
+        parent.rename(original)
+        parent.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="invalid_embedding_cache"):
+        cache.store("a" * 64, (1.0, 2.0))
+    assert list(outside.iterdir()) == []
+
+
 def test_checkpoint_publication_is_atomic_complete_and_hashes_validation(
     tmp_path: Path,
 ) -> None:
@@ -139,6 +168,7 @@ def test_checkpoint_publication_is_atomic_complete_and_hashes_validation(
         metrics={"macro_f1": 0.75},
         validation_hash="a" * 64,
         encoder_hash="b" * 64,
+        encoder_revision="v2.0.4",
         freeze_encoder=True,
         embedding_size=2,
     )
@@ -153,6 +183,7 @@ def test_checkpoint_publication_is_atomic_complete_and_hashes_validation(
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     assert config["labels"] == list(LABELS)
     assert config["encoder_hash"] == "b" * 64
+    assert config["encoder_revision"] == "v2.0.4"
     assert config["embedding_size"] == 2
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["validation_hash"] == "a" * 64
@@ -354,3 +385,42 @@ def test_training_cli_errors_are_sanitized_and_imports_are_lazy(tmp_path: Path) 
     assert result.stderr.strip() == "training_error: invalid_training_manifest"
     assert "private" not in result.stderr.lower()
     assert os.environ == environment
+
+
+def test_evaluation_example_batches_use_exact_profile_batch_size() -> None:
+    from voxdelta.evaluation.emotion_training import evaluation_example_batches
+
+    examples = tuple(range(17))
+    observed = [len(batch) for batch in evaluation_example_batches(examples, 8)]
+
+    assert observed == [8, 8, 1]
+    assert tuple(item for batch in evaluation_example_batches(examples, 8) for item in batch) == (
+        examples
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--architecture", "private-transcript-secret"],
+        ["--seed", "private-transcript-secret"],
+        ["--unknown-private-transcript-secret"],
+        ["--manifest", "private-transcript-secret"],
+    ],
+)
+def test_argparse_failures_never_echo_rejected_values(tmp_path: Path, arguments: list[str]) -> None:
+    command = [sys.executable, "scripts/train_emotion.py", *arguments]
+    result = subprocess.run(
+        command,
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.strip() == "training_error: invalid_training_profile"
+    assert "private" not in result.stderr.lower()
+    assert "transcript" not in result.stderr.lower()
+    assert "secret" not in result.stderr.lower()

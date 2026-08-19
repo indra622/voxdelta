@@ -361,7 +361,7 @@ def test_emotion_resource_boundaries_are_exact(
 def test_emotion_multiple_candidates_are_reduced_deterministically() -> None:
     decision = select_emotion_candidate(
         [
-            _emotion_candidate("stable-b", "wav2vec-xls-r", f1=0.68, ece=0.05),
+            _emotion_candidate("stable-b", "wav2vec-xls-r", f1=0.68, ece=0.07),
             _emotion_candidate("stable-a", "wav2vec-xls-r", f1=0.70, ece=0.08),
             _emotion_candidate("modern-b", "emotion2vec-plus", f1=0.70, ece=0.08, latency=90),
             _emotion_candidate("modern-a", "emotion2vec-plus", f1=0.70, ece=0.08, latency=80),
@@ -378,6 +378,38 @@ def test_emotion_multiple_candidates_are_reduced_deterministically() -> None:
         "unknown": "rejected",
     }
     assert set(decision.reasons) == set(decision.candidate_status)
+
+
+def test_emotion_selection_does_not_discard_calibrated_sibling() -> None:
+    decision = select_emotion_candidate(
+        [
+            _emotion_candidate("stable", "wav2vec-xls-r", f1=0.70, ece=0.05),
+            _emotion_candidate("modern-high", "emotion2vec-plus", f1=0.90, ece=0.20),
+            _emotion_candidate("modern-calibrated", "emotion2vec-plus", f1=0.72, ece=0.06),
+        ]
+    )
+
+    assert decision.selected_candidate_id == "modern-calibrated"
+    assert decision.candidate_status == {
+        "modern-calibrated": "eligible",
+        "modern-high": "rejected",
+        "stable": "rejected",
+    }
+    assert decision.reasons["modern-high"] == "emotion2vec_ece_regressed_above_0.02"
+
+
+def test_emotion_decision_json_is_input_order_independent() -> None:
+    candidates = [
+        _emotion_candidate("z-stable", "wav2vec-xls-r", f1=0.70, ece=0.08),
+        _emotion_candidate("a-modern", "emotion2vec-plus", f1=0.72, ece=0.08),
+    ]
+
+    forward = select_emotion_candidate(candidates)
+    reverse = select_emotion_candidate(list(reversed(candidates)))
+
+    assert forward.model_dump_json() == reverse.model_dump_json()
+    assert list(forward.candidate_status) == sorted(forward.candidate_status)
+    assert list(forward.reasons) == sorted(forward.reasons)
 
 
 def test_emotion_gate_rejects_wrong_task_duplicate_ids_and_missing_metrics() -> None:

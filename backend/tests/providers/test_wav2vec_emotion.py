@@ -159,6 +159,20 @@ def test_malformed_logits_are_safely_rejected(tmp_path: Path, outputs: list[list
     assert "private" not in str(raised.value).lower()
 
 
+def test_logit_mean_overflow_is_safely_rejected(tmp_path: Path) -> None:
+    from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
+
+    provider = Wav2VecEmotionProvider(
+        _checkpoint(tmp_path / "checkpoint"),
+        model_factory=FakeFactory(FakePredictor([[1e308] * 7, [1e308] * 7])),
+        hardware_probe=lambda: (False, False),
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        provider.analyze("utt", _wav(tmp_path / "long.wav", 20.5), "")
+    assert raised.value.code == "invalid_provider_output"
+
+
 @pytest.mark.parametrize("seconds", [0.0, 0.4999375])
 def test_short_audio_is_rejected_before_model_loading(tmp_path: Path, seconds: float) -> None:
     from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
@@ -232,6 +246,36 @@ def test_checkpoint_traversal_and_extra_metadata_are_rejected(tmp_path: Path) ->
     assert "secret" not in str(raised.value).lower()
 
 
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        '{"macro_f1": NaN, "validation_hash": "' + "a" * 64 + '"}',
+        '{"macro_f1": Infinity, "validation_hash": "' + "a" * 64 + '"}',
+        json.dumps({"macro_f1": True, "validation_hash": "a" * 64}),
+        json.dumps({"macro_f1": 1, "validation_hash": "a" * 64}),
+        json.dumps({"macro_f1": "0.7", "validation_hash": "a" * 64}),
+        json.dumps({"macro_f1": 1.01, "validation_hash": "a" * 64}),
+        json.dumps({"macro_f1": 0.7, "validation_hash": "a" * 64, "provider_payload": 0.1}),
+        json.dumps(
+            {
+                "macro_f1": 0.7,
+                "expected_calibration_error": -0.01,
+                "validation_hash": "a" * 64,
+            }
+        ),
+    ],
+)
+def test_checkpoint_metrics_are_strict_finite_and_bounded(tmp_path: Path, metrics: str) -> None:
+    from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
+
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    (checkpoint / "metrics.json").write_text(metrics, encoding="utf-8")
+
+    with pytest.raises(ProviderError) as raised:
+        Wav2VecEmotionProvider(checkpoint, model_factory=FakeFactory(FakePredictor([[0.0] * 7])))
+    assert raised.value.code == "invalid_local_checkpoint"
+
+
 def test_auto_device_prefers_cuda_then_mps_and_explicit_unavailable_is_safe(
     tmp_path: Path,
 ) -> None:
@@ -294,3 +338,93 @@ def test_loading_next_candidate_unloads_previous_resident_model(tmp_path: Path) 
 
     assert first_predictor.closed is True
     assert second_predictor.closed is False
+
+
+def test_previous_candidate_is_evicted_before_factory_and_failed_load_leaves_none_resident(
+    tmp_path: Path,
+) -> None:
+    from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
+
+    events: list[str] = []
+
+    class Resident(FakePredictor):
+        def __init__(self, name: str) -> None:
+            super().__init__([[0.0] * 7])
+            self.name = name
+
+        def close(self) -> None:
+            events.append(f"close:{self.name}")
+
+    class RecordingFactory(FakeFactory):
+        def __init__(self, predictor: FakePredictor, name: str, fail: bool = False) -> None:
+            super().__init__(predictor)
+            self.name = name
+            self.fail = fail
+
+        def __call__(self, checkpoint: Path, *, model_id: str, device: str) -> FakePredictor:
+            events.append(f"construct:{self.name}")
+            if self.fail:
+                raise RuntimeError("private transcript secret")
+            return super().__call__(checkpoint, model_id=model_id, device=device)
+
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    first = Wav2VecEmotionProvider(
+        checkpoint,
+        model_factory=RecordingFactory(Resident("first"), "first"),
+        hardware_probe=lambda: (False, False),
+    )
+    failing = Wav2VecEmotionProvider(
+        checkpoint,
+        model_factory=RecordingFactory(Resident("failed"), "failed", fail=True),
+        hardware_probe=lambda: (False, False),
+    )
+    audio = _wav(tmp_path / "audio.wav", 1)
+
+    first.analyze("first", audio, "")
+    with pytest.raises(ProviderError):
+        failing.analyze("failed", audio, "")
+
+    assert events == ["construct:first", "close:first", "construct:failed"]
+
+
+@pytest.mark.parametrize(
+    ("platform", "raw", "expected"),
+    [
+        ("darwin", 2 * 1024**3, 2048.0),
+        ("linux", 2 * 1024**2, 2048.0),
+    ],
+)
+def test_peak_rss_units_are_platform_specific(platform: str, raw: int, expected: float) -> None:
+    from voxdelta.providers._emotion_runtime import rss_megabytes
+
+    assert rss_megabytes(raw, platform) == expected
+
+
+def test_windows_rss_fallback_does_not_import_resource(monkeypatch: pytest.MonkeyPatch) -> None:
+    from voxdelta.providers import _emotion_runtime as runtime
+
+    requested: list[str] = []
+
+    class Memory:
+        rss = 2 * 1024**3
+
+    class Process:
+        def memory_info(self) -> Memory:
+            return Memory()
+
+    class Psutil:
+        @staticmethod
+        def Process() -> Process:
+            return Process()
+
+    def fake_import(name: str) -> object:
+        requested.append(name)
+        if name == "psutil":
+            return Psutil()
+        raise AssertionError(name)
+
+    monkeypatch.setattr(runtime, "import_module", fake_import)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert runtime.default_rss_probe() == 2048.0
+    assert requested == ["psutil"]

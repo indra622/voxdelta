@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from voxdelta.domain.models import EmotionResult, ProviderProvenance
+from voxdelta.evaluation.emotion_training import encoder_state_hash
 from voxdelta.providers._emotion_runtime import (
     LOCAL_EMOTION_INFERENCE_LOCK,
     Device,
@@ -18,6 +19,7 @@ from voxdelta.providers._emotion_runtime import (
     default_hardware_probe,
     default_inference_context,
     default_rss_probe,
+    prepare_candidate_load,
     release_candidate,
     select_device,
     validate_checkpoint,
@@ -33,15 +35,27 @@ class ModelFactory(Protocol):
         checkpoint: Path,
         *,
         encoder_id: str,
+        encoder_revision: str,
+        encoder_hash: str,
         device: str,
         freeze_encoder: bool,
     ) -> Predictor: ...
 
 
+class _Encoder(Protocol):
+    def generate(self, **kwargs: object) -> object: ...
+
+
 class _Emotion2VecPredictor:
-    def __init__(self, checkpoint: Path, encoder_id: str, device: str) -> None:
+    def __init__(
+        self,
+        checkpoint: Path,
+        encoder_id: str,
+        encoder_revision: str,
+        expected_encoder_hash: str,
+        device: str,
+    ) -> None:
         try:
-            funasr = import_module("funasr")
             torch = import_module("torch")
             safetensors = import_module("safetensors.torch")
             config = __import__("json").loads((checkpoint / "config.json").read_text())
@@ -53,7 +67,14 @@ class _Emotion2VecPredictor:
             ):
                 raise ValueError
             embedding_size = int(raw_embedding_size)
-            self._encoder = funasr.AutoModel(model=encoder_id, disable_update=True)
+            self._encoder = _default_encoder_factory(
+                encoder_id, revision=encoder_revision, device=device
+            )
+            _verify_encoder_identity(
+                self._encoder,
+                expected_hash=expected_encoder_hash,
+                hasher=lambda encoder: encoder_state_hash(encoder, torch),
+            )
             self._device = device
             self._torch = torch
             self._head = torch.nn.Sequential(
@@ -66,6 +87,8 @@ class _Emotion2VecPredictor:
             self._head.load_state_dict(safetensors.load_file(str(checkpoint / "model.safetensors")))
             self._head.to(device)
             self._head.eval()
+        except ProviderError:
+            raise
         except Exception:
             raise ProviderError("provider_runtime_unsupported") from None
 
@@ -86,11 +109,44 @@ class _Emotion2VecPredictor:
 
 
 def _default_factory(
-    checkpoint: Path, *, encoder_id: str, device: str, freeze_encoder: bool
+    checkpoint: Path,
+    *,
+    encoder_id: str,
+    encoder_revision: str,
+    encoder_hash: str,
+    device: str,
+    freeze_encoder: bool,
 ) -> Predictor:
     if not freeze_encoder:
         raise ProviderError("invalid_local_checkpoint")
-    return _Emotion2VecPredictor(checkpoint, encoder_id, device)
+    return _Emotion2VecPredictor(checkpoint, encoder_id, encoder_revision, encoder_hash, device)
+
+
+def _default_encoder_factory(encoder_id: str, *, revision: str, device: str) -> _Encoder:
+    funasr = import_module("funasr")
+    return cast(
+        _Encoder,
+        funasr.AutoModel(
+            model=encoder_id,
+            model_revision=revision,
+            device=device,
+            disable_update=True,
+        ),
+    )
+
+
+def _verify_encoder_identity(
+    encoder: object,
+    *,
+    expected_hash: str,
+    hasher: Callable[[object], str],
+) -> None:
+    try:
+        observed_hash = hasher(encoder)
+    except Exception:
+        raise ProviderError("invalid_local_checkpoint") from None
+    if observed_hash != expected_hash:
+        raise ProviderError("invalid_local_checkpoint")
 
 
 class Emotion2VecEmotionProvider:
@@ -111,7 +167,9 @@ class Emotion2VecEmotionProvider:
             checkpoint_path, architecture="emotion2vec-plus", model_id=ENCODER_ID
         )
         self.provenance = ProviderProvenance(
-            name="emotion2vec-plus", model="emotion2vec-plus-large-seven-emotion", remote=False
+            name="emotion2vec-plus",
+            model="emotion2vec-plus-large-seven-emotion@v2.0.4",
+            remote=False,
         )
         self._requested_device = device
         self._factory = model_factory or _default_factory
@@ -125,10 +183,13 @@ class Emotion2VecEmotionProvider:
         if self._predictor is not None:
             return self._predictor
         device = select_device(self._requested_device, self._hardware_probe)
+        prepare_candidate_load(self)
         try:
             self._predictor = self._factory(
                 self._checkpoint.path,
                 encoder_id=ENCODER_ID,
+                encoder_revision=cast(str, self._checkpoint.encoder_revision),
+                encoder_hash=cast(str, self._checkpoint.encoder_hash),
                 device=device,
                 freeze_encoder=True,
             )

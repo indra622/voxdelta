@@ -8,7 +8,9 @@ import json
 import math
 import os
 import random
+import secrets
 import shutil
+import stat
 import struct
 import tempfile
 import wave
@@ -26,6 +28,7 @@ SAMPLE_RATE = 16_000
 MIN_SAMPLES = SAMPLE_RATE // 2
 WINDOW_SAMPLES = SAMPLE_RATE * 20
 PREPROCESS_VERSION = "emotion-audio-v1"
+EMOTION2VEC_REVISION: Literal["v2.0.4"] = "v2.0.4"
 CANONICAL_LABELS: tuple[EmotionLabel, ...] = (
     "happiness",
     "anger",
@@ -65,6 +68,7 @@ class Emotion2VecTrainingProfile(BaseModel):
 
     architecture: Literal["emotion2vec-plus"] = "emotion2vec-plus"
     encoder_id: Literal["iic/emotion2vec_plus_large"] = "iic/emotion2vec_plus_large"
+    encoder_revision: Literal["v2.0.4"] = EMOTION2VEC_REVISION
     freeze_encoder: Literal[True] = True
     hidden_size: Literal[256] = 256
     dropout: float = 0.1
@@ -154,6 +158,16 @@ def evaluation_logit_mean(logits: Sequence[Sequence[float]]) -> tuple[float, ...
         raise ValueError("invalid_evaluation_logits") from None
 
 
+def evaluation_example_batches[ExampleT](
+    examples: Sequence[ExampleT], batch_size: int
+) -> tuple[tuple[ExampleT, ...], ...]:
+    if isinstance(batch_size, bool) or batch_size <= 0:
+        raise ValueError("invalid_evaluation_batch_size")
+    return tuple(
+        tuple(examples[start : start + batch_size]) for start in range(0, len(examples), batch_size)
+    )
+
+
 def embedding_cache_key(audio_sha256: str, encoder_id: str, preprocess_version: str) -> str:
     if (
         len(audio_sha256) != 64
@@ -172,6 +186,12 @@ def embedding_cache_key(audio_sha256: str, encoder_id: str, preprocess_version: 
 
 
 class EmbeddingCache:
+    """Private cache anchored by a no-follow descriptor on POSIX.
+
+    Other platforms revalidate the root identity immediately around every path operation and
+    fail closed if the directory or any ancestor changes.
+    """
+
     def __init__(self, root: str | Path) -> None:
         candidate = Path(root)
         if ".." in candidate.parts:
@@ -182,6 +202,57 @@ class EmbeddingCache:
             current /= part
             if current.is_symlink():
                 raise ValueError("invalid_embedding_cache")
+        try:
+            self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._use_dirfd = os.name == "posix"
+            self._directory_fd = -1
+            if self._use_dirfd:
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                self._directory_fd = os.open(self._root, flags)
+                opened = os.fstat(self._directory_fd)
+            else:
+                opened = os.stat(self._root, follow_symlinks=False)
+            if not stat.S_ISDIR(opened.st_mode) or self._root.is_symlink():
+                raise OSError
+            self._identity = opened.st_dev, opened.st_ino
+        except (OSError, ValueError):
+            descriptor = getattr(self, "_directory_fd", None)
+            if descriptor is not None:
+                os.close(descriptor)
+            raise ValueError("invalid_embedding_cache") from None
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_directory_fd", -1)
+        if descriptor >= 0:
+            os.close(descriptor)
+            self._directory_fd = -1
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _validate_location(self) -> None:
+        try:
+            if self._use_dirfd and self._directory_fd < 0:
+                raise OSError
+            current = Path(self._root.anchor)
+            for part in self._root.parts[1:]:
+                current /= part
+                if current.is_symlink():
+                    raise OSError
+            live = os.stat(self._root, follow_symlinks=False)
+            opened = os.fstat(self._directory_fd) if self._use_dirfd else live
+            if (
+                not stat.S_ISDIR(live.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or (live.st_dev, live.st_ino) != self._identity
+                or (opened.st_dev, opened.st_ino) != self._identity
+            ):
+                raise OSError
+        except OSError:
+            raise ValueError("invalid_embedding_cache") from None
 
     def path_for(self, key: str) -> Path:
         if len(key) != 64 or any(character not in "0123456789abcdef" for character in key):
@@ -198,26 +269,95 @@ class EmbeddingCache:
             separators=(",", ":"),
             allow_nan=False,
         ).encode()
-        path = self.path_for(key)
+        final_name = self.path_for(key).name
+        if not self._use_dirfd:
+            self._store_portable(final_name, envelope)
+            return
+        temporary_name = f".embedding-{secrets.token_hex(16)}"
+        descriptor = -1
         try:
-            self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            descriptor, temporary_name = tempfile.mkstemp(prefix=".embedding-", dir=self._root)
-            temporary = Path(temporary_name)
+            self._validate_location()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(temporary_name, flags, 0o600, dir_fd=self._directory_fd)
             try:
                 os.fchmod(descriptor, 0o600)
                 with os.fdopen(descriptor, "wb") as output:
+                    descriptor = -1
                     output.write(envelope)
                     output.flush()
                     os.fsync(output.fileno())
-                os.replace(temporary, path)
-            finally:
-                temporary.unlink(missing_ok=True)
+                self._validate_location()
+                os.replace(
+                    temporary_name,
+                    final_name,
+                    src_dir_fd=self._directory_fd,
+                    dst_dir_fd=self._directory_fd,
+                )
+                os.fsync(self._directory_fd)
+            except Exception:
+                try:
+                    os.unlink(temporary_name, dir_fd=self._directory_fd)
+                except OSError:
+                    pass
+                raise
         except (OSError, TypeError, ValueError):
             raise ValueError("invalid_embedding_cache") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def _store_portable(self, final_name: str, envelope: bytes) -> None:
+        temporary: Path | None = None
+        descriptor = -1
+        try:
+            self._validate_location()
+            descriptor, temporary_name = tempfile.mkstemp(prefix=".embedding-", dir=self._root)
+            temporary = Path(temporary_name)
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb") as output:
+                descriptor = -1
+                output.write(envelope)
+                output.flush()
+                os.fsync(output.fileno())
+            self._validate_location()
+            os.replace(temporary, self._root / final_name)
+            temporary = None
+            self._validate_location()
+        except (OSError, TypeError, ValueError):
+            raise ValueError("invalid_embedding_cache") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def load(self, key: str) -> tuple[float, ...]:
+        descriptor = -1
         try:
-            payload = json.loads(read_trusted_regular_file(self.path_for(key)))
+            self._validate_location()
+            name = self.path_for(key).name
+            if self._use_dirfd:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=self._directory_fd,
+                )
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 64 * 1024 * 1024:
+                    raise ValueError
+                chunks: list[bytes] = []
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+            else:
+                raw = read_trusted_regular_file(self._root / name)
+                if len(raw) > 64 * 1024 * 1024:
+                    raise ValueError
+            self._validate_location()
+            payload = json.loads(
+                raw, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError())
+            )
             if not isinstance(payload, dict) or set(payload) != {"sha256", "values"}:
                 raise ValueError
             values = payload["values"]
@@ -234,6 +374,9 @@ class EmbeddingCache:
             return vector
         except Exception:
             raise ValueError("invalid_embedding_cache") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
 
 class CheckpointPayload(BaseModel):
@@ -247,6 +390,7 @@ class CheckpointPayload(BaseModel):
     metrics: dict[str, float]
     validation_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     encoder_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    encoder_revision: str | None = None
     freeze_encoder: bool | None = None
     embedding_size: int | None = Field(default=None, gt=0)
 
@@ -257,12 +401,14 @@ class CheckpointPayload(BaseModel):
         if self.architecture == "emotion2vec-plus":
             if (
                 self.encoder_hash is None
+                or self.encoder_revision != EMOTION2VEC_REVISION
                 or self.freeze_encoder is not True
                 or self.embedding_size is None
             ):
                 raise ValueError("emotion2vec metadata is incomplete")
         elif (
             self.encoder_hash is not None
+            or self.encoder_revision is not None
             or self.freeze_encoder is not None
             or self.embedding_size is not None
         ):
@@ -313,6 +459,7 @@ def publish_checkpoint(
                 {
                     "embedding_size": payload.embedding_size,
                     "encoder_hash": payload.encoder_hash,
+                    "encoder_revision": payload.encoder_revision,
                     "freeze_encoder": payload.freeze_encoder,
                 }
             )
@@ -566,11 +713,19 @@ def _train_wav2vec(
         predictions: list[int] = []
         expected: list[int] = []
         with torch.inference_mode():
-            for item in validation_items:
-                window_inputs = inputs_for(evaluation_windows(load_audio(item.audio_path)))
-                logits = model(**window_inputs).logits.mean(dim=0)
-                predictions.append(int(logits.argmax().item()))
-                expected.append(CANONICAL_LABELS.index(item.label))
+            for item_batch in evaluation_example_batches(validation_items, profile.eval_batch_size):
+                windows_by_item = [
+                    evaluation_windows(load_audio(item.audio_path)) for item in item_batch
+                ]
+                flat_windows = tuple(window for windows in windows_by_item for window in windows)
+                raw_logits = model(**inputs_for(flat_windows)).logits
+                offset = 0
+                for item, windows in zip(item_batch, windows_by_item, strict=True):
+                    stop = offset + len(windows)
+                    logits = raw_logits[offset:stop].mean(dim=0)
+                    predictions.append(int(logits.argmax().item()))
+                    expected.append(CANONICAL_LABELS.index(item.label))
+                    offset = stop
         score = float(
             metrics_module.f1_score(
                 expected,
@@ -652,13 +807,19 @@ def _train_emotion2vec(
 
     train_items, validation_items = _training_splits(examples)
     device = _training_device(torch)
-    encoder = funasr.AutoModel(model=profile.encoder_id, disable_update=True, device=device)
+    encoder = funasr.AutoModel(
+        model=profile.encoder_id,
+        model_revision=profile.encoder_revision,
+        disable_update=True,
+        device=device,
+    )
+    immutable_encoder_hash = encoder_state_hash(encoder, torch)
     cache = EmbeddingCache(Path(tempfile.gettempdir()) / "voxdelta-emotion2vec-cache-v1")
 
     def encode(item: TrainingExample, clip: AudioClip, cache_variant: str) -> tuple[float, ...]:
         key = embedding_cache_key(
             item.audio_sha256,
-            profile.encoder_id,
+            f"{profile.encoder_id}@{profile.encoder_revision}#{immutable_encoder_hash}",
             f"{PREPROCESS_VERSION}:{cache_variant}",
         )
         try:
@@ -787,7 +948,8 @@ def _train_emotion2vec(
         weights=weights,
         metrics={"macro_f1": best_score},
         validation_hash=validation_set_hash(validation_items),
-        encoder_hash=_encoder_state_hash(encoder, torch),
+        encoder_hash=immutable_encoder_hash,
+        encoder_revision=profile.encoder_revision,
         freeze_encoder=True,
         embedding_size=embedding_size,
     )
@@ -827,7 +989,7 @@ def _training_device(torch: Any) -> str:
     return "cpu"
 
 
-def _encoder_state_hash(encoder: Any, torch: Any) -> str:
+def encoder_state_hash(encoder: Any, torch: Any) -> str:
     try:
         model = getattr(encoder, "model", encoder)
         state = model.state_dict()
