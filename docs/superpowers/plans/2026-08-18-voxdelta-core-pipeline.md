@@ -43,7 +43,7 @@
 - Produces: `Settings`, `Role`, `StageName`, `StageStatus`, `ProviderProvenance`, `ProviderUsage`, `AudioAsset`, `SpeakerSegment`, `Utterance`, `EmotionResult`, `ResponseStrategyResult`, `EmotionTransition`, `CallSummary`, and `AnalysisReport`.
 - Consumes: no earlier application code.
 
-- [ ] **Step 1: Create the backend package and dependency manifest**
+- [x] **Step 1: Create the backend package and dependency manifest**
 
 Create `backend/pyproject.toml`:
 
@@ -116,7 +116,7 @@ data/*
 Run: `cd backend && uv sync --dev`
 Expected: lockfile created and dependencies installed without resolution errors.
 
-- [ ] **Step 2: Write failing contract tests**
+- [x] **Step 2: Write failing contract tests**
 
 Create `backend/tests/domain/test_models.py`:
 
@@ -163,12 +163,12 @@ def test_emotion_probabilities_must_be_bounded() -> None:
         )
 ```
 
-- [ ] **Step 3: Run the tests to verify failure**
+- [x] **Step 3: Run the tests to verify failure**
 
 Run: `cd backend && uv run pytest tests/domain/test_models.py -v`
 Expected: FAIL during import because `voxdelta.domain.models` does not exist.
 
-- [ ] **Step 4: Implement settings and complete domain models**
+- [x] **Step 4: Implement settings and complete domain models**
 
 Create `backend/src/voxdelta/config.py`:
 
@@ -333,12 +333,12 @@ class AnalysisReport(BaseModel):
 
 Create every empty package `__init__.py` listed in this task so later task imports work without implicit namespace assumptions.
 
-- [ ] **Step 5: Run contract, lint, and type checks**
+- [x] **Step 5: Run contract, lint, and type checks**
 
 Run: `cd backend && uv run pytest tests/domain/test_models.py -v && uv run ruff check . && uv run mypy src`
 Expected: 3 tests pass; Ruff and mypy exit 0.
 
-- [ ] **Step 6: Commit the foundation**
+- [x] **Step 6: Commit the foundation**
 
 ```bash
 git add .gitignore backend
@@ -357,7 +357,7 @@ git commit -m "feat: define backend domain contracts"
 - Consumes: `StageName`, `StageStatus`.
 - Produces: `ArtifactStore.write_model(job_id, stage, value) -> Path`, `ArtifactStore.read_model(job_id, stage, model_type)`, `ArtifactStore.delete_job(job_id)`, `JobRepository.create_job(source_name, diagnostic_capture=False) -> str`, `JobRepository.set_stage(...)`, `JobRepository.get_job(job_id)`, and `JobRepository.delete_job(job_id)`.
 
-- [ ] **Step 1: Write failing persistence tests**
+- [x] **Step 1: Write failing persistence tests**
 
 Create tests that assert atomic JSON round-tripping and persistent stage state:
 
@@ -389,12 +389,12 @@ def test_job_stage_survives_repository_reopen(tmp_path: Path) -> None:
     assert reopened.get_job(job_id)["stages"]["normalize"]["status"] == "completed"
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `cd backend && uv run pytest tests/jobs -v`
 Expected: FAIL because `voxdelta.jobs` modules do not exist.
 
-- [ ] **Step 3: Implement atomic artifacts**
+- [x] **Step 3: Implement atomic artifacts**
 
 Create `backend/src/voxdelta/jobs/artifacts.py`:
 
@@ -430,7 +430,7 @@ class ArtifactStore:
         return model_type.model_validate_json(path.read_bytes())
 ```
 
-- [ ] **Step 4: Implement the SQLite repository**
+- [x] **Step 4: Implement the SQLite repository**
 
 Create `backend/src/voxdelta/jobs/repository.py` with schema initialization and parameterized queries:
 
@@ -492,12 +492,12 @@ class JobRepository:
 
 Add `delete_job` methods that reject IDs containing path separators, delete database rows in a transaction, and remove only the resolved `<jobs_root>/<job_id>` directory after verifying its parent is exactly the configured jobs root. Tests must prove deleting `j1` cannot delete sibling `j10` or the jobs root.
 
-- [ ] **Step 5: Run persistence tests**
+- [x] **Step 5: Run persistence tests**
 
 Run: `cd backend && uv run pytest tests/jobs -v && uv run ruff check . && uv run mypy src`
 Expected: all persistence tests pass; static checks exit 0.
 
-- [ ] **Step 6: Commit persistence**
+- [x] **Step 6: Commit persistence**
 
 ```bash
 git add backend/src/voxdelta/jobs backend/tests/jobs
@@ -516,7 +516,7 @@ git commit -m "feat: persist jobs and stage artifacts"
 - Produces: `AudioService.ingest(upload_path: Path, job_id: str, channel_preference: Literal["auto", "mixed", "separate"] = "auto") -> AudioAsset`.
 - Consumes: `Settings`, `ArtifactStore.job_dir`.
 
-- [ ] **Step 1: Generate a deterministic licensed-free fixture**
+- [x] **Step 1: Generate a deterministic licensed-free fixture**
 
 Run:
 
@@ -528,7 +528,7 @@ ffmpeg -f lavfi -i "sine=frequency=440:duration=32.5" -f lavfi -i "anullsrc=r=16
 
 Expected: a 16 kHz mono WAV lasting 65 seconds.
 
-- [ ] **Step 2: Write failing validation tests**
+- [x] **Step 2: Write failing validation tests**
 
 ```python
 from pathlib import Path
@@ -559,12 +559,12 @@ def test_ingest_rejects_unsupported_suffix(tmp_path: Path) -> None:
         AudioService(tmp_path / "jobs", 60, 3600).ingest(source, "j1")
 ```
 
-- [ ] **Step 3: Run the tests to verify failure**
+- [x] **Step 3: Run the tests to verify failure**
 
 Run: `cd backend && uv run pytest tests/audio/test_service.py -v`
 Expected: FAIL because `voxdelta.audio.service` does not exist.
 
-- [ ] **Step 4: Implement ffprobe validation and ffmpeg normalization**
+- [x] **Step 4: Implement ffprobe validation and ffmpeg normalization**
 
 Create `AudioService` that allows `.wav`, `.mp3`, and `.m4a`, probes JSON with `ffprobe -v error -show_streams -show_format -of json`, enforces duration bounds, computes SHA-256, and always produces a 16 kHz mono mix. For stereo input, also extract left/right mono candidates with FFmpeg `channelsplit`. Read the PCM candidates with the standard-library `wave` and `array` modules; `auto` selects `separate` only when each channel RMS exceeds 500 and absolute Pearson correlation is below 0.85, otherwise it selects `mixed`. Explicit `mixed` or `separate` preferences override the heuristic after validating the requested channels exist. The mono mix command is:
 
@@ -577,12 +577,12 @@ subprocess.run([
 
 Return an `AudioAsset` containing the original channel count, selected channel mode, and one or two normalized paths. Raise `AudioRejected` with one of `unsupported extension`, `audio is not decodable`, `audio is shorter than 60 seconds`, `audio exceeds 3600 seconds`, or `separate channels requested for mono audio`; never include ffmpeg stderr in the public exception message.
 
-- [ ] **Step 5: Run audio tests and checks**
+- [x] **Step 5: Run audio tests and checks**
 
 Run: `cd backend && uv run pytest tests/audio -v && uv run ruff check . && uv run mypy src`
 Expected: 3 tests pass and static checks exit 0.
 
-- [ ] **Step 6: Commit audio ingestion**
+- [x] **Step 6: Commit audio ingestion**
 
 ```bash
 git add backend/src/voxdelta/audio backend/tests/audio backend/tests/fixtures
@@ -600,7 +600,7 @@ git commit -m "feat: validate and normalize call audio"
 - Produces: `DiarizationProvider.diarize`, `TranscriptionProvider.transcribe`, `EmotionProvider.analyze`, `ResponseStrategyProvider.classify`, `ReportSummaryProvider.summarize`.
 - Consumes: canonical domain models from Task 1.
 
-- [ ] **Step 1: Write failing provider contract tests**
+- [x] **Step 1: Write failing provider contract tests**
 
 ```python
 from pathlib import Path
@@ -622,12 +622,12 @@ def test_fake_emotion_is_deterministic() -> None:
     assert first.provider.remote is False
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `cd backend && uv run pytest tests/providers/test_fake.py -v`
 Expected: FAIL because provider modules do not exist.
 
-- [ ] **Step 3: Define protocols**
+- [x] **Step 3: Define protocols**
 
 Use `typing.Protocol` and exact signatures:
 
@@ -653,16 +653,16 @@ class ReportSummaryProvider(Protocol):
     def summarize(self, report: AnalysisReport) -> str: ...
 ```
 
-- [ ] **Step 4: Implement fake providers**
+- [x] **Step 4: Implement fake providers**
 
 Implement fixed alternating segments and transcript lines. Hash `utterance_id + transcript` with SHA-256, convert the first eight bytes to a deterministic seed, generate seven positive values, normalize to one, derive `negative_intensity`, and select the operational state. Fake response strategy uses transcript keywords for apology, solution, and policy refusal and otherwise returns `information`.
 
-- [ ] **Step 5: Run provider tests**
+- [x] **Step 5: Run provider tests**
 
 Run: `cd backend && uv run pytest tests/providers -v && uv run ruff check . && uv run mypy src`
 Expected: all provider tests pass and static checks exit 0.
 
-- [ ] **Step 6: Commit provider contracts**
+- [x] **Step 6: Commit provider contracts**
 
 ```bash
 git add backend/src/voxdelta/providers backend/tests/providers
@@ -685,7 +685,7 @@ git commit -m "feat: define model provider boundaries"
 - Produces: `map_operational_state(probabilities, confidence)`, `median_smooth(results)`, `suggest_roles(utterances) -> dict[str, Role] | None`, `build_transitions(utterances, emotions) -> list[EmotionTransition]`, and `build_call_summary(customer_utterances, emotions, transitions) -> CallSummary`.
 - Consumes: `Utterance`, `EmotionResult`, `EmotionTransition`, and confirmed `Role` values.
 
-- [ ] **Step 1: Write failing state-mapping and threshold tests**
+- [x] **Step 1: Write failing state-mapping and threshold tests**
 
 ```python
 def test_dominant_surprise_becomes_uncertain() -> None:
@@ -699,16 +699,16 @@ def test_transition_thresholds_are_inclusive() -> None:
     assert classify_delta(.19) == "stable"
 ```
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `cd backend && uv run pytest tests/analysis -v`
 Expected: FAIL because analysis modules do not exist.
 
-- [ ] **Step 3: Implement deterministic mapping and smoothing**
+- [x] **Step 3: Implement deterministic mapping and smoothing**
 
 Implement `map_operational_state` with confidence threshold `0.55`. Aggregate sadness, disgust, and fear for `dissatisfied`; use happiness, neutral, and anger for the other named states. When surprise is the largest single probability or confidence is below `0.55`, return `uncertain`. Implement a centered median over the current customer result and its nearest previous/next customer results, preserving edge windows of two values.
 
-- [ ] **Step 4: Implement triplet construction**
+- [x] **Step 4: Implement triplet construction**
 
 Walk utterances by time and accept only adjacent `customer -> agent -> customer` triples with emotion results on both customer turns. Calculate the smoothed next-minus-previous intensity, round to four decimals, classify with inclusive ±0.20 thresholds, and return transitions. Skip triples containing `unknown` roles rather than inferring them.
 
@@ -716,12 +716,12 @@ Implement `suggest_roles` by scoring utterances in the first 30 seconds. Add one
 
 Implement `build_call_summary` from chronologically ordered valid customer results. Use the first and last operational state, the maximum smoothed intensity as the peak, last-minus-first intensity as overall delta, valid emotion count divided by customer utterance count as coverage, and transition-class counts. Raise `InsufficientEmotionCoverage` when fewer than three valid results or coverage is below 0.50.
 
-- [ ] **Step 5: Run analysis tests and checks**
+- [x] **Step 5: Run analysis tests and checks**
 
 Run: `cd backend && uv run pytest tests/analysis -v && uv run ruff check . && uv run mypy src`
 Expected: state mapping, smoothing, triplet, and boundary tests pass.
 
-- [ ] **Step 6: Commit analysis logic**
+- [x] **Step 6: Commit analysis logic**
 
 ```bash
 git add backend/src/voxdelta/analysis backend/tests/analysis
@@ -740,35 +740,35 @@ git commit -m "feat: calculate customer emotion transitions"
 - Produces: `PipelineRunner.run_until_pause(job_id)`, `PipelineRunner.confirm_roles(job_id, mapping)`, and `PipelineRunner.retry(job_id, stage)`.
 - Consumes: artifact store, repository, audio service, providers, and analysis functions.
 
-- [ ] **Step 1: Write failing pause, resume, and invalidation tests**
+- [x] **Step 1: Write failing pause, resume, and invalidation tests**
 
 Create a test that seeds a normalized fixture, runs the fake pipeline, asserts `confirm_roles` is `paused`, confirms `{"SPEAKER_00": "customer", "SPEAKER_01": "agent"}`, resumes to a completed report, then retries `transcribe` and asserts downstream emotion/report artifacts are removed while normalize/diarize remain.
 
-- [ ] **Step 2: Run the pipeline test to verify failure**
+- [x] **Step 2: Run the pipeline test to verify failure**
 
 Run: `cd backend && uv run pytest tests/pipeline/test_runner.py -v`
 Expected: FAIL because `PipelineRunner` does not exist.
 
-- [ ] **Step 3: Define ordered stages and dependencies**
+- [x] **Step 3: Define ordered stages and dependencies**
 
 In `stages.py`, define the exact order from `NORMALIZE` through `REPORT` and a downstream map. `CONFIRM_ROLES` is a pause stage. Cache keys are SHA-256 of stage name, upstream artifact checksums, provider name/model, and a canonical JSON configuration object.
 
-- [ ] **Step 4: Implement the runner**
+- [x] **Step 4: Implement the runner**
 
 For every stage: mark running, calculate or load its cache key, call the stage handler, atomically write the artifact, and mark completed. On a known validation error mark failed with `{code, message}`. On an unexpected exception record only the exception class plus a generic message and re-raise for local logs. At the role stage, persist candidate utterances and mark paused until exactly one customer and one agent mapping is supplied.
 
 Write one JSON log line per stage event with job ID, stage, event, duration, provider/model, and public error code. Recursively replace values of keys matching `key`, `token`, `authorization`, `transcript`, and `payload` with `[REDACTED]`. When and only when `diagnostic_capture` is true, write provider request/response diagnostics to `<job>/diagnostics/` with mode `0600`; never write credentials even in diagnostic mode.
 
-- [ ] **Step 5: Implement retry invalidation**
+- [x] **Step 5: Implement retry invalidation**
 
 Delete only artifact files and database references for the selected stage and every downstream stage. Reset those stage rows to pending. Never delete the source upload when retrying. A retry of `normalize` may overwrite the normalized copy but not the original uploaded file.
 
-- [ ] **Step 6: Run pipeline tests and all backend tests**
+- [x] **Step 6: Run pipeline tests and all backend tests**
 
 Run: `cd backend && uv run pytest -v && uv run ruff check . && uv run mypy src`
 Expected: all tests pass; Ruff and mypy exit 0.
 
-- [ ] **Step 7: Commit the pipeline**
+- [x] **Step 7: Commit the pipeline**
 
 ```bash
 git add backend/src/voxdelta/pipeline backend/tests/pipeline
@@ -787,16 +787,16 @@ git commit -m "feat: add resumable analysis pipeline"
 - Produces: `GET /api/config/providers`, `POST /api/jobs`, `GET /api/jobs/{job_id}`, `GET /api/jobs/{job_id}/audio`, `DELETE /api/jobs/{job_id}`, `POST /api/jobs/{job_id}/roles`, `POST /api/jobs/{job_id}/retry`, and `GET /api/jobs/{job_id}/report`.
 - Consumes: `PipelineRunner`, `JobRepository`, `ArtifactStore`, and canonical report models.
 
-- [ ] **Step 1: Write failing API tests**
+- [x] **Step 1: Write failing API tests**
 
 Use `httpx.AsyncClient` with ASGI transport. Test provider config lists each stage's provenance, transmitted content, and retention-policy URL; multipart upload returns HTTP 202 and a job ID; the `diagnostic_capture=false` form value persists; job status eventually pauses at role confirmation; an invalid role mapping returns 422; the valid mapping resumes the fake pipeline; report returns canonical JSON; deletion removes database/artifacts and returns 204; and a missing job returns 404 without a stack trace. Also test that the audio route returns normalized audio, honors `Range: bytes=0-1023` with HTTP 206 and `Content-Range`, returns 416 for an unsatisfiable range, and never exposes an absolute filesystem path in headers or JSON.
 
-- [ ] **Step 2: Run tests to verify failure**
+- [x] **Step 2: Run tests to verify failure**
 
 Run: `cd backend && uv run pytest tests/api/test_jobs.py -v`
 Expected: FAIL because the API app does not exist.
 
-- [ ] **Step 3: Define request and response schemas**
+- [x] **Step 3: Define request and response schemas**
 
 ```python
 class RoleConfirmation(BaseModel):
@@ -813,7 +813,7 @@ class RetryRequest(BaseModel):
     stage: StageName
 ```
 
-- [ ] **Step 4: Implement routes and local background execution**
+- [x] **Step 4: Implement routes and local background execution**
 
 Save uploads with a generated job ID before scheduling `PipelineRunner.run_until_pause` through FastAPI `BackgroundTasks`. Return 202 with `{job_id, status_url}`. Keep handlers thin: translate `KeyError` to 404, `AudioRejected` to 422, and role/pipeline state conflicts to 409. Return report JSON from the artifact store only when report stage is completed.
 
@@ -821,7 +821,7 @@ Implement `GET /api/jobs/{job_id}/audio` as a `StreamingResponse` over the job's
 
 Before report completion require at least three valid customer emotion results and at least 50% valid coverage across customer turns. Otherwise fail the report stage with public code `insufficient_emotion_coverage`. `DELETE` calls the repository and artifact-store guarded deletion methods and returns 204.
 
-- [ ] **Step 5: Run the full backend verification**
+- [x] **Step 5: Run the full backend verification**
 
 Run:
 
@@ -836,7 +836,7 @@ uv run uvicorn voxdelta.api.app:app --host 127.0.0.1 --port 8765
 
 Expected: tests/static checks pass; Uvicorn starts at `http://127.0.0.1:8765`; `GET /docs` returns 200. Stop the server with Ctrl-C after the smoke check.
 
-- [ ] **Step 6: Commit the vertical slice**
+- [x] **Step 6: Commit the vertical slice**
 
 ```bash
 git add backend/src/voxdelta/api backend/tests/api backend/uv.lock
@@ -854,20 +854,20 @@ git commit -m "feat: expose local analysis job API"
 - Produces: reproducible setup and smoke-test instructions for the dashboard plan.
 - Consumes: all core-plan commands and endpoints.
 
-- [ ] **Step 1: Write the backend README**
+- [x] **Step 1: Write the backend README**
 
 Document Python 3.12 installation with `uv python install 3.12`, `uv sync --dev`, FFmpeg check, environment variables, `uv run uvicorn`, test commands, every core endpoint, runtime file locations, and the fake-provider limitation. State that no real audio leaves the machine in the core vertical slice.
 
-- [ ] **Step 2: Run an end-to-end smoke test**
+- [x] **Step 2: Run an end-to-end smoke test**
 
 Start the API, upload `backend/tests/fixtures/synthetic_65s.wav`, poll status, confirm roles, fetch the audio with a byte-range request, fetch the report, and assert with `jq` that `.transitions` exists and `.utterances | length > 0`.
 
-- [ ] **Step 3: Run final checks**
+- [x] **Step 3: Run final checks**
 
 Run: `cd backend && uv run pytest -q && uv run ruff check . && uv run ruff format --check . && uv run mypy src && cd .. && git diff --check && git status --short`
 Expected: all checks pass; Git shows only README, `.gitkeep`, and plan checkbox changes.
 
-- [ ] **Step 4: Mark completed plan checkboxes and commit**
+- [x] **Step 4: Mark completed plan checkboxes and commit**
 
 ```bash
 git add backend/README.md data/.gitkeep docs/superpowers/plans/2026-08-18-voxdelta-core-pipeline.md
