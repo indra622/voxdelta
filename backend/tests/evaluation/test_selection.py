@@ -153,6 +153,67 @@ def test_nested_candidate_serialization_fails_closed_after_model_construct() -> 
     assert sentinel not in envelope.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    "unsafe_reason",
+    [
+        {"path": "/private/audio.wav", "token": "secret"},
+        ["transcript-secret", "provider-payload"],
+    ],
+)
+@pytest.mark.parametrize("bypass", ["copy", "construct"])
+def test_unhashable_reason_bypasses_fail_closed_everywhere(
+    unsafe_reason: object,
+    bypass: str,
+) -> None:
+    class Envelope(BaseModel):
+        candidate: CandidateMetrics
+
+    if bypass == "copy":
+        candidate = _candidate("qwen", "qwen3-asr", cer=0.1).model_copy(
+            update={"unavailable_reason": unsafe_reason}
+        )
+    else:
+        candidate = CandidateMetrics.model_construct(
+            candidate_id="qwen",
+            task="asr",
+            provider="qwen3-asr",
+            model="Qwen3-ASR-1.7B",
+            completion_rate=0.0,
+            median_latency_ms=100.0,
+            peak_rss_mb=1000.0,
+            cer=0.1,
+            unavailable_reason=unsafe_reason,
+        )
+
+    assert candidate.model_dump()["unavailable_reason"] == "provider_unavailable"
+    assert Envelope(candidate=candidate).model_dump()["candidate"]["unavailable_reason"] == (
+        "provider_unavailable"
+    )
+    decision = select_asr_candidate([candidate])
+    assert decision.reasons == {"qwen": "provider_unavailable"}
+    serialized = candidate.model_dump_json() + Envelope(candidate=candidate).model_dump_json()
+    serialized += decision.model_dump_json()
+    for fragment in ("private", "transcript", "secret", "token", "payload"):
+        assert fragment not in serialized.lower()
+
+
+@pytest.mark.parametrize("unsafe_reason", [{"secret": "token"}, ["payload"]])
+def test_normal_validation_remains_strict_for_non_string_reasons(
+    unsafe_reason: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        CandidateMetrics.model_validate(
+            {
+                "candidate_id": "qwen",
+                "task": "asr",
+                "provider": "qwen3-asr",
+                "model": "Qwen3-ASR-1.7B",
+                "completion_rate": 0.0,
+                "unavailable_reason": unsafe_reason,
+            }
+        )
+
+
 def test_multiple_candidates_per_provider_select_best_and_reject_every_other() -> None:
     decision = select_asr_candidate(
         [

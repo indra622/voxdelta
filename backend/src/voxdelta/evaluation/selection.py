@@ -32,8 +32,10 @@ _SAFE_UNAVAILABLE_REASONS = frozenset(
 )
 
 
-def _safe_unavailable_reason(value: str | None) -> str | None:
-    if value is None or value in _SAFE_UNAVAILABLE_REASONS:
+def _safe_unavailable_reason(value: object) -> str | None:
+    if value is None:
+        return value
+    if isinstance(value, str) and value in _SAFE_UNAVAILABLE_REASONS:
         return value
     return "provider_unavailable"
 
@@ -60,7 +62,7 @@ class CandidateMetrics(BaseModel):
         return _safe_unavailable_reason(value)
 
     @field_serializer("unavailable_reason")
-    def serialize_unavailable_reason(self, value: str | None) -> str | None:
+    def serialize_unavailable_reason(self, value: object) -> str | None:
         return _safe_unavailable_reason(value)
 
     @model_validator(mode="after")
