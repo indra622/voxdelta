@@ -37,6 +37,7 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
 _LINKED_JOB_DIRECTORY_ERROR = (
     "job directory beneath jobs root must not be a symlink or reparse point"
 )
+_OPERATION_LOCK_VALIDATION_ERROR = "job operation lock could not be validated safely"
 _OPERATION_LOCKS: dict[Path, threading.Lock] = {}
 _OPERATION_LOCKS_GUARD = threading.Lock()
 
@@ -44,9 +45,9 @@ _OPERATION_LOCKS_GUARD = threading.Lock()
 def _operation_process_lock(path: Path) -> threading.Lock:
     """Return the process-wide fallback used when cross-process flock is unavailable."""
 
-    resolved = path.resolve()
+    lexical = path if path.is_absolute() else path.absolute()
     with _OPERATION_LOCKS_GUARD:
-        return _OPERATION_LOCKS.setdefault(resolved, threading.Lock())
+        return _OPERATION_LOCKS.setdefault(lexical, threading.Lock())
 
 
 def _is_link_like(path: Path) -> bool:
@@ -178,23 +179,27 @@ class ArtifactStore:
         flags |= getattr(os, "O_NOFOLLOW", 0)
         with _operation_process_lock(target):
             if _is_link_like(target):
-                raise ValueError("job operation lock must not be a link")
+                raise ValueError(_OPERATION_LOCK_VALIDATION_ERROR)
             try:
                 descriptor = os.open(target, flags, 0o600)
             except OSError:
                 if _is_link_like(target):
-                    raise ValueError("job operation lock must not be a link") from None
+                    raise ValueError(_OPERATION_LOCK_VALIDATION_ERROR) from None
                 raise
             try:
                 opened = os.fstat(descriptor)
                 current = target.lstat()
+                try:
+                    target_is_local = target.resolve().parent == directory
+                except (OSError, RuntimeError):
+                    raise ValueError(_OPERATION_LOCK_VALIDATION_ERROR) from None
                 if (
                     _is_link_like(target)
-                    or target.resolve().parent != directory
+                    or not target_is_local
                     or not stat.S_ISREG(opened.st_mode)
                     or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
                 ):
-                    raise ValueError("job operation lock must be a regular file")
+                    raise ValueError(_OPERATION_LOCK_VALIDATION_ERROR)
                 os.fchmod(descriptor, 0o600)
                 if fcntl is not None:
                     fcntl.flock(descriptor, fcntl.LOCK_EX)

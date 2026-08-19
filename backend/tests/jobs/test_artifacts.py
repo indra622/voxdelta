@@ -101,6 +101,29 @@ def test_job_operation_lock_rejects_a_linked_lock_file(tmp_path: Path) -> None:
     assert outside.read_text(encoding="utf-8") == "outside"
 
 
+@pytest.mark.parametrize("cycle", ["self", "two-link"])
+def test_job_operation_lock_rejects_cyclic_links_without_disclosing_paths(
+    cycle: str,
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "jobs")
+    job_directory = store.job_dir("j1")
+    lock_path = job_directory / ".operation.lock"
+    if cycle == "self":
+        lock_path.symlink_to(lock_path.name)
+    else:
+        second = job_directory / ".operation-lock-cycle"
+        lock_path.symlink_to(second.name)
+        second.symlink_to(lock_path.name)
+
+    with pytest.raises(ValueError) as raised:
+        with store.operation_lock("j1"):
+            pytest.fail("cyclic operation lock was accepted")
+
+    assert str(raised.value) == "job operation lock could not be validated safely"
+    assert str(tmp_path) not in str(raised.value)
+
+
 def test_artifact_write_replaces_from_a_temporary_in_the_target_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
