@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
+from collections.abc import Sequence
+from typing import cast
 
-from voxdelta.credentials import UnsafeEnvFilePermissions, check_credentials
+from voxdelta.credentials import CredentialProfile, UnsafeEnvFilePermissions, check_credentials
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--profile",
+        choices=("local", "comparison"),
+        default="local",
+        help="credential requirements to check (default: local)",
+    )
+    profile = cast(CredentialProfile, parser.parse_args(argv).profile)
+
     try:
-        check = check_credentials()
+        check = check_credentials(profile=profile)
     except UnsafeEnvFilePermissions as error:
         print(str(error), file=sys.stderr)
         return 2

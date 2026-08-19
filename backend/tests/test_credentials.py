@@ -46,7 +46,44 @@ def test_empty_and_missing_values_are_not_configured(
     assert check.exit_code == 1
 
 
-def test_required_credentials_are_ready_without_optional_key(
+def test_local_profile_is_ready_with_only_huggingface_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_process_credentials(monkeypatch)
+    env_file = tmp_path / ".env"
+    write_env(
+        env_file,
+        "HUGGINGFACE_TOKEN=hf-file-secret\n",
+    )
+
+    check = credentials_module().check_credentials(env_file)
+
+    assert check.statuses == {
+        "HUGGINGFACE_TOKEN": "configured",
+        "GEMINI_API_KEY": "missing",
+        "PYANNOTEAI_API_KEY": "missing",
+    }
+    assert check.exit_code == 0
+
+
+def test_comparison_profile_requires_gemini_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_process_credentials(monkeypatch)
+    env_file = tmp_path / ".env"
+    write_env(env_file, "HUGGINGFACE_TOKEN=hf-file-secret\n")
+
+    check = credentials_module().check_credentials(env_file, profile="comparison")
+
+    assert check.statuses == {
+        "HUGGINGFACE_TOKEN": "configured",
+        "GEMINI_API_KEY": "missing",
+        "PYANNOTEAI_API_KEY": "missing",
+    }
+    assert check.exit_code == 1
+
+
+def test_comparison_profile_is_ready_without_optional_pyannote_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clear_process_credentials(monkeypatch)
@@ -56,13 +93,8 @@ def test_required_credentials_are_ready_without_optional_key(
         "HUGGINGFACE_TOKEN=hf-file-secret\nGEMINI_API_KEY=gemini-file-secret\n",
     )
 
-    check = credentials_module().check_credentials(env_file)
+    check = credentials_module().check_credentials(env_file, profile="comparison")
 
-    assert check.statuses == {
-        "HUGGINGFACE_TOKEN": "configured",
-        "GEMINI_API_KEY": "configured",
-        "PYANNOTEAI_API_KEY": "missing",
-    }
     assert check.exit_code == 0
 
 

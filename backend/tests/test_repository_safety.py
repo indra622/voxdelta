@@ -28,3 +28,8 @@ def test_env_example_contains_exactly_the_supported_empty_placeholders() -> None
         "GEMINI_API_KEY=",
         "PYANNOTEAI_API_KEY=",
     ]
+
+
+def test_generated_reports_are_ignored_without_hiding_source_package() -> None:
+    assert check_ignore(REPOSITORY / "reports" / "call.pdf").returncode == 0
+    assert check_ignore(BACKEND / "src" / "voxdelta" / "reports" / "__init__.py").returncode == 1

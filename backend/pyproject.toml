@@ -1,17 +1,23 @@
 [project]
 name = "voxdelta"
 version = "0.1.0"
-description = "Secure local credential bootstrap for VoxDelta"
+description = "Local-first call analysis backend for VoxDelta"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "fastapi>=0.116,<1",
+    "httpx>=0.28,<1",
+    "orjson>=3.10,<4",
     "pydantic>=2.12,<3",
     "pydantic-settings>=2.12,<3",
+    "python-multipart>=0.0.20,<1",
+    "uvicorn[standard]>=0.35,<1",
 ]
 
 [dependency-groups]
 dev = [
     "mypy>=1.18,<2",
     "pytest>=9,<10",
+    "pytest-asyncio>=1.1,<2",
     "ruff>=0.14,<1",
 ]
 

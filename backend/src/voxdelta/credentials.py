@@ -14,6 +14,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
 
 CredentialStatus = Literal["configured", "missing"]
+CredentialProfile = Literal["local", "comparison"]
 
 
 class Credentials(BaseSettings):
@@ -51,6 +52,7 @@ class CredentialCheck:
     """Safe readiness result for the configured credentials."""
 
     credentials: Credentials
+    profile: CredentialProfile = "local"
 
     @property
     def statuses(self) -> dict[str, CredentialStatus]:
@@ -62,11 +64,10 @@ class CredentialCheck:
 
     @property
     def exit_code(self) -> Literal[0, 1]:
-        required = (
-            self.credentials.huggingface_token,
-            self.credentials.gemini_api_key,
-        )
-        return 0 if all(value is not None for value in required) else 1
+        ready = self.credentials.huggingface_token is not None
+        if self.profile == "comparison":
+            ready = ready and self.credentials.gemini_api_key is not None
+        return 0 if ready else 1
 
 
 def _status(value: SecretStr | None) -> CredentialStatus:
@@ -90,7 +91,9 @@ def load_credentials(env_file: Path | None = None) -> Credentials:
     return Credentials(_env_file=selected_env_file, _env_file_encoding="utf-8")
 
 
-def check_credentials(env_file: Path | None = None) -> CredentialCheck:
+def check_credentials(
+    env_file: Path | None = None, *, profile: CredentialProfile = "local"
+) -> CredentialCheck:
     """Validate the env file boundary and return a safe readiness result."""
 
-    return CredentialCheck(credentials=load_credentials(env_file))
+    return CredentialCheck(credentials=load_credentials(env_file), profile=profile)

@@ -1,5 +1,21 @@
 # Local datasets may be large and can contain licensed or sensitive material.
-data/raw/
+data/*
+!data/.gitkeep
+!data/README.md
+
+# Runtime state, call media, provider payloads, and generated reports stay local.
+runtime/
+backend/runtime/
+backend/jobs/
+/reports/
+provider-payloads/
+provider_payloads/
+diagnostics/
+*.sqlite3
+*.wav
+*.mp3
+*.m4a
+*.pdf
 
 # Isolated implementation workspaces.
 .worktrees/
@@ -12,8 +28,14 @@ data/raw/
 !**/.env.example
 
 # Python build and tool artifacts.
+.DS_Store
 __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .venv/
+backend/.coverage
+
+# Frontend dependency and build output.
+frontend/node_modules/
+frontend/dist/
