@@ -12,13 +12,13 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request, UploadFile
+from fastapi import BackgroundTasks, FastAPI, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.requests import ClientDisconnect
 
 import voxdelta.jobs.artifacts as artifacts_module
-from voxdelta.api.app import create_app
+from voxdelta.api.app import create_app, reconcile_local_state
 from voxdelta.audio.service import AudioService
 from voxdelta.domain.models import AudioAsset, StageName, StageStatus
 from voxdelta.jobs.artifacts import ArtifactStore
@@ -62,6 +62,22 @@ class FailingCreateRepository(JobRepository):
     ) -> str:
         del source_name, diagnostic_capture, job_id
         raise RuntimeError("private database create failure")
+
+
+class CommitThenRaiseRepository(JobRepository):
+    def create_job(
+        self,
+        source_name: str,
+        diagnostic_capture: bool = False,
+        *,
+        job_id: str | None = None,
+    ) -> str:
+        created = super().create_job(
+            source_name,
+            diagnostic_capture=diagnostic_capture,
+            job_id=job_id,
+        )
+        raise RuntimeError(f"ambiguous commit for {created}")
 
 
 class FailOnceFinalizeRepository(JobRepository):
@@ -409,6 +425,25 @@ async def test_obviously_oversized_content_length_rejects_without_receiving_body
 
 
 @pytest.mark.asyncio
+async def test_extremely_long_content_length_is_bounded_and_never_received(tmp_path: Path) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path, max_upload_bytes=8)
+
+    sent, received, receive_calls = await raw_chunked_request(
+        app,
+        b"unread body",
+        include_content_length=False,
+        content_length_values=[b"9" * 5000],
+    )
+
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    assert start["status"] == 413
+    assert received == 0
+    assert receive_calls == 0
+    assert job_count(repository) == 0
+    assert not artifacts.root.exists()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "content_length_values",
     [[b"invalid"], [b"-1"], [b"1", b"9999999"]],
@@ -529,6 +564,111 @@ async def test_database_create_failure_after_adopt_discards_unregistered_directo
     assert not (artifacts.root / ".deleted").exists()
     assert not (artifacts.root / ".locks").exists()
     assert "private" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_database_commit_then_raise_is_verified_and_continues(tmp_path: Path) -> None:
+    repository = CommitThenRaiseRepository(tmp_path / "voxdelta.sqlite3")
+    app, _, artifacts, _ = build_harness(tmp_path, repository_override=repository)
+
+    async with client_for(app) as client:
+        response = await upload(client)
+        status = await client.get(response.json()["status_url"])
+
+    assert response.status_code == 202
+    assert status.status_code == 200
+    assert status.json()["status"] == "paused"
+    job_id = response.json()["job_id"]
+    assert repository.get_job(job_id)["source_name"] == str(
+        artifacts.root / job_id / "source-upload.wav"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduling_claim_then_raise_keeps_job_and_terminalizes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path)
+
+    def claim_then_raise(
+        self: BackgroundTasks,
+        function: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        del self, function, kwargs
+        job_id = str(args[-1])
+        assert repository.claim_stage(job_id, StageName.NORMALIZE) is not None
+        raise RuntimeError("scheduler failed after claim")
+
+    monkeypatch.setattr(BackgroundTasks, "add_task", claim_then_raise)
+    async with client_for(app) as client:
+        response = await upload(client)
+        status = await client.get(response.json()["status_url"])
+
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    assert status.status_code == 200
+    assert status.json()["status"] == "failed"
+    assert repository.get_job(job_id)["status"] == "failed"
+    assert (artifacts.root / job_id / "source-upload.wav").is_file()
+
+
+def test_reconciliation_cleans_only_stale_absent_state_and_recovers_pending_job(
+    tmp_path: Path,
+) -> None:
+    _, repository, artifacts, runner = build_harness(tmp_path)
+    incoming_id = "a" * 32
+    orphan_id = "b" * 32
+    pending_id = "c" * 32
+    tombstone_id = "d" * 32
+    lock_id = "e" * 32
+    claimed_id = "f" * 32
+
+    descriptor, stale_incoming = artifacts.open_incoming_upload(incoming_id, ".wav")
+    os.write(descriptor, b"stale")
+    os.close(descriptor)
+    os.utime(stale_incoming, (0, 0))
+
+    descriptor, orphan_incoming = artifacts.open_incoming_upload(orphan_id, ".wav")
+    os.write(descriptor, b"orphan")
+    os.close(descriptor)
+    artifacts.adopt_incoming_upload(orphan_id, orphan_incoming, ".wav")
+    os.utime(artifacts.root / orphan_id, (0, 0))
+
+    descriptor, pending_incoming = artifacts.open_incoming_upload(pending_id, ".wav")
+    os.write(descriptor, FIXTURE.read_bytes())
+    os.fsync(descriptor)
+    os.close(descriptor)
+    pending_source = artifacts.adopt_incoming_upload(pending_id, pending_incoming, ".wav")
+    repository.create_job(str(pending_source), job_id=pending_id)
+
+    claimed_source = artifacts.job_dir(claimed_id) / "source-upload.wav"
+    claimed_source.write_bytes(b"claimed sentinel")
+    repository.create_job(str(claimed_source), job_id=claimed_id)
+    assert repository.claim_stage(claimed_id, StageName.NORMALIZE) is not None
+    os.utime(artifacts.root / claimed_id, (0, 0))
+
+    artifacts.mark_deletion_tombstone(tombstone_id)
+    with artifacts.operation_lock(lock_id):
+        pass
+
+    recovered = reconcile_local_state(
+        repository,
+        artifacts,
+        runner,
+        lease_seconds=10,
+        now=1000,
+    )
+
+    assert recovered == (pending_id,)
+    assert not stale_incoming.exists()
+    assert not (artifacts.root / orphan_id).exists()
+    assert repository.get_job(pending_id)["status"] == "paused"
+    assert claimed_source.read_bytes() == b"claimed sentinel"
+    assert repository.get_job(claimed_id)["status"] == "running"
+    assert (artifacts.root / ".deleted" / f"{tombstone_id}.tombstone").is_file()
+    assert (artifacts.root / ".locks" / f"{lock_id}.lock").is_file()
 
 
 @pytest.mark.asyncio
@@ -1078,6 +1218,38 @@ async def test_retry_delete_race_from_repository_value_error_remains_http_409(
 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "job_deleting"
+
+
+@pytest.mark.asyncio
+async def test_retry_completed_delete_after_locked_recheck_remains_http_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+
+        def completing_delete(
+            selected_job_id: str,
+            stages: tuple[StageName, ...],
+        ) -> None:
+            del stages
+            repository.begin_delete(selected_job_id)
+            artifacts.delete_job(selected_job_id)
+            repository.finalize_delete(selected_job_id)
+            raise KeyError(selected_job_id)
+
+        monkeypatch.setattr(repository, "invalidate_stages", completing_delete)
+        response = await client.post(
+            f"/api/jobs/{job_id}/retry",
+            json={"stage": "diarize"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "job_deleting"
+    with pytest.raises(KeyError):
+        repository.get_job(job_id)
+    assert (artifacts.root / ".deleted" / f"{job_id}.tombstone").is_file()
 
 
 @pytest.mark.asyncio

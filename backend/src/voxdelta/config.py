@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     max_audio_seconds: int = Field(default=3600, gt=0)
     min_audio_seconds: int = Field(default=60, gt=0)
     max_upload_bytes: int = Field(default=1024 * 1024 * 1024, gt=0)
+    admission_reconciliation_lease_seconds: int = Field(default=300, gt=0)
 
     model_config = SettingsConfigDict(env_prefix="VOXDELTA_", extra="ignore")
 

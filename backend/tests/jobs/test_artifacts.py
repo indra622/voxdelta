@@ -369,27 +369,40 @@ def test_incoming_upload_is_private_then_atomically_adopted_into_exact_new_job(
     assert (root / ".incoming").stat().st_mode & 0o777 == 0o700
     assert not (root / ".deleted").exists()
     assert not (root / ".locks").exists()
+    assert root / ".incoming" in synced
     assert adopted.parent in synced
     assert root in synced
 
 
-def test_discard_incoming_and_unregistered_job_leave_no_tombstone_or_lock(tmp_path: Path) -> None:
+def test_discard_incoming_leaves_no_tombstone_lock_or_public_job_discard(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     store = ArtifactStore(root)
     descriptor, incoming = store.open_incoming_upload("j1", ".wav")
     os.close(descriptor)
     store.discard_incoming_upload(incoming)
-    descriptor, incoming = store.open_incoming_upload("j2", ".wav")
-    os.write(descriptor, b"stored")
-    os.close(descriptor)
-    store.adopt_incoming_upload("j2", incoming, ".wav")
-
-    store.discard_unregistered_job("j2")
 
     assert not incoming.exists()
-    assert not (root / "j2").exists()
     assert not (root / ".deleted").exists()
     assert not (root / ".locks").exists()
+    assert not hasattr(store, "discard_unregistered_job")
+
+
+def test_unregistered_job_discard_rejects_direct_call_without_absence_proof(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    job_id = "a" * 32
+    sentinel = store.job_dir(job_id) / "sentinel"
+    sentinel.write_text("preserve", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="absence proof"):
+        store._discard_unregistered_job_under_absence_proof(  # noqa: SLF001
+            job_id,
+            None,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
 
 
 def test_existing_tombstone_fsync_failure_is_retried_before_job_removal(
@@ -517,6 +530,49 @@ def test_delete_job_rejects_linked_tombstone_control_directory(tmp_path: Path) -
         store.delete_job("j1")
 
     assert not list(outside.iterdir())
+
+
+@pytest.mark.parametrize("control_name", [".deleted", ".locks", ".incoming"])
+def test_reserved_control_components_cannot_be_used_as_job_ids_or_deleted(
+    control_name: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "jobs"
+    control = root / control_name
+    control.mkdir(parents=True)
+    sentinel = control / "sentinel"
+    sentinel.write_text("preserve", encoding="utf-8")
+    store = ArtifactStore(root)
+
+    with pytest.raises(ValueError, match="reserved"):
+        store.job_dir(control_name)
+    with pytest.raises(ValueError, match="reserved"):
+        store.delete_job(control_name)
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_stale_reconciliation_candidates_exclude_incoming_and_job_links(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    incoming = root / ".incoming"
+    incoming.mkdir(parents=True)
+    outside_file = tmp_path / "outside.wav"
+    outside_file.write_bytes(b"preserve")
+    incoming_link = incoming / f".upload-{'a' * 32}-linked.wav"
+    incoming_link.symlink_to(outside_file)
+    outside_directory = tmp_path / "outside-job"
+    outside_directory.mkdir()
+    job_link = root / ("b" * 32)
+    job_link.symlink_to(outside_directory, target_is_directory=True)
+    store = ArtifactStore(root)
+
+    removed = store.remove_stale_incoming_uploads(lease_seconds=1, now=10**10)
+    candidates = store.stale_unregistered_job_candidates(lease_seconds=1, now=10**10)
+
+    assert removed == 0
+    assert candidates == ()
+    assert incoming_link.is_symlink()
+    assert job_link.is_symlink()
+    assert outside_file.read_bytes() == b"preserve"
 
 
 def test_delete_job_rejects_a_symlink_that_resolves_outside_the_jobs_root(tmp_path: Path) -> None:

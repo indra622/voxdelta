@@ -366,6 +366,52 @@ def test_create_job_accepts_one_explicit_validated_id_and_rejects_reuse(tmp_path
 
 @pytest.mark.parametrize(
     "job_id",
+    ["j1", "A" * 32, "a" * 31, "a" * 33, "g" * 32, ".deleted", ".locks", ".incoming"],
+)
+def test_create_job_rejects_noncanonical_explicit_ids(job_id: str, tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+
+    with pytest.raises(ValueError, match="32 lowercase hexadecimal|reserved"):
+        repository.create_job("source.wav", job_id=job_id)
+
+
+def test_resolve_create_after_error_distinguishes_commit_absence_and_mismatch(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    committed = "a" * 32
+    absent = "b" * 32
+    claimed = "c" * 32
+    repository.create_job("committed.wav", diagnostic_capture=True, job_id=committed)
+    repository.create_job("claimed.wav", job_id=claimed)
+    assert repository.claim_stage(claimed, StageName.NORMALIZE) is not None
+    discarded: list[str] = []
+
+    assert repository.resolve_create_after_error(
+        committed,
+        source_name="committed.wav",
+        diagnostic_capture=True,
+        discard_if_absent=lambda proof: discarded.append("committed"),
+    )
+    assert not repository.resolve_create_after_error(
+        absent,
+        source_name="absent.wav",
+        diagnostic_capture=False,
+        discard_if_absent=lambda proof: discarded.append("absent"),
+    )
+    with pytest.raises(ValueError, match="ambiguous"):
+        repository.resolve_create_after_error(
+            claimed,
+            source_name="claimed.wav",
+            diagnostic_capture=False,
+            discard_if_absent=lambda proof: discarded.append("claimed"),
+        )
+
+    assert discarded == ["absent"]
+
+
+@pytest.mark.parametrize(
+    "job_id",
     [
         "",
         ".",

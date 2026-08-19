@@ -11,10 +11,34 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from voxdelta.domain.models import StageName, StageStatus
-from voxdelta.jobs._ids import validate_job_id
+from voxdelta.jobs._ids import (
+    JobAbsenceProof,
+    _issue_job_absence_proof,
+    validate_canonical_job_id,
+    validate_job_id,
+)
 
 Clock = Callable[[], datetime]
 Publisher = Callable[[], None]
+
+
+def _stages_are_pristine_pending(stages: list[sqlite3.Row]) -> bool:
+    return (
+        len(stages) == len(StageName)
+        and {str(row["stage"]) for row in stages} == {stage.value for stage in StageName}
+        and all(
+            row["status"] == StageStatus.PENDING.value
+            and int(row["generation"]) == 0
+            and row["artifact_path"] is None
+            and row["cache_key"] is None
+            and row["artifact_hash"] is None
+            and row["error_json"] is None
+            and row["claim_token"] is None
+            and row["claimed_at"] is None
+            and int(row["role_confirmed"]) == 0
+            for row in stages
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,7 +148,7 @@ class JobRepository:
         """Create a pending job and all canonical pending stage rows atomically."""
 
         job_id = uuid.uuid4().hex if job_id is None else job_id
-        validate_job_id(job_id)
+        validate_canonical_job_id(job_id)
         now = self._now().isoformat()
         with self._connect() as database:
             database.execute(
@@ -140,6 +164,73 @@ class JobRepository:
                 [(job_id, stage.value, StageStatus.PENDING.value) for stage in StageName],
             )
         return job_id
+
+    def resolve_create_after_error(
+        self,
+        job_id: str,
+        *,
+        source_name: str,
+        diagnostic_capture: bool,
+        discard_if_absent: Callable[[JobAbsenceProof], None],
+    ) -> bool:
+        """Resolve an ambiguous insert while serializing an absence-bound cleanup callback."""
+
+        validate_canonical_job_id(job_id)
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            job = database.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                discard_if_absent(_issue_job_absence_proof(job_id))
+                return False
+            stages = database.execute(
+                "SELECT * FROM stages WHERE job_id = ? ORDER BY rowid", (job_id,)
+            ).fetchall()
+            if (
+                job["source_name"] == source_name
+                and job["status"] == StageStatus.PENDING.value
+                and int(job["diagnostic_capture"]) == int(diagnostic_capture)
+                and _stages_are_pristine_pending(stages)
+            ):
+                return True
+            raise ValueError("job creation outcome is ambiguous and not pristine")
+
+    def discard_if_absent(
+        self,
+        job_id: str,
+        discard: Callable[[JobAbsenceProof], None],
+    ) -> bool:
+        """Run a private filesystem discard callback under a serialized DB absence proof."""
+
+        validate_canonical_job_id(job_id)
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            if database.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone():
+                return False
+            discard(_issue_job_absence_proof(job_id))
+            return True
+
+    def list_pristine_pending_jobs(self) -> list[tuple[str, str]]:
+        """List startup-recoverable jobs that never entered a pipeline claim."""
+
+        recovered: list[tuple[str, str]] = []
+        with self._connect() as database:
+            jobs = database.execute(
+                "SELECT id, source_name FROM jobs WHERE status = ? ORDER BY created_at, id",
+                (StageStatus.PENDING.value,),
+            ).fetchall()
+            for job in jobs:
+                job_id = str(job["id"])
+                try:
+                    validate_canonical_job_id(job_id)
+                except ValueError:
+                    continue
+                stages = database.execute(
+                    "SELECT * FROM stages WHERE job_id = ? ORDER BY rowid", (job_id,)
+                ).fetchall()
+                source_name = str(job["source_name"])
+                if source_name and _stages_are_pristine_pending(stages):
+                    recovered.append((job_id, source_name))
+        return recovered
 
     def update_source_name(self, job_id: str, source_name: str) -> None:
         """Bind a newly streamed job upload before any pipeline work is scheduled."""

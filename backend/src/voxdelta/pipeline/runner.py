@@ -1238,9 +1238,9 @@ class PipelineRunner:
             raise PipelineValidationError("invalid_stage", "Select a valid pipeline stage.")
         self._repository.get_job(job_id)
         with self._job_lock(job_id):
-            with self._artifacts.operation_lock(job_id):
-                self._invalidate_from_under_operation_lock(job_id, stage)
             try:
+                with self._artifacts.operation_lock(job_id):
+                    self._invalidate_from_under_operation_lock(job_id, stage)
                 result = self._run_locked(job_id)
             except KeyError:
                 if self._artifacts.deletion_tombstone_exists(job_id):

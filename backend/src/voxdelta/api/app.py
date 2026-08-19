@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-from collections.abc import AsyncIterator
-from contextlib import AbstractContextManager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractContextManager, asynccontextmanager
 from pathlib import Path
 from threading import Lock
+from time import time
 from typing import Annotated, BinaryIO, cast
 from uuid import uuid4
 
@@ -29,6 +31,7 @@ from voxdelta.api.schemas import (
 )
 from voxdelta.config import Settings
 from voxdelta.domain.models import StageName
+from voxdelta.jobs._ids import JobAbsenceProof
 from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.repository import JobRepository
 from voxdelta.pipeline.runner import (
@@ -77,6 +80,22 @@ def _upload_too_large_response() -> JSONResponse:
     )
 
 
+def _declared_length_exceeds(raw: bytes, maximum: int) -> bool | None:
+    candidate = raw.strip()
+    if not candidate or any(byte < ord("0") or byte > ord("9") for byte in candidate):
+        return None
+    canonical = candidate.lstrip(b"0") or b"0"
+    limit = str(maximum).encode("ascii")
+    if len(canonical) != len(limit):
+        return len(canonical) > len(limit)
+    if canonical != limit:
+        return canonical > limit
+    try:
+        return int(canonical) > maximum
+    except ValueError:
+        return None
+
+
 class _RequestBodyLimitMiddleware:
     """Stop oversized upload bodies while the multipart parser is still reading ASGI messages."""
 
@@ -98,11 +117,11 @@ class _RequestBodyLimitMiddleware:
             for name, value in scope.get("headers", [])
             if name.lower() == b"content-length"
         ]
-        if len(content_lengths) == 1 and content_lengths[0].isdigit():
-            declared_length = int(content_lengths[0])
-            if declared_length > self._max_bytes:
-                await _upload_too_large_response()(scope, receive, send)
-                return
+        if len(content_lengths) == 1 and _declared_length_exceeds(
+            content_lengths[0], self._max_bytes
+        ):
+            await _upload_too_large_response()(scope, receive, send)
+            return
 
         total = 0
         limit_exceeded = False
@@ -267,28 +286,6 @@ def _cleanup_incoming_upload(
             pass
 
 
-def _rollback_registered_upload(
-    repository: JobRepository,
-    artifacts: ArtifactStore,
-    job_id: str,
-) -> None:
-    try:
-        repository.delete_job(job_id)
-    except Exception:
-        return
-    try:
-        artifacts.discard_unregistered_job(job_id)
-    except Exception:
-        pass
-
-
-def _discard_unregistered_upload(artifacts: ArtifactStore, job_id: str) -> None:
-    try:
-        artifacts.discard_unregistered_job(job_id)
-    except Exception:
-        pass
-
-
 def _parse_range(raw: str | None, size: int) -> tuple[int, int] | None:
     if raw is None:
         return None
@@ -348,12 +345,53 @@ async def _audio_chunks(
         closer.close()
 
 
+def reconcile_local_state(
+    repository: JobRepository,
+    artifacts: ArtifactStore,
+    runner: PipelineRunner,
+    *,
+    lease_seconds: float,
+    now: float | None = None,
+    schedule: Callable[[str], None] | None = None,
+) -> tuple[str, ...]:
+    """Reconcile stale admission state and recover pristine jobs in this local process."""
+
+    current_time = time() if now is None else now
+    artifacts.remove_stale_incoming_uploads(
+        lease_seconds=lease_seconds,
+        now=current_time,
+    )
+    for job_id in artifacts.stale_unregistered_job_candidates(
+        lease_seconds=lease_seconds,
+        now=current_time,
+    ):
+
+        def discard_absent(proof: JobAbsenceProof, selected: str = job_id) -> None:
+            artifacts._discard_unregistered_job_under_absence_proof(  # noqa: SLF001
+                selected, proof
+            )
+
+        repository.discard_if_absent(job_id, discard_absent)
+
+    recovered: list[str] = []
+    for job_id, source_name in repository.list_pristine_pending_jobs():
+        if not artifacts.canonical_source_exists(job_id, source_name):
+            continue
+        recovered.append(job_id)
+        if schedule is None:
+            _safe_background_run(runner, job_id)
+        else:
+            schedule(job_id)
+    return tuple(recovered)
+
+
 def create_app(
     *,
     repository: JobRepository | None = None,
     artifacts: ArtifactStore | None = None,
     runner: PipelineRunner | None = None,
     max_upload_bytes: int | None = None,
+    reconciliation_lease_seconds: float | None = None,
 ) -> FastAPI:
     """Create an isolated application, or construct safe local production dependencies."""
 
@@ -366,12 +404,38 @@ def create_app(
         runner = dependencies.runner
         if max_upload_bytes is None:
             max_upload_bytes = dependencies.max_upload_bytes
+        if reconciliation_lease_seconds is None:
+            reconciliation_lease_seconds = dependencies.admission_reconciliation_lease_seconds
     if max_upload_bytes is None:
         max_upload_bytes = Settings().max_upload_bytes
+    if reconciliation_lease_seconds is None:
+        reconciliation_lease_seconds = Settings().admission_reconciliation_lease_seconds
     if max_upload_bytes <= 0:
         raise ValueError("max_upload_bytes must be positive")
+    if reconciliation_lease_seconds <= 0:
+        raise ValueError("reconciliation_lease_seconds must be positive")
 
-    app = FastAPI(title="VoxDelta", version="0.1.0")
+    recovery_tasks: set[asyncio.Task[None]] = set()
+
+    def schedule_recovery(job_id: str) -> None:
+        task = asyncio.create_task(asyncio.to_thread(_safe_background_run, runner, job_id))
+        recovery_tasks.add(task)
+        task.add_done_callback(recovery_tasks.discard)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):  # type: ignore[no-untyped-def]
+        reconcile_local_state(
+            repository,
+            artifacts,
+            runner,
+            lease_seconds=reconciliation_lease_seconds,
+            schedule=schedule_recovery,
+        )
+        yield
+        if recovery_tasks:
+            await asyncio.gather(*tuple(recovery_tasks), return_exceptions=True)
+
+    app = FastAPI(title="VoxDelta", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         _RequestBodyLimitMiddleware,
         max_bytes=max_upload_bytes + MULTIPART_OVERHEAD_BYTES,
@@ -467,25 +531,37 @@ def create_app(
                 job_id=job_id,
             )
         except BaseException:
-            _discard_unregistered_upload(artifacts, job_id)
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "code": "upload_failed",
-                    "message": "The upload could not be stored safely.",
-                },
-            ) from None
+
+            def discard_adopted(proof: JobAbsenceProof) -> None:
+                artifacts._discard_unregistered_job_under_absence_proof(  # noqa: SLF001
+                    job_id, proof
+                )
+
+            try:
+                committed = repository.resolve_create_after_error(
+                    job_id,
+                    source_name=str(destination),
+                    diagnostic_capture=diagnostic_capture,
+                    discard_if_absent=discard_adopted,
+                )
+            except BaseException:
+                committed = False
+            if not committed:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "upload_failed",
+                        "message": "The upload could not be stored safely.",
+                    },
+                ) from None
         try:
             background_tasks.add_task(_safe_background_run, runner, job_id)
         except BaseException:
-            _rollback_registered_upload(repository, artifacts, job_id)
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "code": "upload_failed",
-                    "message": "The upload could not be stored safely.",
-                },
-            ) from None
+            _safe_background_run(runner, job_id)
+            try:
+                runner.mark_unhandled_failure(job_id)
+            except Exception:
+                pass
         return JobCreated(job_id=job_id, status_url=f"/api/jobs/{job_id}")
 
     @app.get("/api/jobs/{job_id}", response_model=PublicJob)
@@ -616,4 +692,5 @@ __all__ = [
     "UPLOAD_CHUNK_BYTES",
     "app",
     "create_app",
+    "reconcile_local_state",
 ]

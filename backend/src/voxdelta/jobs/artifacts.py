@@ -19,7 +19,12 @@ import orjson
 from pydantic import BaseModel
 
 from voxdelta.domain.models import StageName
-from voxdelta.jobs._ids import validate_job_id
+from voxdelta.jobs._ids import (
+    JobAbsenceProof,
+    validate_canonical_job_id,
+    validate_job_absence_proof,
+    validate_job_id,
+)
 
 try:
     import fcntl
@@ -422,6 +427,7 @@ class ArtifactStore:
         destination = directory / f"source-upload{suffix}"
         try:
             os.replace(incoming, destination)
+            _fsync_directory(incoming.parent)
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(destination, flags)
@@ -454,13 +460,98 @@ class ArtifactStore:
                 pass
             raise
 
-    def discard_unregistered_job(self, job_id: str) -> None:
-        """Remove an adopted directory whose repository insert is known to have failed."""
+    def _discard_unregistered_job_under_absence_proof(
+        self,
+        job_id: str,
+        proof: JobAbsenceProof,
+    ) -> None:
+        """Repository callback: remove an adopted directory during a locked absence proof."""
 
+        validate_job_absence_proof(proof, job_id)
         directory = self._job_path(job_id, create=False, require_directory=False)
         if directory.exists():
             shutil.rmtree(directory)
         _fsync_directory(self.root)
+
+    def remove_stale_incoming_uploads(self, *, lease_seconds: float, now: float) -> int:
+        """Remove only old canonical regular files from the private incoming directory."""
+
+        if lease_seconds <= 0:
+            raise ValueError("reconciliation lease must be positive")
+        directory = self._control_directory(
+            ".incoming",
+            create=False,
+            error_message=_INCOMING_VALIDATION_ERROR,
+        )
+        if not directory.is_dir():
+            return 0
+        removed = 0
+        for candidate in directory.iterdir():
+            name = candidate.name
+            if not name.startswith(".upload-") or len(name) < 42:
+                continue
+            job_id = name[8:40]
+            if name[40] != "-" or candidate.suffix not in {".wav", ".mp3", ".m4a"}:
+                continue
+            try:
+                validate_canonical_job_id(job_id)
+                metadata = candidate.lstat()
+            except (OSError, ValueError):
+                continue
+            if (
+                _is_link_like(candidate)
+                or not stat.S_ISREG(metadata.st_mode)
+                or now - metadata.st_mtime < lease_seconds
+            ):
+                continue
+            candidate.unlink()
+            removed += 1
+        if removed:
+            _fsync_directory(directory)
+        return removed
+
+    def stale_unregistered_job_candidates(
+        self, *, lease_seconds: float, now: float
+    ) -> tuple[str, ...]:
+        """Return old canonical direct job directories, excluding every control component/link."""
+
+        if lease_seconds <= 0:
+            raise ValueError("reconciliation lease must be positive")
+        if not self.root.is_dir() or _is_link_like(self.root):
+            return ()
+        candidates: list[str] = []
+        for directory in self.root.iterdir():
+            try:
+                validate_canonical_job_id(directory.name)
+                metadata = directory.lstat()
+            except (OSError, ValueError):
+                continue
+            if (
+                _is_link_like(directory)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or now - metadata.st_mtime < lease_seconds
+            ):
+                continue
+            candidates.append(directory.name)
+        return tuple(sorted(candidates))
+
+    def canonical_source_exists(self, job_id: str, source_name: str) -> bool:
+        """Validate one adopted source path without following links."""
+
+        try:
+            validate_canonical_job_id(job_id)
+            directory = self._job_path(job_id, create=False, require_directory=True)
+            source = Path(source_name)
+            if source.parent != directory or source.name not in {
+                "source-upload.wav",
+                "source-upload.mp3",
+                "source-upload.m4a",
+            }:
+                return False
+            metadata = source.lstat()
+            return not _is_link_like(source) and stat.S_ISREG(metadata.st_mode)
+        except (OSError, ValueError):
+            return False
 
     @contextmanager
     def operation_lock(self, job_id: str) -> Iterator[None]:
