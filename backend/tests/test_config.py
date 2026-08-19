@@ -6,6 +6,9 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from pydantic import ValidationError
+
+REPOSITORY = Path(__file__).resolve().parents[2]
 
 
 def config_module() -> ModuleType:
@@ -95,3 +98,53 @@ def test_default_settings_env_path_is_independent_of_current_working_directory(
     settings = module.load_settings()
 
     assert settings.min_audio_seconds == 42
+
+
+def test_default_data_paths_are_absolute_and_independent_of_current_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(env_file, "")
+    elsewhere = tmp_path / "caller"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    settings = config_module().load_settings(env_file)
+
+    assert settings.data_root == REPOSITORY / "data"
+    assert settings.database_path == REPOSITORY / "data" / "voxdelta.sqlite3"
+    assert settings.data_root.is_absolute()
+    assert settings.database_path.is_absolute()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "VOXDELTA_MIN_AUDIO_SECONDS=0\n",
+        "VOXDELTA_MAX_AUDIO_SECONDS=0\n",
+    ],
+)
+def test_public_loader_rejects_non_positive_audio_limits(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(env_file, content)
+
+    with pytest.raises(ValidationError):
+        config_module().load_settings(env_file)
+
+
+def test_public_loader_rejects_minimum_audio_limit_above_maximum(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "VOXDELTA_MIN_AUDIO_SECONDS=61\nVOXDELTA_MAX_AUDIO_SECONDS=60\n",
+    )
+
+    with pytest.raises(ValidationError):
+        config_module().load_settings(env_file)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from math import isfinite
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -61,8 +62,8 @@ class AudioAsset(BaseModel):
     source_path: str
     normalized_paths: tuple[str, ...] = ()
     channel_mode: Literal["mixed", "separate"] | None = None
-    duration_seconds: float | None = None
-    channels: int | None = None
+    duration_seconds: float | None = Field(default=None, ge=0)
+    channels: int | None = Field(default=None, gt=0)
     sha256: str
 
 
@@ -101,6 +102,8 @@ class EmotionResult(BaseModel):
         expected = {"happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise"}
         if set(self.probabilities) != expected:
             raise ValueError("all seven emotion labels are required")
+        if any(not isfinite(value) for value in self.probabilities.values()):
+            raise ValueError("emotion probabilities must be finite")
         if any(value < 0 or value > 1 for value in self.probabilities.values()):
             raise ValueError("emotion probabilities must be between zero and one")
         if abs(sum(self.probabilities.values()) - 1.0) > 1e-6:
@@ -131,6 +134,18 @@ class EmotionTransition(BaseModel):
     next_customer_id: str
     delta: float = Field(ge=-1, le=1)
     classification: TransitionClass
+
+    @model_validator(mode="after")
+    def classification_matches_delta(self) -> EmotionTransition:
+        if self.delta <= -0.20:
+            expected: TransitionClass = "recovery"
+        elif self.delta >= 0.20:
+            expected = "worsening"
+        else:
+            expected = "stable"
+        if self.classification != expected:
+            raise ValueError(f"classification must be {expected} for delta {self.delta}")
+        return self
 
 
 class CallSummary(BaseModel):

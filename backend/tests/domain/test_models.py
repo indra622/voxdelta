@@ -80,6 +80,26 @@ def test_audio_asset_accepts_normalized_local_metadata() -> None:
     assert asset.normalized_paths == ("jobs/j1/audio/mixed.wav",)
 
 
+def test_audio_asset_rejects_negative_duration() -> None:
+    with pytest.raises(ValidationError):
+        AudioAsset(
+            source_name="call.wav",
+            source_path="incoming/call.wav",
+            duration_seconds=-0.1,
+            sha256="0" * 64,
+        )
+
+
+def test_audio_asset_rejects_non_positive_channel_count() -> None:
+    with pytest.raises(ValidationError):
+        AudioAsset(
+            source_name="call.wav",
+            source_path="incoming/call.wav",
+            channels=0,
+            sha256="0" * 64,
+        )
+
+
 def test_speaker_segment_rejects_non_positive_interval() -> None:
     with pytest.raises(ValidationError):
         SpeakerSegment(
@@ -158,6 +178,37 @@ def test_emotion_probabilities_must_be_bounded() -> None:
         )
 
 
+def test_emotion_probabilities_reject_nan() -> None:
+    probabilities = valid_probabilities()
+    probabilities["happiness"] = float("nan")
+
+    with pytest.raises(ValidationError):
+        EmotionResult(
+            utterance_id="u1",
+            probabilities=probabilities,
+            operational_state="stable",
+            negative_intensity=0.2,
+            confidence=0.8,
+            provider=local_provider(),
+        )
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf")])
+def test_emotion_probabilities_reject_infinity(value: float) -> None:
+    probabilities = valid_probabilities()
+    probabilities["happiness"] = value
+
+    with pytest.raises(ValidationError):
+        EmotionResult(
+            utterance_id="u1",
+            probabilities=probabilities,
+            operational_state="stable",
+            negative_intensity=0.2,
+            confidence=0.8,
+            provider=local_provider(),
+        )
+
+
 def test_transition_and_summary_reject_out_of_range_values() -> None:
     with pytest.raises(ValidationError):
         EmotionTransition(
@@ -177,6 +228,51 @@ def test_transition_and_summary_reject_out_of_range_values() -> None:
             valid_coverage=1.1,
             recovery_count=1,
             worsening_count=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("delta", "classification"),
+    [
+        (-0.20, "recovery"),
+        (-0.19, "stable"),
+        (0.19, "stable"),
+        (0.20, "worsening"),
+    ],
+)
+def test_transition_classification_accepts_exact_delta_boundaries(
+    delta: float, classification: str
+) -> None:
+    transition = EmotionTransition(
+        previous_customer_id="u1",
+        agent_id="u2",
+        next_customer_id="u3",
+        delta=delta,
+        classification=classification,
+    )
+
+    assert transition.classification == classification
+
+
+@pytest.mark.parametrize(
+    ("delta", "classification"),
+    [
+        (-0.20, "stable"),
+        (-0.19, "recovery"),
+        (0.19, "worsening"),
+        (0.20, "stable"),
+    ],
+)
+def test_transition_rejects_classification_that_disagrees_with_delta(
+    delta: float, classification: str
+) -> None:
+    with pytest.raises(ValidationError):
+        EmotionTransition(
+            previous_customer_id="u1",
+            agent_id="u2",
+            next_customer_id="u3",
+            delta=delta,
+            classification=classification,
         )
 
 
