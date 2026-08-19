@@ -5,7 +5,14 @@ from __future__ import annotations
 from math import isfinite
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 CandidateStatus = Literal["eligible", "unavailable", "rejected"]
 _MAX_RSS_MB = 18_432.0
@@ -25,6 +32,12 @@ _SAFE_UNAVAILABLE_REASONS = frozenset(
 )
 
 
+def _safe_unavailable_reason(value: str | None) -> str | None:
+    if value is None or value in _SAFE_UNAVAILABLE_REASONS:
+        return value
+    return "provider_unavailable"
+
+
 class CandidateMetrics(BaseModel):
     candidate_id: str
     task: Literal["diarization", "asr", "emotion"]
@@ -37,16 +50,18 @@ class CandidateMetrics(BaseModel):
     cer: float | None = Field(default=None, ge=0)
     macro_f1: float | None = Field(default=None, ge=0, le=1)
     expected_calibration_error: float | None = Field(default=None, ge=0, le=1)
-    unavailable_reason: str | None = None
+    unavailable_reason: str | None = Field(default=None, repr=False)
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
     @field_validator("unavailable_reason")
     @classmethod
     def safe_unavailable_reason(cls, value: str | None) -> str | None:
-        if value is None or value in _SAFE_UNAVAILABLE_REASONS:
-            return value
-        return "provider_unavailable"
+        return _safe_unavailable_reason(value)
+
+    @field_serializer("unavailable_reason")
+    def serialize_unavailable_reason(self, value: str | None) -> str | None:
+        return _safe_unavailable_reason(value)
 
     @model_validator(mode="after")
     def finite_metrics(self) -> CandidateMetrics:
@@ -90,11 +105,7 @@ def _base_status(
     for candidate in candidates:
         reason: str | None = None
         if candidate.unavailable_reason is not None:
-            reason = (
-                candidate.unavailable_reason
-                if candidate.unavailable_reason in _SAFE_UNAVAILABLE_REASONS
-                else "provider_unavailable"
-            )
+            reason = _safe_unavailable_reason(candidate.unavailable_reason)
         elif candidate.completion_rate < _MIN_COMPLETION:
             reason = "completion_rate_below_0.95"
         elif candidate.peak_rss_mb is None:

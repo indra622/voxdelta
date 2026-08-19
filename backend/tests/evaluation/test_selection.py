@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from voxdelta.evaluation.selection import (
     CandidateMetrics,
@@ -108,6 +108,49 @@ def test_candidate_contract_sanitizes_arbitrary_unavailable_reason() -> None:
 
     assert candidate.unavailable_reason == "provider_unavailable"
     assert "private" not in candidate.model_dump_json().lower()
+
+
+@pytest.mark.parametrize("bypass", ["copy", "construct"])
+def test_unavailable_reason_serialization_fails_closed_after_validation_bypass(
+    bypass: str,
+) -> None:
+    sentinel = "/private/audio.wav transcript-secret hf_token provider-payload"
+    if bypass == "copy":
+        candidate = _candidate("qwen", "qwen3-asr", cer=0.1).model_copy(
+            update={"unavailable_reason": sentinel}
+        )
+    else:
+        candidate = CandidateMetrics.model_construct(
+            candidate_id="qwen",
+            task="asr",
+            provider="qwen3-asr",
+            model="Qwen3-ASR-1.7B",
+            completion_rate=0.0,
+            unavailable_reason=sentinel,
+        )
+
+    assert candidate.model_dump()["unavailable_reason"] == "provider_unavailable"
+    assert sentinel not in candidate.model_dump_json()
+    assert sentinel not in repr(candidate)
+
+
+def test_nested_candidate_serialization_fails_closed_after_model_construct() -> None:
+    class Envelope(BaseModel):
+        candidate: CandidateMetrics
+
+    sentinel = "/private/audio.wav transcript-secret hf_token provider-payload"
+    candidate = CandidateMetrics.model_construct(
+        candidate_id="qwen",
+        task="asr",
+        provider="qwen3-asr",
+        model="Qwen3-ASR-1.7B",
+        completion_rate=0.0,
+        unavailable_reason=sentinel,
+    )
+    envelope = Envelope(candidate=candidate)
+
+    assert envelope.model_dump()["candidate"]["unavailable_reason"] == "provider_unavailable"
+    assert sentinel not in envelope.model_dump_json()
 
 
 def test_multiple_candidates_per_provider_select_best_and_reject_every_other() -> None:
