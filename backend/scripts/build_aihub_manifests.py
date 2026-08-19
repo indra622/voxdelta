@@ -16,6 +16,7 @@ from voxdelta.domain.models import EmotionLabel
 from voxdelta.evaluation.aihub_fields import resolve_canonical_field
 from voxdelta.evaluation.manifest import (
     DatasetItem,
+    DatasetSource,
     DatasetSplit,
     read_trusted_regular_file,
     validate_disjoint_splits,
@@ -143,7 +144,7 @@ def _split_for_call(call_id: str) -> DatasetSplit:
     return "test"
 
 
-def _build_item(audio: Path, metadata: Path, *, require_emotion: bool) -> DatasetItem:
+def _build_item(audio: Path, metadata: Path, *, source: DatasetSource) -> DatasetItem:
     payload = _load_metadata(metadata)
     item_id = resolve_canonical_field(payload, "id")
     call_id = resolve_canonical_field(payload, "call_id")
@@ -151,7 +152,7 @@ def _build_item(audio: Path, metadata: Path, *, require_emotion: bool) -> Datase
     transcript = resolve_canonical_field(payload, "transcript")
     raw_emotion = (
         resolve_canonical_field(payload, "emotion")
-        if require_emotion
+        if source == "emotion"
         else resolve_canonical_field(payload, "emotion", required=False)
     )
     audio_bytes = read_trusted_regular_file(audio)
@@ -162,6 +163,7 @@ def _build_item(audio: Path, metadata: Path, *, require_emotion: bool) -> Datase
         audio_path=str(audio),
         transcript=transcript,
         split=_split_for_call(call_id),
+        source=source,
         emotion=_normalize_emotion(raw_emotion) if raw_emotion is not None else None,
         sha256=hashlib.sha256(audio_bytes).hexdigest(),
     )
@@ -171,15 +173,19 @@ def build_manifests(consultation_root: Path, emotion_root: Path, output_root: Pa
     consultation = _input_root(consultation_root)
     emotion = _input_root(emotion_root)
     output = _output_root(output_root)
-    items = [
-        *(
-            _build_item(audio, metadata, require_emotion=False)
+    source_items: dict[DatasetSource, list[DatasetItem]] = {
+        "consultation": [
+            _build_item(audio, metadata, source="consultation")
             for audio, metadata in _discover_pairs(consultation)
-        ),
-        *(
-            _build_item(audio, metadata, require_emotion=True)
+        ],
+        "emotion": [
+            _build_item(audio, metadata, source="emotion")
             for audio, metadata in _discover_pairs(emotion)
-        ),
+        ],
+    }
+    items = [
+        *source_items["consultation"],
+        *source_items["emotion"],
     ]
     items.sort(key=lambda item: item.id)
 
@@ -195,6 +201,10 @@ def build_manifests(consultation_root: Path, emotion_root: Path, output_root: Pa
         grouped[item.split].append(item)
     for split in _SPLITS:
         _write_manifest(output / f"{split}.jsonl", grouped[split])
+    for source, source_records in source_items.items():
+        _write_manifest(
+            output / f"{source}.jsonl", sorted(source_records, key=lambda item: item.id)
+        )
 
 
 def _write_manifest(path: Path, items: list[DatasetItem]) -> None:
@@ -231,6 +241,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         build_manifests(arguments.consultation_root, arguments.emotion_root, arguments.output_root)
+    except OSError:
+        print("manifest build failed: filesystem operation failed", file=sys.stderr)
+        return 2
     except ValueError as error:
         print(f"manifest build failed: {error}", file=sys.stderr)
         return 2

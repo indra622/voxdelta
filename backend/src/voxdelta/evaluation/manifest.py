@@ -8,17 +8,18 @@ import stat
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from voxdelta.domain.models import EmotionLabel
 
 DatasetSplit = Literal["train", "validation", "test"]
+DatasetSource = Literal["consultation", "emotion"]
 
 
 class DatasetItem(BaseModel):
     """One immutable utterance record in an evaluation manifest."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     id: str
     call_id: str
@@ -26,10 +27,11 @@ class DatasetItem(BaseModel):
     audio_path: str
     transcript: str
     split: DatasetSplit
+    source: DatasetSource
     emotion: EmotionLabel | None = None
     start: float | None = None
     end: float | None = None
-    sha256: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def _absolute_path(path: str | Path) -> Path:
@@ -93,7 +95,24 @@ def load_manifest(path: str | Path) -> list[DatasetItem]:
             payload = json.loads(line)
         except json.JSONDecodeError as error:
             raise ValueError(f"invalid JSON on manifest line {line_number}") from error
-        items.append(DatasetItem.model_validate(payload))
+        try:
+            items.append(DatasetItem.model_validate(payload))
+        except ValidationError as error:
+            details: list[str] = []
+            for detail in error.errors(
+                include_url=False, include_context=False, include_input=False
+            ):
+                location = ".".join(
+                    str(part)
+                    if isinstance(part, int) or part in DatasetItem.model_fields
+                    else "<field>"
+                    for part in detail["loc"]
+                )
+                details.append(f"{location or '<model>'} ({detail['type']})")
+            diagnostics = ", ".join(details)
+            raise ValueError(
+                f"invalid dataset item on manifest line {line_number}: {diagnostics}"
+            ) from None
 
     seen: set[str] = set()
     for item in items:

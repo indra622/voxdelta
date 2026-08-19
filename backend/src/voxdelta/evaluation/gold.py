@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class GoldUtteranceLabel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     item_id: str
     annotator: str
@@ -17,7 +17,7 @@ class GoldUtteranceLabel(BaseModel):
 
 
 class GoldTransitionLabel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     previous_customer_id: str
     agent_id: str

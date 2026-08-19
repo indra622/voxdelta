@@ -29,7 +29,9 @@ uv run python scripts/build_aihub_manifests.py \
 ```
 
 The builder requires adjacent audio and JSON files with the same filename stem. It stores absolute
-local audio paths and SHA-256 digests in `train.jsonl`, `validation.jsonl`, and `test.jsonl`.
+local audio paths, source identity, and SHA-256 digests in `train.jsonl`, `validation.jsonl`, and
+`test.jsonl`. It also writes sorted source-specific `consultation.jsonl` and `emotion.jsonl`
+manifests; every item in those files retains its deterministic split.
 
 ## Validate audio hashes
 

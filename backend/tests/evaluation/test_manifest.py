@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from voxdelta.evaluation.aihub_fields import resolve_canonical_field
 from voxdelta.evaluation.manifest import DatasetItem, load_manifest, validate_disjoint_splits
@@ -27,6 +28,7 @@ def _item(
         audio_path=f"/{item_id}.wav",
         transcript="fixture transcript",
         split=split,
+        source="consultation",
         sha256="0" * 64,
     )
 
@@ -92,6 +94,65 @@ def test_load_manifest_parses_jsonl_and_sorts_by_item_id(tmp_path: Path) -> None
     assert [item.id for item in load_manifest(manifest)] == ["a", "z"]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("start", "1.25"), ("start", True), ("transcript", b"coercible transcript")],
+)
+def test_dataset_item_rejects_coercible_values(field: str, value: object) -> None:
+    payload = _item("strict").model_dump()
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        DatasetItem.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "sha256",
+    ["A" * 64, "a" * 63, "g" * 64, "not-a-digest"],
+)
+def test_dataset_item_requires_lowercase_sha256(sha256: str) -> None:
+    payload = _item("hash").model_dump()
+    payload["sha256"] = sha256
+
+    with pytest.raises(ValidationError):
+        DatasetItem.model_validate(payload)
+
+
+def test_load_manifest_sanitizes_validation_errors(tmp_path: Path) -> None:
+    sentinel = "PRIVATE_TRANSCRIPT_SENTINEL"
+    payload = _item("invalid").model_dump()
+    payload["transcript"] = [sentinel]
+    manifest = tmp_path / "invalid.jsonl"
+    manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        load_manifest(manifest)
+
+    message = str(caught.value)
+    assert "manifest line 1" in message
+    assert "transcript" in message
+    assert "string_type" in message
+    assert sentinel not in message
+    assert "input_value" not in message
+
+
+@pytest.mark.parametrize("sha256", ["A" * 64, "short", "z" * 64, "arbitrary"])
+def test_load_manifest_rejects_invalid_sha256_values(tmp_path: Path, sha256: str) -> None:
+    payload = _item("invalid-hash").model_dump()
+    payload["sha256"] = sha256
+    manifest = tmp_path / "invalid-hash.jsonl"
+    manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        load_manifest(manifest)
+
+    message = str(caught.value)
+    assert "manifest line 1" in message
+    assert "sha256" in message
+    assert "string_pattern_mismatch" in message
+    assert sha256 not in message
+
+
 def test_load_manifest_rejects_symlink(tmp_path: Path) -> None:
     target = tmp_path / "real.jsonl"
     target.write_text(_item("a").model_dump_json() + "\n", encoding="utf-8")
@@ -148,6 +209,27 @@ def test_builder_writes_absolute_hashed_sorted_jsonl_manifests(tmp_path: Path) -
         },
         audio=b"emotion-audio",
     )
+    _write_pair(
+        consultation,
+        "b-item",
+        {
+            "id": "b",
+            "call_id": "consultation-call-2",
+            "speaker_id": "consultation-speaker-2",
+            "transcript": "second consultation text",
+        },
+    )
+    _write_pair(
+        emotion / "nested",
+        "y-item",
+        {
+            "id": "y",
+            "call_id": "emotion-call-2",
+            "speaker_id": "emotion-speaker-2",
+            "transcript": "second emotion text",
+            "emotion": "sadness",
+        },
+    )
 
     result = _run_builder(consultation, emotion, output)
 
@@ -156,7 +238,7 @@ def test_builder_writes_absolute_hashed_sorted_jsonl_manifests(tmp_path: Path) -
     output_files = [output / "train.jsonl", output / "validation.jsonl", output / "test.jsonl"]
     assert all(path.is_file() for path in output_files)
     items = [item for path in output_files for item in load_manifest(path)]
-    assert sorted(item.id for item in items) == ["a", "z"]
+    assert sorted(item.id for item in items) == ["a", "b", "y", "z"]
     assert all(
         [item.id for item in load_manifest(path)] == sorted(item.id for item in load_manifest(path))
         for path in output_files
@@ -165,9 +247,18 @@ def test_builder_writes_absolute_hashed_sorted_jsonl_manifests(tmp_path: Path) -
     assert by_id["a"].audio_path == str(emotion_audio.resolve())
     assert by_id["a"].sha256 == hashlib.sha256(b"emotion-audio").hexdigest()
     assert by_id["a"].emotion == "anger"
+    assert by_id["a"].source == "emotion"
     assert by_id["z"].audio_path == str(consultation_audio.resolve())
     assert by_id["z"].sha256 == hashlib.sha256(b"consultation-audio").hexdigest()
     assert by_id["z"].emotion is None
+    assert by_id["z"].source == "consultation"
+    consultation_items = load_manifest(output / "consultation.jsonl")
+    emotion_items = load_manifest(output / "emotion.jsonl")
+    assert [item.id for item in consultation_items] == ["b", "z"]
+    assert [item.id for item in emotion_items] == ["a", "y"]
+    assert {item.source for item in consultation_items} == {"consultation"}
+    assert {item.source for item in emotion_items} == {"emotion"}
+    assert {item.id for item in consultation_items}.isdisjoint(item.id for item in emotion_items)
     validate_disjoint_splits(items)
 
 
@@ -209,6 +300,35 @@ def test_builder_rejects_duplicate_ids(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "duplicate item id: duplicate" in result.stderr
+
+
+def test_builder_rejects_cross_source_id_collisions(tmp_path: Path) -> None:
+    consultation = tmp_path / "consultation"
+    emotion = tmp_path / "emotion"
+    output = tmp_path / "manifests"
+    base = {
+        "id": "shared",
+        "call_id": "consultation-call",
+        "speaker_id": "consultation-speaker",
+        "transcript": "consultation text",
+    }
+    _write_pair(consultation, "consultation", base)
+    _write_pair(
+        emotion,
+        "emotion",
+        base
+        | {
+            "call_id": "emotion-call",
+            "speaker_id": "emotion-speaker",
+            "emotion": "neutral",
+        },
+    )
+
+    result = _run_builder(consultation, emotion, output)
+
+    assert result.returncode == 2
+    assert "duplicate item id: shared" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 def test_builder_rejects_emotion_outside_seven_labels(tmp_path: Path) -> None:
@@ -253,3 +373,49 @@ def test_builder_rejects_symlinked_input_file(tmp_path: Path) -> None:
 
     assert result.returncode == 2
     assert "symlink" in result.stderr
+
+
+def test_builder_cli_does_not_echo_transcript_values_or_tracebacks(tmp_path: Path) -> None:
+    sentinel = "PRIVATE_TRANSCRIPT_SENTINEL"
+    consultation = tmp_path / "consultation"
+    emotion = tmp_path / "emotion"
+    output = tmp_path / "manifests"
+    emotion.mkdir()
+    _write_pair(
+        consultation,
+        "ambiguous",
+        {
+            "id": "item",
+            "call_id": "call",
+            "speaker_id": "speaker",
+            "transcript": sentinel,
+            "nested": {"text": "different"},
+        },
+    )
+
+    result = _run_builder(consultation, emotion, output)
+
+    assert result.returncode == 2
+    assert sentinel not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("failure_kind", ["output-file", "replace-directory"])
+def test_builder_cli_sanitizes_filesystem_failures(tmp_path: Path, failure_kind: str) -> None:
+    consultation = tmp_path / "consultation"
+    emotion = tmp_path / "emotion"
+    output = tmp_path / "PRIVATE_OUTPUT_SENTINEL"
+    consultation.mkdir()
+    emotion.mkdir()
+    if failure_kind == "output-file":
+        output.write_text("not a directory", encoding="utf-8")
+    else:
+        output.mkdir()
+        (output / "train.jsonl").mkdir()
+
+    result = _run_builder(consultation, emotion, output)
+
+    assert result.returncode == 2
+    assert result.stderr == "manifest build failed: filesystem operation failed\n"
+    assert "PRIVATE_OUTPUT_SENTINEL" not in result.stderr
+    assert "Traceback" not in result.stderr
