@@ -5,6 +5,7 @@ import json
 import shutil
 import sqlite3
 import threading
+import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,7 @@ from voxdelta.jobs.repository import JobRepository
 from voxdelta.pipeline.runner import PipelineRunner, PipelineValidationError
 from voxdelta.pipeline.stages import (
     EmotionArtifact,
+    MediaReference,
     NormalizeArtifact,
     ReportArtifact,
     RoleArtifact,
@@ -89,6 +91,21 @@ class BlockingDiarizer(FakeDiarizationProvider):
         return super().diarize(asset)
 
 
+class BlockingDeleteStore(ArtifactStore):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.delete_entered = threading.Event()
+        self.release_delete = threading.Event()
+        self._blocked_once = False
+
+    def delete_stage(self, job_id: str, stage: StageName) -> None:
+        if not self._blocked_once:
+            self._blocked_once = True
+            self.delete_entered.set()
+            assert self.release_delete.wait(timeout=5)
+        super().delete_stage(job_id, stage)
+
+
 class ReversedDiarizer(FakeDiarizationProvider):
     def diarize(self, asset: AudioAsset) -> list[SpeakerSegment]:
         return list(reversed(super().diarize(asset)))
@@ -144,6 +161,7 @@ def _harness(
     report: FakeReportSummaryProvider | None = None,
     diagnostic_capture: bool = False,
     repository_override: JobRepository | None = None,
+    separate_media: bool = False,
 ) -> tuple[PipelineRunner, JobRepository, ArtifactStore, str]:
     jobs_root = tmp_path / "jobs"
     repository = repository_override or JobRepository(tmp_path / "voxdelta.sqlite3")
@@ -153,13 +171,25 @@ def _harness(
     seeded_generation.mkdir()
     seeded_mixed = seeded_generation / "mixed.wav"
     shutil.copyfile(FIXTURE, seeded_mixed)
+    if separate_media:
+        seeded_left = seeded_generation / "left.wav"
+        seeded_right = seeded_generation / "right.wav"
+        shutil.copyfile(FIXTURE, seeded_left)
+        shutil.copyfile(FIXTURE, seeded_right)
+        normalized_paths = (str(seeded_left), str(seeded_right))
+        channel_mode = "separate"
+        channels = 2
+    else:
+        normalized_paths = (str(seeded_mixed),)
+        channel_mode = "mixed"
+        channels = 1
     asset = AudioAsset(
         source_name=FIXTURE.name,
         source_path=str(FIXTURE),
-        normalized_paths=(str(seeded_mixed),),
-        channel_mode="mixed",
+        normalized_paths=normalized_paths,
+        channel_mode=channel_mode,
         duration_seconds=65.0,
-        channels=1,
+        channels=channels,
         sha256=hashlib.sha256(FIXTURE.read_bytes()).hexdigest(),
     )
     cache_key = cache_key_for_stage(
@@ -168,7 +198,26 @@ def _harness(
         None,
         {"channel_preference": "auto"},
     )
-    artifact = NormalizeArtifact(cache_key=cache_key, asset=asset)
+    normalized_media = tuple(
+        MediaReference(
+            path=path,
+            sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+        )
+        for path in normalized_paths
+    )
+    artifact = NormalizeArtifact(
+        cache_key=cache_key,
+        asset=asset,
+        normalized_media=normalized_media,
+        mixed_preview=(
+            MediaReference(
+                path=str(seeded_mixed),
+                sha256=hashlib.sha256(seeded_mixed.read_bytes()).hexdigest(),
+            )
+            if separate_media
+            else normalized_media[0]
+        ),
+    )
     path = store.write_model(job_id, StageName.NORMALIZE, artifact)
     repository.set_stage(
         job_id,
@@ -322,7 +371,7 @@ def test_role_confirmation_requires_exact_observed_bijection(
     assert not store.artifact_path(job_id, StageName.EMOTION).exists()
 
 
-def test_completed_candidate_cannot_bypass_explicit_role_confirmation(tmp_path: Path) -> None:
+def test_missing_confirmation_marker_prevents_downstream_role_use(tmp_path: Path) -> None:
     runner, repository, store, job_id = _harness(tmp_path)
     runner.run_until_pause(job_id)
     candidate = store.read_model(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
@@ -374,7 +423,7 @@ def test_set_stage_cannot_mark_role_confirmation_paused_or_completed(tmp_path: P
             repository.set_stage(job_id, StageName.CONFIRM_ROLES, status)
 
 
-def test_tampered_paused_candidate_cannot_supply_confirmed_utterance_body(
+def test_candidate_body_mismatch_with_transcription_is_rejected(
     tmp_path: Path,
 ) -> None:
     runner, repository, store, job_id = _harness(tmp_path)
@@ -382,7 +431,7 @@ def test_tampered_paused_candidate_cannot_supply_confirmed_utterance_body(
     candidate = store.read_model(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
     tampered_utterances = list(candidate.utterances)
     tampered_utterances[0] = tampered_utterances[0].model_copy(
-        update={"transcript": "attacker supplied transcript"}
+        update={"transcript": "candidate transcript mismatch"}
     )
     tampered = candidate.model_copy(update={"utterances": tampered_utterances})
     store.write_model(job_id, StageName.CONFIRM_ROLES, tampered)
@@ -451,6 +500,47 @@ def test_retry_fences_a_blocked_worker_before_it_can_overwrite_new_output(
     assert store.artifact_path(job_id, StageName.DIARIZE).read_bytes() == expected_bytes
     assert json.loads(expected_bytes)["provider"]["name"] == "fake-diarization"
     assert not list(store.job_dir(job_id).glob(".diarize.v1.json.*.tmp"))
+    assert not any(
+        thread.name.startswith(f"voxdelta-heartbeat-{job_id}") for thread in threading.enumerate()
+    )
+
+
+def test_reset_holds_job_operation_lock_through_exact_artifact_deletion(
+    tmp_path: Path,
+) -> None:
+    runner, repository, store, job_id = _harness(tmp_path)
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+    blocking_store = BlockingDeleteStore(store.root)
+
+    def make_runner() -> PipelineRunner:
+        return PipelineRunner(
+            repository,
+            blocking_store,
+            AudioService(store.root, 60, 3600),
+            diarization_provider=FakeDiarizationProvider(),
+            transcription_provider=FakeTranscriptionProvider(),
+            emotion_provider=FakeEmotionProvider(),
+            strategy_provider=FakeResponseStrategyProvider(),
+            report_provider=FakeReportSummaryProvider(),
+        )
+
+    retry_runner = make_runner()
+    competing_runner = make_runner()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        retry_future = executor.submit(retry_runner.retry, job_id, StageName.DIARIZE)
+        assert blocking_store.delete_entered.wait(timeout=5)
+        assert repository.get_job(job_id)["stages"]["diarize"]["status"] == "pending"
+
+        competing_future = executor.submit(competing_runner.run_until_pause, job_id)
+        time.sleep(0.2)
+        assert not competing_future.done()
+        assert repository.get_job(job_id)["stages"]["diarize"]["claim_token"] is None
+
+        blocking_store.release_delete.set()
+        retry_future.result(timeout=5)
+        competing_future.result(timeout=5)
+        assert repository.get_job(job_id)["stages"]["confirm_roles"]["status"] == "paused"
 
 
 def test_runner_recovers_an_expired_claim_but_not_before_its_lease(tmp_path: Path) -> None:
@@ -479,6 +569,53 @@ def test_runner_recovers_an_expired_claim_but_not_before_its_lease(tmp_path: Pat
     assert recovered["stages"]["diarize"]["generation"] == original.generation + 1
 
 
+def test_heartbeat_prevents_live_blocked_provider_claim_from_being_stolen(
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(
+        tmp_path / "voxdelta.sqlite3",
+        claim_lease_seconds=0.15,
+    )
+    blocked = BlockingDiarizer()
+    _, _, store, job_id = _harness(
+        tmp_path,
+        diarizer=blocked,
+        repository_override=repository,
+    )
+    live_runner = PipelineRunner(
+        repository,
+        store,
+        AudioService(store.root, 60, 3600),
+        diarization_provider=blocked,
+        heartbeat_interval_seconds=0.03,
+    )
+    competing_runner = PipelineRunner(
+        repository,
+        store,
+        AudioService(store.root, 60, 3600),
+        heartbeat_interval_seconds=0.03,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        live_future = executor.submit(live_runner.run_until_pause, job_id)
+        assert blocked.entered.wait(timeout=5)
+        original = repository.get_job(job_id)["stages"]["diarize"]
+        time.sleep(0.3)
+
+        competing = competing_runner.run_until_pause(job_id)
+
+        assert competing["stages"]["diarize"]["status"] == StageStatus.RUNNING.value
+        current = repository.get_job(job_id)["stages"]["diarize"]
+        assert current["generation"] == original["generation"]
+        assert current["claim_token"] == original["claim_token"]
+        blocked.release.set()
+        assert live_future.result(timeout=5)["stages"]["confirm_roles"]["status"] == "paused"
+
+    assert not any(
+        thread.name.startswith(f"voxdelta-heartbeat-{job_id}") for thread in threading.enumerate()
+    )
+
+
 def test_corrupt_completed_artifact_invalidates_it_and_all_downstream(tmp_path: Path) -> None:
     runner, repository, store, job_id = _harness(tmp_path)
     runner.run_until_pause(job_id)
@@ -497,6 +634,29 @@ def test_corrupt_completed_artifact_invalidates_it_and_all_downstream(tmp_path: 
     ):
         assert repository.get_job(job_id)["stages"][stage.value]["status"] == "pending"
         assert not store.artifact_path(job_id, stage).exists()
+
+
+@pytest.mark.parametrize("media_name", ["mixed.wav", "left.wav", "right.wav"])
+def test_changed_normalized_media_invalidates_cached_report(
+    media_name: str,
+    tmp_path: Path,
+) -> None:
+    runner, repository, store, job_id = _harness(tmp_path, separate_media=True)
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+    before = repository.get_job(job_id)["stages"]["normalize"]["generation"]
+    normalize = store.read_model(job_id, StageName.NORMALIZE, NormalizeArtifact)
+    references = (*normalize.normalized_media, normalize.mixed_preview)
+    target = next(Path(item.path) for item in references if Path(item.path).name == media_name)
+    target.write_bytes(b"changed normalized media")
+
+    result = runner.run_until_pause(job_id)
+
+    assert result["status"] != StageStatus.COMPLETED.value
+    assert result["stages"]["normalize"]["generation"] == before + 1
+    assert result["stages"]["confirm_roles"]["status"] == StageStatus.PAUSED.value
+    assert result["stages"]["report"]["status"] == StageStatus.PENDING.value
+    assert not store.artifact_path(job_id, StageName.REPORT).exists()
 
 
 def test_retry_transcribe_preserves_upstream_audio_and_reaches_role_pause(tmp_path: Path) -> None:
@@ -619,6 +779,9 @@ def test_unexpected_failure_records_only_exception_class_and_reraises(tmp_path: 
         "message": "An unexpected pipeline error occurred.",
     }
     assert "private" not in row["error_json"]
+    assert not any(
+        thread.name.startswith(f"voxdelta-heartbeat-{job_id}") for thread in threading.enumerate()
+    )
 
 
 @pytest.mark.parametrize(

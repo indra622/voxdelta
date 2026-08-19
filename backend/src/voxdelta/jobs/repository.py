@@ -45,6 +45,12 @@ class JobRepository:
         self._claim_lease = timedelta(seconds=claim_lease_seconds)
         self._initialize_schema()
 
+    @property
+    def claim_lease_seconds(self) -> float:
+        """Expose the configured lease so runners can choose a shorter heartbeat interval."""
+
+        return self._claim_lease.total_seconds()
+
     def _initialize_schema(self) -> None:
         """Serialize creation and additive migrations across concurrent constructors."""
 
@@ -296,6 +302,28 @@ class JobRepository:
             )
             return StageClaim(job_id, stage, next_generation, token)
 
+    def renew_claim(self, claim: StageClaim) -> bool:
+        """Extend only the still-current running claim's lease."""
+
+        now = self._now().isoformat()
+        with self._connect() as database:
+            renewed = database.execute(
+                """
+                UPDATE stages SET claimed_at = ?
+                WHERE job_id = ? AND stage = ? AND status = ?
+                  AND generation = ? AND claim_token = ?
+                """,
+                (
+                    now,
+                    claim.job_id,
+                    claim.stage.value,
+                    StageStatus.RUNNING.value,
+                    claim.generation,
+                    claim.token,
+                ),
+            )
+            return renewed.rowcount == 1
+
     def publish_claimed_stage(
         self,
         claim: StageClaim,
@@ -357,11 +385,12 @@ class JobRepository:
             )
             if updated.rowcount != 1:
                 raise RuntimeError("stage claim changed while database write lock was held")
-            job_status = (
-                StageStatus.COMPLETED
-                if claim.stage == StageName.REPORT and status == StageStatus.COMPLETED
-                else status
-            )
+            if claim.stage == StageName.REPORT and status == StageStatus.COMPLETED:
+                job_status = StageStatus.COMPLETED
+            elif status == StageStatus.PAUSED:
+                job_status = StageStatus.PAUSED
+            else:
+                job_status = StageStatus.RUNNING
             database.execute(
                 "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?",
                 (job_status.value, now, claim.job_id),

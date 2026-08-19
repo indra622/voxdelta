@@ -164,6 +164,30 @@ def test_claim_stage_does_not_steal_a_live_claim_and_recovers_an_expired_claim(
     assert recovered.token != first.token
 
 
+def test_claim_renewal_extends_only_the_current_token_generation(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 19, tzinfo=UTC)
+    repository = JobRepository(
+        tmp_path / "voxdelta.sqlite3",
+        clock=lambda: now,
+        claim_lease_seconds=10,
+    )
+    job_id = repository.create_job("sample.wav")
+    original = repository.claim_stage(job_id, StageName.DIARIZE)
+    assert original is not None
+    first_timestamp = repository.get_job(job_id)["stages"]["diarize"]["claimed_at"]
+
+    now += timedelta(seconds=6)
+    assert repository.renew_claim(original)
+    renewed_timestamp = repository.get_job(job_id)["stages"]["diarize"]["claimed_at"]
+    assert renewed_timestamp != first_timestamp
+
+    now += timedelta(seconds=11)
+    recovered = repository.claim_stage(job_id, StageName.DIARIZE)
+    assert recovered is not None
+    assert not repository.renew_claim(original)
+    assert repository.get_job(job_id)["stages"]["diarize"]["claim_token"] == recovered.token
+
+
 def test_stale_claim_cannot_publish_or_change_current_stage_state(tmp_path: Path) -> None:
     now = datetime(2026, 8, 19, tzinfo=UTC)
     repository = JobRepository(
@@ -195,6 +219,52 @@ def test_stale_claim_cannot_publish_or_change_current_stage_state(tmp_path: Path
     assert row["status"] == "running"
     assert row["generation"] == current.generation
     assert row["claim_token"] == current.token
+
+
+@pytest.mark.parametrize(
+    ("stage", "stage_status", "expected_job_status"),
+    [
+        (StageName.DIARIZE, StageStatus.COMPLETED, StageStatus.RUNNING),
+        (StageName.CONFIRM_ROLES, StageStatus.PAUSED, StageStatus.PAUSED),
+        (StageName.REPORT, StageStatus.COMPLETED, StageStatus.COMPLETED),
+    ],
+)
+def test_claimed_publication_sets_only_terminal_or_paused_job_status(
+    stage: StageName,
+    stage_status: StageStatus,
+    expected_job_status: StageStatus,
+    tmp_path: Path,
+) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    job_id = repository.create_job("sample.wav")
+    claim = repository.claim_stage(job_id, stage)
+    assert claim is not None
+
+    assert repository.publish_claimed_stage(
+        claim,
+        status=stage_status,
+        artifact_path=f"{stage.value}.v1.json",
+        cache_key="a" * 64,
+        artifact_hash="b" * 64,
+        role_confirmed=False,
+        publish=lambda: None,
+    )
+
+    assert repository.get_job(job_id)["status"] == expected_job_status.value
+
+
+def test_claim_failure_sets_failed_job_status(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    job_id = repository.create_job("sample.wav")
+    claim = repository.claim_stage(job_id, StageName.DIARIZE)
+    assert claim is not None
+
+    assert repository.fail_claimed_stage(
+        claim,
+        {"code": "failed", "message": "public"},
+    )
+
+    assert repository.get_job(job_id)["status"] == StageStatus.FAILED.value
 
 
 def test_invalidate_stages_resets_exact_rows_and_job_status_atomically(tmp_path: Path) -> None:

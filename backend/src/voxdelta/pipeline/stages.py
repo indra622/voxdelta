@@ -46,6 +46,10 @@ UPSTREAM_STAGES: dict[StageName, tuple[StageName, ...]] = {
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _NON_IDENTIFIER = re.compile(r"[^a-zA-Z0-9]+")
+_CREDENTIAL_TOKENS = frozenset({"authorization", "key", "password", "secret", "token"})
+_COMPACT_CREDENTIAL_ALIASES = frozenset(
+    {"apikey", "accesstoken", "bearertoken", "clientsecret", "refreshtoken"}
+)
 
 
 def downstream_stages(stage: StageName) -> tuple[StageName, ...]:
@@ -70,13 +74,9 @@ def _canonical_cache_value(value: object) -> Any:
                 raise TypeError("cache configuration keys must be strings")
             separated = _CAMEL_BOUNDARY.sub("_", raw_key)
             normalized = _NON_IDENTIFIER.sub("_", separated).strip("_").casefold()
-            if (
-                normalized in {"authorization", "key", "token", "password", "secret"}
-                or normalized.endswith("_key")
-                or normalized.endswith("_token")
-                or normalized.endswith("_password")
-                or normalized.endswith("_secret")
-            ):
+            tokens = tuple(part for part in normalized.split("_") if part)
+            compact = "".join(tokens)
+            if _CREDENTIAL_TOKENS.intersection(tokens) or compact in _COMPACT_CREDENTIAL_ALIASES:
                 raise ValueError("credential-bearing cache configuration is not allowed")
             sanitized[raw_key] = _canonical_cache_value(item)
         return sanitized
@@ -113,7 +113,13 @@ def cache_key_for_stage(
 
 
 class StageArtifact(BaseModel):
-    """Metadata common to every on-disk pipeline JSON object."""
+    """Metadata common to every on-disk pipeline JSON object.
+
+    Cache keys and media digests detect application-level drift; they are not cryptographic
+    attestation. The SQLite database and job artifact directory are trusted local state
+    protected by operating-system user permissions. Coordinated same-user modification of
+    both is outside the MVP threat model.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -132,9 +138,34 @@ class StageArtifact(BaseModel):
         return self
 
 
+class MediaReference(BaseModel):
+    """A normalized media path bound to the exact bytes accepted by the pipeline."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    sha256: str = Field(pattern=_SHA256_PATTERN)
+
+
 class NormalizeArtifact(StageArtifact):
     stage: Literal[StageName.NORMALIZE] = StageName.NORMALIZE
     asset: AudioAsset
+    normalized_media: tuple[MediaReference, ...]
+    mixed_preview: MediaReference
+
+    @model_validator(mode="after")
+    def media_manifest_matches_asset(self) -> NormalizeArtifact:
+        if tuple(item.path for item in self.normalized_media) != self.asset.normalized_paths:
+            raise ValueError("normalized media manifest must match selected paths exactly")
+        if self.asset.channel_mode == "mixed" and (
+            len(self.normalized_media) != 1 or self.mixed_preview != self.normalized_media[0]
+        ):
+            raise ValueError("mixed media preview must match the selected normalized path")
+        if self.asset.channel_mode == "separate" and self.mixed_preview.path in {
+            item.path for item in self.normalized_media
+        }:
+            raise ValueError("separate media requires a distinct typed mixed preview")
+        return self
 
 
 class DiarizeArtifact(StageArtifact):

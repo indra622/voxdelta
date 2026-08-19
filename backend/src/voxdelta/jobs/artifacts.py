@@ -8,6 +8,9 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TypeVar
 
@@ -16,6 +19,11 @@ from pydantic import BaseModel
 
 from voxdelta.domain.models import StageName
 from voxdelta.jobs._ids import validate_job_id
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -29,6 +37,16 @@ _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
 _LINKED_JOB_DIRECTORY_ERROR = (
     "job directory beneath jobs root must not be a symlink or reparse point"
 )
+_OPERATION_LOCKS: dict[Path, threading.Lock] = {}
+_OPERATION_LOCKS_GUARD = threading.Lock()
+
+
+def _operation_process_lock(path: Path) -> threading.Lock:
+    """Return the process-wide fallback used when cross-process flock is unavailable."""
+
+    resolved = path.resolve()
+    with _OPERATION_LOCKS_GUARD:
+        return _OPERATION_LOCKS.setdefault(resolved, threading.Lock())
 
 
 def _is_link_like(path: Path) -> bool:
@@ -145,6 +163,46 @@ class ArtifactStore:
         """Return the validated job directory, creating it when necessary."""
 
         return self._job_path(job_id, create=True, require_directory=True)
+
+    @contextmanager
+    def operation_lock(self, job_id: str) -> Iterator[None]:
+        """Serialize one job's claim/reset transitions across runner processes.
+
+        POSIX uses ``flock`` on a validated job-local file. Platforms without ``fcntl``
+        retain process-wide per-path serialization but cannot promise cross-process locking.
+        """
+
+        directory = self.job_dir(job_id)
+        target = directory / ".operation.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        with _operation_process_lock(target):
+            if _is_link_like(target):
+                raise ValueError("job operation lock must not be a link")
+            try:
+                descriptor = os.open(target, flags, 0o600)
+            except OSError:
+                if _is_link_like(target):
+                    raise ValueError("job operation lock must not be a link") from None
+                raise
+            try:
+                opened = os.fstat(descriptor)
+                current = target.lstat()
+                if (
+                    _is_link_like(target)
+                    or target.resolve().parent != directory
+                    or not stat.S_ISREG(opened.st_mode)
+                    or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                ):
+                    raise ValueError("job operation lock must be a regular file")
+                os.fchmod(descriptor, 0o600)
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
 
     def write_model(self, job_id: str, stage: StageName, value: BaseModel) -> Path:
         """Atomically persist a model without dropping its version fields."""

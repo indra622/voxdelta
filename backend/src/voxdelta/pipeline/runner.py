@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
+import stat
 import tempfile
 import time
 import wave
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Lock, RLock
+from threading import Event, Lock, RLock, Thread
 from typing import TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -31,13 +33,14 @@ from voxdelta.domain.models import (
 )
 from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.logging import PipelineLogger
-from voxdelta.jobs.repository import JobRepository
+from voxdelta.jobs.repository import JobRepository, StageClaim
 from voxdelta.pipeline.stages import (
     ARTIFACT_MODELS,
     STAGE_ORDER,
     UPSTREAM_STAGES,
     DiarizeArtifact,
     EmotionArtifact,
+    MediaReference,
     NormalizeArtifact,
     ReportArtifact,
     RoleArtifact,
@@ -129,6 +132,10 @@ def _relevant_agent_ids(ordered: list[Utterance]) -> list[str]:
     ]
 
 
+def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
+
+
 class PipelineRunner:
     """Compose storage, providers, and deterministic analysis into resumable stages."""
 
@@ -145,6 +152,7 @@ class PipelineRunner:
         report_provider: ReportSummaryProvider | None = None,
         config: RunnerConfig | Mapping[str, Mapping[str, object]] | None = None,
         logger: PipelineLogger | None = None,
+        heartbeat_interval_seconds: float | None = None,
     ) -> None:
         self._repository = repository
         self._artifacts = artifacts
@@ -162,6 +170,14 @@ class PipelineRunner:
             )
         except ValidationError:
             raise ValueError("runner configuration contains unsupported fields or values") from None
+        heartbeat_interval = (
+            repository.claim_lease_seconds / 3
+            if heartbeat_interval_seconds is None
+            else heartbeat_interval_seconds
+        )
+        if not 0 < heartbeat_interval < repository.claim_lease_seconds:
+            raise ValueError("heartbeat interval must be positive and shorter than the claim lease")
+        self._heartbeat_interval = heartbeat_interval
         self._logger = logger or PipelineLogger(artifacts)
         self._locks: dict[str, RLock] = {}
         self._locks_guard = Lock()
@@ -169,6 +185,28 @@ class PipelineRunner:
     def _job_lock(self, job_id: str) -> RLock:
         with self._locks_guard:
             return self._locks.setdefault(job_id, RLock())
+
+    def _start_claim_heartbeat(self, claim: StageClaim) -> tuple[Event, Thread]:
+        """Start renewing one claim until its returned stop event is set."""
+
+        stopped = Event()
+
+        def heartbeat() -> None:
+            while not stopped.wait(self._heartbeat_interval):
+                try:
+                    if not self._repository.renew_claim(claim):
+                        return
+                except Exception:
+                    # Publication remains generation-fenced; retry transient renewal errors.
+                    continue
+
+        thread = Thread(
+            target=heartbeat,
+            name=f"voxdelta-heartbeat-{claim.job_id}-{claim.stage.value}",
+            daemon=True,
+        )
+        thread.start()
+        return stopped, thread
 
     def _provider(self, stage: StageName) -> ProviderProvenance | None:
         providers: dict[StageName, ProviderProvenance] = {
@@ -224,6 +262,51 @@ class PipelineRunner:
     def _read(self, job_id: str, stage: StageName, model: type[TArtifact]) -> TArtifact:
         return self._artifacts.read_model(job_id, stage, model)
 
+    def _hash_trusted_media(self, job_id: str, raw_path: str) -> str:
+        """Hash one regular, non-link file in a direct job audio generation."""
+
+        job_directory = self._artifacts.job_dir(job_id)
+        path = Path(raw_path)
+        if not path.is_absolute():
+            raise ValueError("normalized media path must be absolute")
+        generation = path.parent
+        if (
+            not generation.name.startswith("audio-")
+            or generation.parent != job_directory
+            or generation.is_symlink()
+            or not generation.is_dir()
+            or generation.resolve() != generation
+        ):
+            raise ValueError("normalized media must remain in one validated audio generation")
+        before = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(before.st_mode):
+            raise ValueError("normalized media must be a regular non-link file")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or _file_identity(opened) != _file_identity(before):
+                raise ValueError("normalized media changed while being opened")
+            digest = hashlib.sha256()
+            while chunk := os.read(descriptor, 1024 * 1024):
+                digest.update(chunk)
+            after = path.lstat()
+            if path.is_symlink() or _file_identity(after) != _file_identity(opened):
+                raise ValueError("normalized media changed while being hashed")
+            return digest.hexdigest()
+        finally:
+            os.close(descriptor)
+
+    def _normalize_media_are_valid(self, job_id: str, artifact: NormalizeArtifact) -> bool:
+        references = (*artifact.normalized_media, artifact.mixed_preview)
+        generations = {Path(item.path).parent for item in references}
+        if len(generations) != 1:
+            return False
+        return all(
+            self._hash_trusted_media(job_id, item.path) == item.sha256 for item in references
+        )
+
     @contextmanager
     def _emotion_clip(
         self,
@@ -234,14 +317,11 @@ class PipelineRunner:
         audio = asset.asset
         if not audio.normalized_paths:
             raise ValueError("normalized audio path is missing")
-        selected = Path(audio.normalized_paths[0])
-        preview = selected.parent / "mixed.wav" if audio.channel_mode == "separate" else selected
+        preview = Path(asset.mixed_preview.path)
         job_directory = self._artifacts.job_dir(job_id)
-        if preview.is_symlink() or not preview.is_file():
+        if self._hash_trusted_media(job_id, asset.mixed_preview.path) != asset.mixed_preview.sha256:
             raise ValueError("normalized mixed preview is unavailable")
         resolved_preview = preview.resolve()
-        if not resolved_preview.is_relative_to(job_directory):
-            raise ValueError("normalized mixed preview must remain inside the job directory")
         if (
             not math.isfinite(utterance.start)
             or not math.isfinite(utterance.end)
@@ -306,9 +386,7 @@ class PipelineRunner:
 
     def _artifact_semantics_are_valid(self, job_id: str, artifact: StageArtifact) -> bool:
         if isinstance(artifact, NormalizeArtifact):
-            return bool(artifact.asset.normalized_paths) and all(
-                Path(path).is_file() for path in artifact.asset.normalized_paths
-            )
+            return self._normalize_media_are_valid(job_id, artifact)
         if isinstance(artifact, DiarizeArtifact):
             ordered_segments = sorted(
                 artifact.segments,
@@ -455,9 +533,10 @@ class PipelineRunner:
 
     def _invalidate_from(self, job_id: str, stage: StageName) -> None:
         selected = downstream_stages(stage)
-        self._repository.invalidate_stages(job_id, selected)
-        for selected_stage in selected:
-            self._artifacts.delete_stage(job_id, selected_stage)
+        with self._artifacts.operation_lock(job_id):
+            self._repository.invalidate_stages(job_id, selected)
+            for selected_stage in selected:
+                self._artifacts.delete_stage(job_id, selected_stage)
 
     def _public_failure(self, stage: StageName, error: BaseException) -> PipelineValidationError:
         if isinstance(error, PipelineValidationError):
@@ -532,11 +611,30 @@ class PipelineRunner:
                 job_id,
                 channel_preference=cast(ChannelPreference, preference),
             )
+            normalized_media = tuple(
+                MediaReference(path=path, sha256=self._hash_trusted_media(job_id, path))
+                for path in asset.normalized_paths
+            )
+            mixed_path = (
+                str(Path(asset.normalized_paths[0]).parent / "mixed.wav")
+                if asset.channel_mode == "separate"
+                else asset.normalized_paths[0]
+            )
+            mixed_preview = (
+                normalized_media[0]
+                if asset.channel_mode == "mixed"
+                else MediaReference(
+                    path=mixed_path,
+                    sha256=self._hash_trusted_media(job_id, mixed_path),
+                )
+            )
             return NormalizeArtifact(
                 cache_key=cache_key,
                 upstream_hashes=upstream_hashes,
                 provider=provider,
                 asset=asset,
+                normalized_media=normalized_media,
+                mixed_preview=mixed_preview,
             )
         if stage == StageName.DIARIZE:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
@@ -717,10 +815,12 @@ class PipelineRunner:
         raise KeyError(stage)
 
     def _execute_stage(self, job_id: str, stage: StageName) -> bool:
-        claim = self._repository.claim_stage(job_id, stage)
+        with self._artifacts.operation_lock(job_id):
+            claim = self._repository.claim_stage(job_id, stage)
         if claim is None:
             return False
         started = time.monotonic()
+        heartbeat_stopped, heartbeat_thread = self._start_claim_heartbeat(claim)
         try:
             self._log(job_id, stage, "started", started)
             artifact = self._build_artifact(job_id, stage)
@@ -772,6 +872,9 @@ class PipelineRunner:
             )
             self._log(job_id, stage, "failed", started, error_class)
             raise
+        finally:
+            heartbeat_stopped.set()
+            heartbeat_thread.join()
 
     def _run_locked(self, job_id: str) -> dict[str, object]:
         for stage in STAGE_ORDER:
@@ -918,15 +1021,16 @@ class PipelineRunner:
                     "The paused role candidate metadata is invalid.",
                 )
             try:
-                published = self._repository.publish_role_confirmation(
-                    job_id,
-                    expected_generation=generation,
-                    expected_candidate_hash=candidate_hash,
-                    artifact_path=prepared.target.name,
-                    cache_key=cache_key,
-                    artifact_hash=prepared.content_hash,
-                    publish=prepared.publish,
-                )
+                with self._artifacts.operation_lock(job_id):
+                    published = self._repository.publish_role_confirmation(
+                        job_id,
+                        expected_generation=generation,
+                        expected_candidate_hash=candidate_hash,
+                        artifact_path=prepared.target.name,
+                        cache_key=cache_key,
+                        artifact_hash=prepared.content_hash,
+                        publish=prepared.publish,
+                    )
             finally:
                 prepared.discard()
             if not published:

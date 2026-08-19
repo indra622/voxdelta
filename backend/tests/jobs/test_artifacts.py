@@ -3,6 +3,9 @@ from __future__ import annotations
 import errno
 import json
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -57,6 +60,45 @@ def test_stage_artifact_hash_and_exact_deletion_do_not_touch_audio(tmp_path: Pat
     assert len(digest) == 64
     assert not report_path.exists()
     assert audio_generation.read_bytes() == b"normalized audio"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="cross-process flock is POSIX-specific")
+def test_job_operation_lock_serializes_separate_processes(tmp_path: Path) -> None:
+    jobs_root = tmp_path / "jobs"
+    store = ArtifactStore(jobs_root)
+    store.job_dir("j1")
+    marker = tmp_path / "child-acquired"
+    script = "\n".join(
+        (
+            "from pathlib import Path",
+            "from voxdelta.jobs.artifacts import ArtifactStore",
+            f"store = ArtifactStore(Path({str(jobs_root)!r}))",
+            "with store.operation_lock('j1'):",
+            f"    Path({str(marker)!r}).write_text('acquired')",
+        )
+    )
+
+    with store.operation_lock("j1"):
+        child = subprocess.Popen([sys.executable, "-c", script])
+        time.sleep(0.2)
+        assert not marker.exists()
+
+    assert child.wait(timeout=5) == 0
+    assert marker.read_text(encoding="utf-8") == "acquired"
+
+
+def test_job_operation_lock_rejects_a_linked_lock_file(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "jobs")
+    job_directory = store.job_dir("j1")
+    outside = tmp_path / "outside.lock"
+    outside.write_text("outside", encoding="utf-8")
+    (job_directory / ".operation.lock").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="operation lock"):
+        with store.operation_lock("j1"):
+            pytest.fail("linked operation lock was accepted")
+
+    assert outside.read_text(encoding="utf-8") == "outside"
 
 
 def test_artifact_write_replaces_from_a_temporary_in_the_target_directory(
