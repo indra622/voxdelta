@@ -8,6 +8,7 @@ import random
 from pathlib import Path
 from typing import Literal
 
+from voxdelta.analysis.emotions import map_operational_state
 from voxdelta.domain.models import (
     AnalysisReport,
     AudioAsset,
@@ -31,7 +32,6 @@ _MODEL_VERSION = "deterministic-v1"
 _SCHEMA_VERSION = "1"
 _FAKE_SEGMENT_COUNT = 6
 _FAKE_EMOTION_CONFIDENCE = 0.85
-_CONFIDENCE_THRESHOLD = 0.55
 _EMOTION_LABELS: tuple[EmotionLabel, ...] = (
     "happiness",
     "anger",
@@ -46,11 +46,6 @@ _NEGATIVE_EMOTION_LABELS: tuple[EmotionLabel, ...] = (
     "disgust",
     "fear",
     "sadness",
-)
-_DISSATISFIED_EMOTION_LABELS: tuple[EmotionLabel, ...] = (
-    "sadness",
-    "disgust",
-    "fear",
 )
 _TRANSCRIPT_LINES = (
     "안녕하세요. 문의 내용을 말씀해 주세요.",
@@ -76,26 +71,7 @@ def _derive_operational_state(
     probabilities: dict[EmotionLabel, float],
     confidence: float,
 ) -> OperationalState:
-    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
-        raise ValueError("confidence must be finite and between zero and one")
-
-    scores: tuple[tuple[OperationalState, float], ...] = (
-        ("satisfied", probabilities["happiness"]),
-        ("stable", probabilities["neutral"]),
-        (
-            "dissatisfied",
-            math.fsum(probabilities[label] for label in _DISSATISFIED_EMOTION_LABELS),
-        ),
-        ("escalated", probabilities["anger"]),
-    )
-    # max() keeps the first item on ties, making the specification order above the tie-break.
-    state = max(scores, key=lambda item: item[1])[0]
-    non_surprise_peak = max(
-        probabilities[label] for label in _EMOTION_LABELS if label != "surprise"
-    )
-    if probabilities["surprise"] >= non_surprise_peak or confidence < _CONFIDENCE_THRESHOLD:
-        return "uncertain"
-    return state
+    return map_operational_state(probabilities, confidence)
 
 
 class FakeDiarizationProvider(DiarizationProvider):
