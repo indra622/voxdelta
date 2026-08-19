@@ -959,6 +959,12 @@ class PipelineRunner:
             )
         return disclosures
 
+    def mark_unhandled_failure(self, job_id: str) -> bool:
+        """Best-effort terminalization for exceptions raised outside claimed execution."""
+
+        with self._job_lock(job_id), self._artifacts.operation_lock(job_id):
+            return self._repository.fail_unhandled_job(job_id)
+
     def role_candidate(self, job_id: str) -> RoleArtifact:
         """Return a cache-validated paused role candidate for public speaker selection."""
 

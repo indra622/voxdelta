@@ -27,6 +27,7 @@ def clear_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "VOXDELTA_DATABASE_PATH",
         "VOXDELTA_MAX_AUDIO_SECONDS",
         "VOXDELTA_MIN_AUDIO_SECONDS",
+        "VOXDELTA_MAX_UPLOAD_BYTES",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -51,6 +52,7 @@ def test_public_loader_reads_application_settings_and_ignores_credentials(
 
     assert settings.data_root == Path("/safe/data")
     assert settings.max_audio_seconds == 900
+    assert settings.max_upload_bytes > 0
 
 
 def test_process_environment_overrides_settings_env_file(

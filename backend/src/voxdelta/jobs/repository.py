@@ -445,6 +445,81 @@ class JobRepository:
             )
             return True
 
+    def fail_unhandled_job(self, job_id: str) -> bool:
+        """Fence active claims and persist one generic failure when no stage did so."""
+
+        validate_job_id(job_id)
+        terminal = {
+            StageStatus.PAUSED.value,
+            StageStatus.COMPLETED.value,
+            StageStatus.FAILED.value,
+            "deleting",
+        }
+        now = self._now().isoformat()
+        generic_error = json.dumps(
+            {"code": "pipeline_failed", "message": "The pipeline stage failed."}
+        )
+        with self._connect() as database:
+            database.execute("BEGIN IMMEDIATE")
+            job = database.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            if job["status"] in terminal:
+                return False
+            rows = {
+                str(row["stage"]): row
+                for row in database.execute(
+                    "SELECT stage, status FROM stages WHERE job_id = ?", (job_id,)
+                ).fetchall()
+            }
+            active = next(
+                (
+                    stage
+                    for stage in StageName
+                    if rows.get(stage.value) is not None
+                    and rows[stage.value]["status"] == StageStatus.RUNNING.value
+                ),
+                None,
+            )
+            if active is None:
+                active = next(
+                    (
+                        stage
+                        for stage in StageName
+                        if rows.get(stage.value) is not None
+                        and rows[stage.value]["status"] == StageStatus.PENDING.value
+                    ),
+                    None,
+                )
+            if active is None:
+                return False
+            for stage in StageName:
+                row = rows.get(stage.value)
+                if row is None:
+                    raise KeyError(f"{job_id}:{stage.value}")
+                previous = str(row["status"])
+                status = (
+                    StageStatus.PENDING.value if previous == StageStatus.RUNNING.value else previous
+                )
+                error_json = None
+                if stage == active:
+                    status = StageStatus.FAILED.value
+                    error_json = generic_error
+                database.execute(
+                    """
+                    UPDATE stages
+                    SET status = ?, error_json = ?, generation = generation + 1,
+                        claim_token = NULL, claimed_at = NULL
+                    WHERE job_id = ? AND stage = ?
+                    """,
+                    (status, error_json, job_id, stage.value),
+                )
+            database.execute(
+                "UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?",
+                (StageStatus.FAILED.value, now, job_id),
+            )
+            return True
+
     def publish_role_confirmation(
         self,
         job_id: str,

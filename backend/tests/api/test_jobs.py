@@ -12,7 +12,8 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from voxdelta.api.app import create_app
 from voxdelta.audio.service import AudioService
@@ -42,22 +43,49 @@ class BlockingDiarizer(FakeDiarizationProvider):
         return super().diarize(asset)
 
 
+class PreClaimFailRunner(PipelineRunner):
+    def run_until_pause(self, job_id: str) -> dict[str, object]:
+        del job_id
+        raise RuntimeError("private pre-claim failure /absolute/path")
+
+
+class FailingDeleteStore(ArtifactStore):
+    def delete_job(self, job_id: str) -> None:
+        del job_id
+        raise OSError("private artifact cleanup path")
+
+
+class FailingDeleteRepository(JobRepository):
+    def delete_job(self, job_id: str) -> None:
+        del job_id
+        raise RuntimeError("private database cleanup row")
+
+
 def build_harness(
     tmp_path: Path,
     *,
     diarizer: FakeDiarizationProvider | None = None,
+    max_upload_bytes: int | None = None,
+    artifacts_override: ArtifactStore | None = None,
+    repository_override: JobRepository | None = None,
+    runner_type: type[PipelineRunner] = PipelineRunner,
 ) -> tuple[FastAPI, JobRepository, ArtifactStore, PipelineRunner]:
     jobs_root = tmp_path / "jobs"
-    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
-    artifacts = ArtifactStore(jobs_root)
-    runner = PipelineRunner(
+    repository = repository_override or JobRepository(tmp_path / "voxdelta.sqlite3")
+    artifacts = artifacts_override or ArtifactStore(jobs_root)
+    runner = runner_type(
         repository,
         artifacts,
         AudioService(jobs_root, 60, 3600),
         diarization_provider=diarizer,
     )
     return (
-        create_app(repository=repository, artifacts=artifacts, runner=runner),
+        create_app(
+            repository=repository,
+            artifacts=artifacts,
+            runner=runner,
+            max_upload_bytes=max_upload_bytes,
+        ),
         repository,
         artifacts,
         runner,
@@ -88,6 +116,11 @@ async def upload(client: httpx.AsyncClient, *, diagnostic_capture: str = "false"
         files={"file": ("../../private-call.WAV", FIXTURE.read_bytes(), "audio/wav")},
         data={"diagnostic_capture": diagnostic_capture},
     )
+
+
+def job_count(repository: JobRepository) -> int:
+    with sqlite3.connect(repository.path) as database:
+        return int(database.execute("SELECT COUNT(*) FROM jobs").fetchone()[0])
 
 
 @pytest.mark.asyncio
@@ -152,6 +185,182 @@ async def test_upload_rejects_unsupported_suffix_without_creating_job(tmp_path: 
         assert database.execute("SELECT COUNT(*) FROM jobs").fetchone() == (0,)
     assert not artifacts.root.exists()
     assert "call.exe" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_upload_accepts_exact_byte_cap_and_reads_only_bounded_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read_sizes: list[int] = []
+    original_read = StarletteUploadFile.read
+
+    async def recording_read(self: UploadFile, size: int = -1) -> bytes:
+        read_sizes.append(size)
+        return await original_read(self, size)
+
+    monkeypatch.setattr(StarletteUploadFile, "read", recording_read)
+    cap = FIXTURE.stat().st_size
+    app, repository, _, _ = build_harness(tmp_path, max_upload_bytes=cap)
+
+    async with client_for(app) as client:
+        response = await upload(client)
+
+    assert response.status_code == 202
+    assert job_count(repository) == 1
+    assert read_sizes
+    assert set(read_sizes) == {1024 * 1024}
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_cap_plus_one_and_empty_and_cleans_partial_state(
+    tmp_path: Path,
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path, max_upload_bytes=8)
+    async with client_for(app) as client:
+        oversized = await client.post(
+            "/api/jobs",
+            files={"file": ("call.wav", b"123456789", "audio/wav")},
+        )
+        empty = await client.post(
+            "/api/jobs",
+            files={"file": ("call.wav", b"", "audio/wav")},
+        )
+
+    assert oversized.status_code == 413
+    assert oversized.json()["detail"]["code"] == "upload_too_large"
+    assert empty.status_code == 422
+    assert empty.json()["detail"]["code"] == "empty_upload"
+    assert job_count(repository) == 0
+    assert not artifacts.root.exists() or not list(artifacts.root.glob("[!.]*"))
+    assert str(tmp_path) not in oversized.text + empty.text
+
+
+@pytest.mark.asyncio
+async def test_upload_close_failure_is_sanitized_and_cleans_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_close = StarletteUploadFile.close
+    close_calls = 0
+
+    async def failing_close(self: UploadFile) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        await original_close(self)
+        if close_calls == 1:
+            raise OSError("private close /absolute/path")
+
+    monkeypatch.setattr(StarletteUploadFile, "close", failing_close)
+    app, repository, artifacts, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        response = await upload(client)
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "upload_failed",
+        "message": "The upload could not be stored safely.",
+    }
+    assert job_count(repository) == 0
+    assert not artifacts.root.exists() or not list(artifacts.root.glob("[!.]*"))
+    assert "private" not in response.text
+    assert str(tmp_path) not in response.text
+
+
+@pytest.mark.asyncio
+async def test_upload_cleanup_continues_after_source_unlink_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_unlink = Path.unlink
+
+    def failing_source_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self.name.startswith("source-upload-"):
+            raise OSError("private unlink path")
+        original_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    original_close = StarletteUploadFile.close
+    close_calls = 0
+
+    async def failing_close(self: UploadFile) -> None:
+        nonlocal close_calls
+        close_calls += 1
+        await original_close(self)
+        if close_calls == 1:
+            raise OSError("trigger cleanup")
+
+    monkeypatch.setattr(Path, "unlink", failing_source_unlink)
+    monkeypatch.setattr(StarletteUploadFile, "close", failing_close)
+    app, repository, artifacts, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        response = await upload(client)
+
+    assert response.status_code == 500
+    assert job_count(repository) == 0
+    assert not artifacts.root.exists() or not list(artifacts.root.glob("[!.]*"))
+
+
+@pytest.mark.asyncio
+async def test_upload_cleanup_continues_after_artifact_delete_failure(tmp_path: Path) -> None:
+    jobs_root = tmp_path / "jobs"
+    artifacts = FailingDeleteStore(jobs_root)
+    app, repository, _, _ = build_harness(
+        tmp_path,
+        max_upload_bytes=1,
+        artifacts_override=artifacts,
+    )
+    async with client_for(app) as client:
+        response = await client.post(
+            "/api/jobs",
+            files={"file": ("call.wav", b"12", "audio/wav")},
+        )
+
+    assert response.status_code == 413
+    assert job_count(repository) == 0
+    assert not list(jobs_root.rglob("source-upload-*"))
+
+
+@pytest.mark.asyncio
+async def test_upload_cleanup_repository_delete_failure_falls_back_to_failed_state(
+    tmp_path: Path,
+) -> None:
+    repository = FailingDeleteRepository(tmp_path / "voxdelta.sqlite3")
+    app, _, artifacts, _ = build_harness(
+        tmp_path,
+        max_upload_bytes=1,
+        repository_override=repository,
+    )
+    async with client_for(app) as client:
+        response = await client.post(
+            "/api/jobs",
+            files={"file": ("call.wav", b"12", "audio/wav")},
+        )
+
+    assert response.status_code == 413
+    with sqlite3.connect(repository.path) as database:
+        assert database.execute("SELECT status FROM jobs").fetchone() == ("failed",)
+    assert not list(artifacts.root.rglob("source-upload-*"))
+    assert "private" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_background_preclaim_failure_becomes_terminal_public_failure(tmp_path: Path) -> None:
+    app, repository, _, _ = build_harness(tmp_path, runner_type=PreClaimFailRunner)
+    async with client_for(app) as client:
+        created = await upload(client)
+        status = await client.get(created.json()["status_url"])
+
+    assert created.status_code == 202
+    assert status.status_code == 200
+    assert status.json()["status"] == "failed"
+    failed = [stage for stage in status.json()["stages"].values() if stage["status"] == "failed"]
+    assert failed == [
+        {
+            "status": "failed",
+            "error": {"code": "pipeline_failed", "message": "The pipeline stage failed."},
+        }
+    ]
+    assert all(stage["status"] != "running" for stage in status.json()["stages"].values())
+    assert "private" not in status.text
+    assert str(tmp_path) not in status.text
+    assert repository.get_job(created.json()["job_id"])["status"] == "failed"
 
 
 @pytest.mark.asyncio

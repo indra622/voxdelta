@@ -24,6 +24,7 @@ from voxdelta.api.schemas import (
     RoleCandidate,
     RoleConfirmation,
 )
+from voxdelta.config import Settings
 from voxdelta.domain.models import StageName
 from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.repository import JobRepository
@@ -37,6 +38,7 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 AUDIO_CHUNK_BYTES = 64 * 1024
 _SUPPORTED_SUFFIXES = frozenset({".wav", ".mp3", ".m4a"})
 _PUBLIC_STAGE_ERRORS = {
+    "pipeline_failed": "The pipeline stage failed.",
     "audio_rejected": "The uploaded audio was rejected.",
     "insufficient_emotion_coverage": (
         "There is not enough customer emotion coverage to generate a report."
@@ -44,6 +46,14 @@ _PUBLIC_STAGE_ERRORS = {
     "invalid_stage_output": "The pipeline stage produced invalid data.",
     "unsupported_speaker_count": "Exactly two observed speakers are required.",
 }
+
+
+class _UploadAdmissionError(ValueError):
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+        super().__init__(message)
 
 
 def _not_found() -> HTTPException:
@@ -64,7 +74,10 @@ def _safe_background_run(runner: PipelineRunner, job_id: str) -> None:
     try:
         runner.run_until_pause(job_id)
     except Exception:
-        # PipelineRunner has already persisted and logged a bounded public failure.
+        try:
+            runner.mark_unhandled_failure(job_id)
+        except Exception:
+            pass
         return
 
 
@@ -129,19 +142,30 @@ def _public_job(repository: JobRepository, runner: PipelineRunner, job_id: str) 
 def _cleanup_failed_upload(
     repository: JobRepository,
     artifacts: ArtifactStore,
-    runner: PipelineRunner,
     job_id: str,
+    descriptor: int | None,
+    destination: Path | None,
 ) -> None:
-    try:
-        runner.delete_job(job_id)
-    except (KeyError, OSError, ValueError):
+    if descriptor is not None:
         try:
-            repository.delete_job(job_id)
-        except (KeyError, ValueError):
+            os.close(descriptor)
+        except OSError:
             pass
+    if destination is not None:
         try:
-            artifacts.delete_job(job_id)
-        except (FileNotFoundError, ValueError):
+            destination.unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        artifacts.delete_job(job_id)
+    except Exception:
+        pass
+    try:
+        repository.delete_job(job_id)
+    except Exception:
+        try:
+            repository.fail_unhandled_job(job_id)
+        except Exception:
             pass
 
 
@@ -202,6 +226,7 @@ def create_app(
     repository: JobRepository | None = None,
     artifacts: ArtifactStore | None = None,
     runner: PipelineRunner | None = None,
+    max_upload_bytes: int | None = None,
 ) -> FastAPI:
     """Create an isolated application, or construct safe local production dependencies."""
 
@@ -212,6 +237,12 @@ def create_app(
         repository = dependencies.repository
         artifacts = dependencies.artifacts
         runner = dependencies.runner
+        if max_upload_bytes is None:
+            max_upload_bytes = dependencies.max_upload_bytes
+    if max_upload_bytes is None:
+        max_upload_bytes = Settings().max_upload_bytes
+    if max_upload_bytes <= 0:
+        raise ValueError("max_upload_bytes must be positive")
 
     app = FastAPI(title="VoxDelta", version="0.1.0")
 
@@ -237,30 +268,83 @@ def create_app(
         job_id = repository.create_job("", diagnostic_capture=diagnostic_capture)
         destination: Path | None = None
         descriptor: int | None = None
+        failure: BaseException | None = None
         try:
             directory = artifacts.job_dir(job_id)
             destination = directory / f"source-upload-{uuid4().hex}{suffix}"
             flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(destination, flags, 0o600)
-            with os.fdopen(descriptor, "wb") as output:
-                descriptor = None
-                while chunk := await uploaded_file.read(UPLOAD_CHUNK_BYTES):
-                    output.write(chunk)
-                output.flush()
-                os.fsync(output.fileno())
-                os.fchmod(output.fileno(), 0o600)
+            total = 0
+            while chunk := await uploaded_file.read(UPLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > max_upload_bytes:
+                    raise _UploadAdmissionError(
+                        413,
+                        "upload_too_large",
+                        "The uploaded file exceeds the configured size limit.",
+                    )
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("upload write made no progress")
+                    remaining = remaining[written:]
+            if total == 0:
+                raise _UploadAdmissionError(
+                    422,
+                    "empty_upload",
+                    "The uploaded audio file is empty.",
+                )
+            os.fsync(descriptor)
+            os.fchmod(descriptor, 0o600)
+            os.close(descriptor)
+            descriptor = None
+        except BaseException as error:
+            failure = error
+        try:
+            await uploaded_file.close()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+        if failure is not None:
+            _cleanup_failed_upload(
+                repository,
+                artifacts,
+                job_id,
+                descriptor,
+                destination,
+            )
+            if isinstance(failure, _UploadAdmissionError):
+                raise HTTPException(
+                    status_code=failure.status_code,
+                    detail={"code": failure.code, "message": failure.message},
+                ) from None
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "upload_failed",
+                    "message": "The upload could not be stored safely.",
+                },
+            ) from None
+        try:
             repository.update_source_name(job_id, str(destination))
             background_tasks.add_task(_safe_background_run, runner, job_id)
         except BaseException:
-            if descriptor is not None:
-                os.close(descriptor)
-            if destination is not None:
-                destination.unlink(missing_ok=True)
-            _cleanup_failed_upload(repository, artifacts, runner, job_id)
-            raise
-        finally:
-            await uploaded_file.close()
+            _cleanup_failed_upload(
+                repository,
+                artifacts,
+                job_id,
+                descriptor,
+                destination,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "upload_failed",
+                    "message": "The upload could not be stored safely.",
+                },
+            ) from None
         return JobCreated(job_id=job_id, status_url=f"/api/jobs/{job_id}")
 
     @app.get("/api/jobs/{job_id}", response_model=PublicJob)
