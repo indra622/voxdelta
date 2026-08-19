@@ -659,8 +659,13 @@ class PipelineRunner:
                 Path(source_name),
                 job_id,
                 channel_preference=cast(ChannelPreference, preference),
+                hold_generation_lease=True,
             )
-            return self._normalize_artifact(job_id, asset, cache_key, upstream_hashes)
+            try:
+                return self._normalize_artifact(job_id, asset, cache_key, upstream_hashes)
+            except BaseException:
+                self._audio.release_generation_lease(asset)
+                raise
         if stage == StageName.DIARIZE:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
             self._diagnostic(
@@ -891,6 +896,23 @@ class PipelineRunner:
         )
         self._artifacts.remove_unreferenced_audio_generations(job_id, keep)
 
+    def _gc_against_current_normalize(self, job_id: str) -> None:
+        """Collect a rejected worker's media against the committed normalize row."""
+
+        row = _stage_rows(self._repository.get_job(job_id))[StageName.NORMALIZE.value]
+        if row.get("status") != StageStatus.COMPLETED.value:
+            return
+        try:
+            artifact = self._artifacts.read_model(
+                job_id,
+                StageName.NORMALIZE,
+                NormalizeArtifact,
+            )
+            artifact_hash = self._artifacts.content_hash(job_id, StageName.NORMALIZE)
+        except (OSError, TypeError, ValueError, ValidationError):
+            return
+        self._gc_normalized_generations_if_current(job_id, artifact, artifact_hash)
+
     def admit_prepared_audio(
         self,
         job_id: str,
@@ -903,9 +925,15 @@ class PipelineRunner:
             claim = self._repository.claim_stage(job_id, StageName.NORMALIZE)
             if claim is None:
                 return False
+            asset: AudioAsset | None = None
             try:
                 cache_key, upstream_hashes = self._cache_key(job_id, StageName.NORMALIZE)
-                asset = self._audio.publish_prepared(prepared_audio, source_path, job_id)
+                asset = self._audio.publish_prepared(
+                    prepared_audio,
+                    source_path,
+                    job_id,
+                    hold_generation_lease=True,
+                )
                 artifact = self._normalize_artifact(
                     job_id,
                     asset,
@@ -945,6 +973,9 @@ class PipelineRunner:
                     {"code": "audio_rejected", "message": "The uploaded audio was rejected."},
                 )
                 raise
+            finally:
+                if asset is not None:
+                    self._audio.release_generation_lease(asset)
 
     def preflight_audio(self, upload_path: Path) -> PreparedAudio:
         """Decode one private staged upload using the configured normalize policy."""
@@ -964,6 +995,8 @@ class PipelineRunner:
             return False
         started = time.monotonic()
         heartbeat_stopped, heartbeat_thread = self._start_claim_heartbeat(claim)
+        artifact: StageArtifact | None = None
+        normalize_lease_released = False
         try:
             self._log(job_id, stage, "started", started)
             artifact = self._build_artifact(job_id, stage)
@@ -987,6 +1020,11 @@ class PipelineRunner:
             finally:
                 prepared.discard()
             if not published:
+                if isinstance(artifact, NormalizeArtifact):
+                    self._audio.release_generation_lease(artifact.asset)
+                    normalize_lease_released = True
+                    with self._artifacts.operation_lock(job_id):
+                        self._gc_against_current_normalize(job_id)
                 return False
             if stage == StageName.NORMALIZE and isinstance(artifact, NormalizeArtifact):
                 with self._artifacts.operation_lock(job_id):
@@ -1023,6 +1061,8 @@ class PipelineRunner:
             self._log(job_id, stage, "failed", started, error_class)
             raise
         finally:
+            if isinstance(artifact, NormalizeArtifact) and not normalize_lease_released:
+                self._audio.release_generation_lease(artifact.asset)
             heartbeat_stopped.set()
             heartbeat_thread.join()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -270,6 +271,13 @@ async def test_job_routes_require_capability_and_reject_untrusted_host_or_origin
     runner = PipelineRunner(repository, artifacts, AudioService(jobs_root, 60, 3600))
     with pytest.raises(ValueError, match="capability token"):
         create_app(repository=repository, artifacts=artifacts, runner=runner)
+    with pytest.raises(ValueError, match="at least 32 ASCII"):
+        create_app(
+            repository=repository,
+            artifacts=artifacts,
+            runner=runner,
+            api_capability_token=SecretStr("x" * 31),
+        )
     app = create_app(
         repository=repository,
         artifacts=artifacts,
@@ -445,6 +453,29 @@ async def test_openapi_documents_uniform_request_validation_envelope(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_openapi_marks_every_job_operation_with_capability_header_security(
+    tmp_path: Path,
+) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        schema = (await client.get("/openapi.json")).json()
+
+    assert schema["components"]["securitySchemes"]["VoxDeltaCapability"] == {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-VoxDelta-Token",
+    }
+    for path, path_item in schema["paths"].items():
+        if not path.startswith("/api/jobs"):
+            continue
+        for operation in path_item.values():
+            if isinstance(operation, dict) and "responses" in operation:
+                assert operation["security"] == [{"VoxDeltaCapability": []}]
+    assert "security" not in schema["paths"]["/api/config/providers"]["get"]
+
+
+@pytest.mark.asyncio
 async def test_openapi_exactly_documents_report_audio_and_public_error_contracts(
     tmp_path: Path,
 ) -> None:
@@ -606,6 +637,75 @@ async def test_upload_reuses_preflight_normalization_without_decoding_twice(
 
     assert response.status_code == 202
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_preflight_does_not_block_get_and_cancellation_cleans_all_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import voxdelta.audio.service as audio_module
+
+    entered = threading.Event()
+    release = threading.Event()
+    original = audio_module._normalize_mixed
+
+    def block_decode(source: Path, target: Path) -> None:
+        entered.set()
+        assert release.wait(timeout=5)
+        original(source, target)
+
+    monkeypatch.setattr(audio_module, "_normalize_mixed", block_decode)
+    app, repository, artifacts, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        upload_task = asyncio.create_task(upload(client))
+        assert await asyncio.to_thread(entered.wait, 5)
+        providers = await asyncio.wait_for(client.get("/api/config/providers"), timeout=0.5)
+        upload_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await upload_task
+
+    assert providers.status_code == 200
+    assert job_count(repository) == 0
+    if artifacts.root.exists():
+        assert not list((artifacts.root / ".incoming").glob("*"))
+        assert not [path for path in artifacts.root.iterdir() if len(path.name) == 32]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="active workspace flock is POSIX-specific")
+def test_reconciliation_removes_only_stale_unlocked_ingest_workspaces(tmp_path: Path) -> None:
+    import fcntl
+
+    _, repository, artifacts, runner = build_harness(tmp_path)
+    incoming = artifacts.root / ".incoming"
+    incoming.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stale = incoming / ".ingest-stale"
+    active = incoming / ".ingest-active"
+    stale.mkdir()
+    active.mkdir()
+    (stale / ".lease").write_bytes(b"")
+    active_lease = active / ".lease"
+    active_lease.write_bytes(b"")
+    os.utime(stale, (0, 0))
+    os.utime(active, (0, 0))
+    descriptor = os.open(active_lease, os.O_RDWR)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        reconcile_local_state(
+            repository,
+            artifacts,
+            runner,
+            lease_seconds=10,
+            now=1000,
+            schedule=lambda _: None,
+        )
+    finally:
+        os.close(descriptor)
+
+    assert not stale.exists()
+    assert active.is_dir()
 
 
 @pytest.mark.asyncio

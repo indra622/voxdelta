@@ -169,6 +169,44 @@ def _stale_incoming_ownership(path: Path) -> Iterator[bool]:
                     del _INCOMING_OWNERS[key]
 
 
+@contextmanager
+def _exclusive_posix_lease(path: Path) -> Iterator[bool]:
+    """Own one regular no-follow lease file, or fail closed off POSIX."""
+
+    if fcntl is None:
+        yield False
+        return
+    descriptor = -1
+    try:
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            current = path.lstat()
+        except (FileNotFoundError, OSError):
+            yield False
+            return
+        if (
+            _is_link_like(path)
+            or not stat.S_ISREG(opened.st_mode)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            yield False
+            return
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                yield False
+                return
+            raise
+        yield True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _is_link_like(path: Path) -> bool:
     """Detect symlinks and Windows reparse points without following them."""
 
@@ -637,6 +675,68 @@ class ArtifactStore:
             candidates.append(directory.name)
         return tuple(sorted(candidates))
 
+    def remove_stale_ingest_workspaces(self, *, lease_seconds: float, now: float) -> int:
+        """Remove expired abandoned decodes while preserving every locked active workspace.
+
+        Cross-process lease inspection uses ``flock``. Platforms without ``fcntl`` fail closed
+        and retain workspaces because they cannot distinguish a crashed owner from an active one.
+        """
+
+        if lease_seconds <= 0:
+            raise ValueError("reconciliation lease must be positive")
+        if fcntl is None or not self.root.is_dir() or _is_link_like(self.root):
+            return 0
+        parents: list[Path] = []
+        incoming = self._control_directory(
+            ".incoming",
+            create=False,
+            error_message=_INCOMING_VALIDATION_ERROR,
+        )
+        if incoming.is_dir():
+            parents.append(incoming)
+        for candidate in self.root.iterdir():
+            try:
+                validate_canonical_job_id(candidate.name)
+                metadata = candidate.lstat()
+            except (OSError, ValueError):
+                continue
+            if not _is_link_like(candidate) and stat.S_ISDIR(metadata.st_mode):
+                parents.append(candidate)
+
+        removed = 0
+        for parent in parents:
+            for workspace in parent.iterdir():
+                if not workspace.name.startswith(".ingest-"):
+                    continue
+                try:
+                    metadata = workspace.lstat()
+                except OSError:
+                    continue
+                if (
+                    _is_link_like(workspace)
+                    or not stat.S_ISDIR(metadata.st_mode)
+                    or now - metadata.st_mtime < lease_seconds
+                ):
+                    continue
+                with _exclusive_posix_lease(workspace / ".lease") as acquired:
+                    if not acquired:
+                        continue
+                    try:
+                        current = workspace.lstat()
+                    except OSError:
+                        continue
+                    if (
+                        _is_link_like(workspace)
+                        or not stat.S_ISDIR(current.st_mode)
+                        or now - current.st_mtime < lease_seconds
+                    ):
+                        continue
+                    shutil.rmtree(workspace)
+                    removed += 1
+            if removed:
+                _fsync_directory(parent)
+        return removed
+
     def canonical_source_exists(self, job_id: str, source_name: str) -> bool:
         """Validate one adopted source path without following links."""
 
@@ -686,13 +786,24 @@ class ArtifactStore:
                 continue
             if _is_link_like(candidate) or not stat.S_ISDIR(metadata.st_mode):
                 continue
-            try:
-                shutil.rmtree(candidate)
-                removed += 1
-            except OSError:
-                # Open descriptors remain valid on POSIX. Windows may defer cleanup until a
-                # later retry once active preview handles close.
-                continue
+            lease = candidate / ".lease"
+            if lease.exists() or _is_link_like(lease):
+                with _exclusive_posix_lease(lease) as acquired:
+                    if not acquired:
+                        continue
+                    try:
+                        shutil.rmtree(candidate)
+                        removed += 1
+                    except OSError:
+                        continue
+            else:
+                try:
+                    shutil.rmtree(candidate)
+                    removed += 1
+                except OSError:
+                    # Open descriptors remain valid on POSIX. Windows may defer cleanup until a
+                    # later retry once active preview handles close.
+                    continue
         if removed:
             _fsync_directory(directory)
         return removed

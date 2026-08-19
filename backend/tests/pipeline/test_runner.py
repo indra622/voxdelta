@@ -167,6 +167,31 @@ class ClipSpyEmotion(FakeEmotionProvider):
         return super().analyze(utterance_id, audio_path, transcript)
 
 
+class LateNormalizeAudioService(AudioService):
+    def __init__(self, jobs_root: Path) -> None:
+        super().__init__(jobs_root, 60, 3600)
+        self.published = threading.Event()
+        self.release = threading.Event()
+
+    def ingest(  # type: ignore[no-untyped-def]
+        self,
+        upload_path: Path,
+        job_id: str,
+        channel_preference="auto",
+        *,
+        hold_generation_lease=False,
+    ):
+        asset = super().ingest(
+            upload_path,
+            job_id,
+            channel_preference=channel_preference,
+            hold_generation_lease=hold_generation_lease,
+        )
+        self.published.set()
+        assert self.release.wait(timeout=5)
+        return asset
+
+
 def _harness(
     tmp_path: Path,
     *,
@@ -519,6 +544,32 @@ def test_retry_fences_a_blocked_worker_before_it_can_overwrite_new_output(
     assert not any(
         thread.name.startswith(f"voxdelta-heartbeat-{job_id}") for thread in threading.enumerate()
     )
+
+
+def test_late_stale_normalize_publication_garbage_collects_its_generation(
+    tmp_path: Path,
+) -> None:
+    _, repository, store, job_id = _harness(tmp_path)
+    late_audio = LateNormalizeAudioService(store.root)
+    stale_runner = PipelineRunner(repository, store, late_audio)
+    current_runner = PipelineRunner(repository, store, AudioService(store.root, 60, 3600))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_future = executor.submit(stale_runner.retry, job_id, StageName.NORMALIZE)
+        assert late_audio.published.wait(timeout=5)
+        current = current_runner.retry(job_id, StageName.NORMALIZE)
+        assert current["stages"]["confirm_roles"]["status"] == "paused"
+        expected = store.read_model(job_id, StageName.NORMALIZE, NormalizeArtifact)
+        expected_generation = Path(expected.asset.normalized_paths[0]).parent
+        late_audio.release.set()
+        stale_future.result(timeout=5)
+
+    generations = [
+        path
+        for path in store.job_dir(job_id).iterdir()
+        if path.is_dir() and path.name.startswith("audio-")
+    ]
+    assert generations == [expected_generation]
 
 
 def test_reset_holds_job_operation_lock_through_exact_artifact_deletion(

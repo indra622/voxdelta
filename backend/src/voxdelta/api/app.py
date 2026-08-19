@@ -15,9 +15,19 @@ from typing import Annotated, Any, BinaryIO, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Security,
+    UploadFile,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.security import APIKeyHeader
 from pydantic import SecretStr
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -61,6 +71,11 @@ _PUBLIC_STAGE_ERRORS = {
     "unsupported_speaker_count": "Exactly two observed speakers are required.",
 }
 _CAPABILITY_HEADER = b"x-voxdelta-token"
+_CAPABILITY_SECURITY = APIKeyHeader(
+    name="X-VoxDelta-Token",
+    scheme_name="VoxDeltaCapability",
+    auto_error=False,
+)
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
@@ -454,6 +469,10 @@ def reconcile_local_state(
     """Reconcile stale admission state and recover pristine jobs in this local process."""
 
     current_time = time() if now is None else now
+    artifacts.remove_stale_ingest_workspaces(
+        lease_seconds=lease_seconds,
+        now=current_time,
+    )
     artifacts.remove_stale_incoming_uploads(
         lease_seconds=lease_seconds,
         now=current_time,
@@ -529,8 +548,15 @@ def create_app(
         raise ValueError("reconciliation_lease_seconds must be positive")
     if max_active_jobs <= 0:
         raise ValueError("max_active_jobs must be positive")
-    if not api_capability_token.get_secret_value():
-        raise ValueError("api capability token must not be empty")
+    raw_capability_token = api_capability_token.get_secret_value()
+    if (
+        len(raw_capability_token) < 32
+        or not raw_capability_token.isascii()
+        or any(character.isspace() for character in raw_capability_token)
+    ):
+        raise ValueError(
+            "api capability token must contain at least 32 ASCII characters without whitespace"
+        )
 
     recovery_tasks: set[asyncio.Task[None]] = set()
 
@@ -615,6 +641,7 @@ def create_app(
         "/api/jobs",
         status_code=202,
         response_model=JobCreated,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
         responses={
             **_error_responses(400, 401, 403, 413, 422, 429, 500),
         },
@@ -687,8 +714,18 @@ def create_app(
             ) from None
         assert incoming is not None
         prepared_audio: PreparedAudio | None = None
+        preflight_task = asyncio.create_task(asyncio.to_thread(runner.preflight_audio, incoming))
         try:
-            prepared_audio = runner.preflight_audio(incoming)
+            prepared_audio = await asyncio.shield(preflight_task)
+        except asyncio.CancelledError:
+            try:
+                late_prepared = await preflight_task
+            except BaseException:
+                pass
+            else:
+                late_prepared.discard()
+            _cleanup_incoming_upload(artifacts, None, incoming)
+            raise
         except AudioRejected:
             _cleanup_incoming_upload(artifacts, None, incoming)
             raise HTTPException(
@@ -791,6 +828,7 @@ def create_app(
     @app.get(
         "/api/jobs/{job_id}",
         response_model=PublicJob,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
         responses=_error_responses(400, 401, 403, 404, 422, 500),
     )
     def get_job(job_id: str) -> PublicJob:
@@ -799,6 +837,7 @@ def create_app(
     @app.post(
         "/api/jobs/{job_id}/roles",
         response_model=PublicJob,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
         responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
     )
     def confirm_roles(job_id: str, confirmation: RoleConfirmation) -> PublicJob:
@@ -817,6 +856,7 @@ def create_app(
     @app.post(
         "/api/jobs/{job_id}/retry",
         response_model=PublicJob,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
         responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
     )
     def retry(job_id: str, request: RetryRequest) -> PublicJob:
@@ -835,6 +875,7 @@ def create_app(
     @app.get(
         "/api/jobs/{job_id}/report",
         response_model=AnalysisReport,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
         responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
     )
     def report(job_id: str) -> AnalysisReport:
@@ -853,6 +894,7 @@ def create_app(
     @app.get(
         "/api/jobs/{job_id}/audio",
         response_class=StreamingResponse,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
         responses={
             200: {"description": "Full normalized preview", "content": _WAV_CONTENT},
             206: {"description": "Partial normalized preview", "content": _WAV_CONTENT},
@@ -924,6 +966,7 @@ def create_app(
     @app.delete(
         "/api/jobs/{job_id}",
         status_code=204,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
         responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
     )
     def delete_job(job_id: str) -> Response:

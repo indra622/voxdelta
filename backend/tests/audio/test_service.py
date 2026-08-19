@@ -464,6 +464,24 @@ def test_ingest_maps_normalization_failures_to_safe_error_and_cleans_partial_out
     assert list((tmp_path / "jobs" / "j1").iterdir()) == []
 
 
+def test_ingest_unexpected_decode_exception_cleans_workspace_and_reraises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_unexpectedly(source: Path, target: Path) -> None:
+        del source, target
+        raise RuntimeError("unexpected private decoder failure")
+
+    monkeypatch.setattr(service_module, "_normalize_mixed", fail_unexpectedly)
+
+    with pytest.raises(RuntimeError, match="unexpected private decoder failure"):
+        AudioService(tmp_path / "jobs", 60, 3600).ingest(MONO_FIXTURE, "j1")
+
+    job_dir = tmp_path / "jobs" / "j1"
+    assert job_dir.is_dir()
+    assert list(job_dir.iterdir()) == []
+
+
 def test_ingest_uses_one_staged_snapshot_when_final_source_path_is_swapped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

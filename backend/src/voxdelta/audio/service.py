@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import wave
 from array import array
 from collections.abc import Sequence
@@ -22,6 +23,11 @@ from uuid import uuid4
 
 from voxdelta.domain.models import AudioAsset
 from voxdelta.jobs.artifacts import ArtifactStore
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback keeps process ownership only
+    fcntl = None  # type: ignore[assignment]
 
 ChannelPreference = Literal["auto", "mixed", "separate"]
 
@@ -49,11 +55,46 @@ class PreparedAudio:
     channels: int
     channel_mode: Literal["mixed", "separate"]
     normalized_names: tuple[str, ...]
+    lease_descriptor: int
     published: bool = False
 
     def discard(self) -> None:
+        """Release the workspace lease and remove media that was never published."""
+
+        if self.lease_descriptor >= 0:
+            _release_workspace_lease(self.workspace, self.lease_descriptor)
+            self.lease_descriptor = -1
         if not self.published and self.workspace.exists() and not self.workspace.is_symlink():
             shutil.rmtree(self.workspace, ignore_errors=True)
+
+
+def _release_workspace_lease(workspace: Path, descriptor: int) -> None:
+    try:
+        (workspace / ".lease").unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _create_ingest_workspace(parent: Path) -> tuple[Path, int]:
+    workspace = Path(tempfile.mkdtemp(dir=parent, prefix=".ingest-"))
+    lease = workspace / ".lease"
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(lease, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+        if fcntl is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return workspace, descriptor
+    except BaseException:
+        if descriptor >= 0:
+            _release_workspace_lease(workspace, descriptor)
+        shutil.rmtree(workspace, ignore_errors=True)
+        raise
 
 
 def _is_link_like(metadata: os.stat_result) -> bool:
@@ -367,6 +408,8 @@ class AudioService:
         self._store = ArtifactStore(jobs_root)
         self._min_seconds = min_seconds
         self._max_seconds = max_seconds
+        self._generation_leases: dict[Path, int] = {}
+        self._generation_leases_lock = threading.Lock()
 
     def _prepare(
         self,
@@ -381,17 +424,19 @@ class AudioService:
         if upload_path.suffix.lower() not in _ALLOWED_EXTENSIONS:
             raise AudioRejected("unsupported extension")
         workspace: Path | None = None
+        lease_descriptor = -1
         temporary_paths: list[Path] = []
+        prepared = False
 
         try:
             if source_file is None:
                 with _open_trusted_source(upload_path) as opened_source:
-                    workspace = Path(tempfile.mkdtemp(dir=workspace_parent, prefix=".ingest-"))
+                    workspace, lease_descriptor = _create_ingest_workspace(workspace_parent)
                     staged_source, sha256 = _stage_source(
                         opened_source, workspace, upload_path.suffix
                     )
             else:
-                workspace = Path(tempfile.mkdtemp(dir=workspace_parent, prefix=".ingest-"))
+                workspace, lease_descriptor = _create_ingest_workspace(workspace_parent)
                 staged_source, sha256 = _stage_source(source_file, workspace, upload_path.suffix)
 
             _, channels, is_stereo = _probe(staged_source)
@@ -446,18 +491,15 @@ class AudioService:
             for name in dict.fromkeys(output_names):
                 _fsync_file(workspace / name)
             _fsync_directory(workspace)
-        except AudioRejected:
-            _unlink_all(temporary_paths)
-            if workspace is not None:
-                shutil.rmtree(workspace, ignore_errors=True)
-            raise
+            prepared = True
         except OSError:
-            _unlink_all(temporary_paths)
-            if workspace is not None:
-                shutil.rmtree(workspace, ignore_errors=True)
             raise AudioRejected(_DECODABILITY_ERROR) from None
         finally:
             _unlink_all(temporary_paths)
+            if workspace is not None and not prepared:
+                if lease_descriptor >= 0:
+                    _release_workspace_lease(workspace, lease_descriptor)
+                shutil.rmtree(workspace, ignore_errors=True)
         if workspace is None:
             raise AudioRejected(_DECODABILITY_ERROR)
         return PreparedAudio(
@@ -468,6 +510,7 @@ class AudioService:
             channels=channels,
             channel_mode=selected_mode,
             normalized_names=normalized_names,
+            lease_descriptor=lease_descriptor,
         )
 
     def preflight(
@@ -484,6 +527,8 @@ class AudioService:
         prepared: PreparedAudio,
         upload_path: Path,
         job_id: str,
+        *,
+        hold_generation_lease: bool = False,
     ) -> AudioAsset:
         """Atomically publish a preflighted generation beneath one validated job."""
 
@@ -499,6 +544,14 @@ class AudioService:
             raise AudioRejected(_DECODABILITY_ERROR) from None
         prepared.workspace = generation
         prepared.published = True
+        if hold_generation_lease:
+            with self._generation_leases_lock:
+                if generation in self._generation_leases:
+                    raise RuntimeError("audio generation lease already exists")
+                self._generation_leases[generation] = prepared.lease_descriptor
+                prepared.lease_descriptor = -1
+        else:
+            prepared.discard()
         normalized_paths = tuple(str(generation / name) for name in prepared.normalized_names)
 
         return AudioAsset(
@@ -516,6 +569,8 @@ class AudioService:
         upload_path: Path,
         job_id: str,
         channel_preference: ChannelPreference = "auto",
+        *,
+        hold_generation_lease: bool = False,
     ) -> AudioAsset:
         """Validate an upload and return metadata for its selected normalized channel mode."""
 
@@ -532,9 +587,29 @@ class AudioService:
         try:
             if self._store.job_dir(job_id) != job_directory:
                 raise ValueError("job directory changed while audio was being normalized")
-            return self.publish_prepared(prepared, upload_path, job_id)
+            return self.publish_prepared(
+                prepared,
+                upload_path,
+                job_id,
+                hold_generation_lease=hold_generation_lease,
+            )
         finally:
             prepared.discard()
+
+    def release_generation_lease(self, asset: AudioAsset) -> None:
+        """Release a normalized generation only after its stage publication is resolved."""
+
+        generation = Path(asset.normalized_paths[0]).parent
+        with self._generation_leases_lock:
+            descriptor = self._generation_leases.pop(generation, None)
+        if descriptor is None:
+            return
+        _release_workspace_lease(generation, descriptor)
+        if generation.is_dir():
+            try:
+                _fsync_directory(generation)
+            except OSError:
+                pass
 
 
 __all__ = ["AudioRejected", "AudioService", "ChannelPreference", "PreparedAudio"]

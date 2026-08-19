@@ -66,8 +66,8 @@ Application settings are read from `VOXDELTA_` process-environment variables. Uv
   `300`.
 - `VOXDELTA_MAX_ACTIVE_JOBS`: maximum incomplete jobs admitted at once; default `8`.
 - `VOXDELTA_API_CAPABILITY_TOKEN`: per-launch local API capability. Supply a fresh high-entropy
-  value in the process environment; it is held as a secret in memory and is never logged or
-  persisted by VoxDelta.
+  value of at least 32 ASCII characters without whitespace in the process environment; it is held
+  as a secret in memory and is never logged or persisted by VoxDelta.
 
 The upload middleware separately caps the complete multipart request at the configured raw-file
 limit plus 64 KiB of multipart overhead. The stored file itself may never exceed the exact
@@ -87,8 +87,9 @@ Open <http://127.0.0.1:8000/docs> for the generated OpenAPI interface. Binding t
 keeps the development service off external network interfaces. Every `/api/jobs...` request must
 also send `X-VoxDelta-Token: $VOXDELTA_API_CAPABILITY_TOKEN`. Strict local `Host` and `Origin`
 checks block DNS-rebinding and drive-by browser requests; the custom token header is intentionally
-not a CORS-simple request header. `GET /api/config/providers`, `/docs`, and `/openapi.json` contain
-no job data and do not require the capability.
+not a CORS-simple request header. In Swagger UI, select **Authorize** and enter the same token.
+`GET /api/config/providers`, `/docs`, and `/openapi.json` contain no job data and do not require
+the capability.
 
 ## HTTP API
 
