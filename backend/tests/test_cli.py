@@ -19,7 +19,8 @@ def isolated_backend(tmp_path: Path, env_content: str, mode: int = 0o600) -> Pat
     shutil.copy2(BACKEND / "scripts" / "check_credentials.py", backend / "scripts")
     env_file = backend / ".env"
     env_file.write_text(env_content, encoding="utf-8")
-    env_file.chmod(mode)
+    if os.name == "posix":
+        env_file.chmod(mode)
     return backend
 
 
@@ -38,7 +39,6 @@ def run_check(backend: Path, cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permission modes are required")
 def test_cli_prints_only_safe_statuses_and_succeeds_from_another_cwd(tmp_path: Path) -> None:
     secrets = ("hf-cli-secret", "gemini-cli-secret")
     backend = isolated_backend(
@@ -60,7 +60,6 @@ def test_cli_prints_only_safe_statuses_and_succeeds_from_another_cwd(tmp_path: P
     assert all(secret not in result.stdout + result.stderr for secret in secrets)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permission modes are required")
 def test_cli_returns_one_when_a_required_value_is_empty(tmp_path: Path) -> None:
     backend = isolated_backend(
         tmp_path,
