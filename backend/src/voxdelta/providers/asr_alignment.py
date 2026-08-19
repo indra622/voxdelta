@@ -69,6 +69,8 @@ def validated_words(
             previous = word
     except ProviderError:
         raise
+    except TimeoutError:
+        raise ProviderError("provider_timeout") from None
     except Exception:
         raise ProviderError("invalid_provider_output") from None
     return words
@@ -89,7 +91,15 @@ def _validated_segments(segments: list[SpeakerSegment], duration: float) -> list
         for segment in ordered
     ):
         raise ProviderError("invalid_provider_output")
+    if len({segment.speaker_id for segment in ordered}) != 2:
+        raise ProviderError("unsupported_speaker_count")
     return ordered
+
+
+def validate_mixed_segments(segments: list[SpeakerSegment], duration: float) -> None:
+    """Fail closed on a non-canonical mixed-audio alignment timeline."""
+
+    _validated_segments(segments, duration)
 
 
 def _utterances(assignments: list[tuple[AlignedWord, str]]) -> list[Utterance]:
@@ -102,8 +112,8 @@ def _utterances(assignments: list[tuple[AlignedWord, str]]) -> list[Utterance]:
     return [
         Utterance(
             id=f"utt-{index:04d}",
-            start=words[0].start,
-            end=words[-1].end,
+            start=min(word.start for word in words),
+            end=max(word.end for word in words),
             speaker_id=speaker_id,
             confidence=1.0,
             transcript=" ".join(word.text for word in words),

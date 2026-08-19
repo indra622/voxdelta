@@ -5,11 +5,24 @@ from __future__ import annotations
 from math import isfinite
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 CandidateStatus = Literal["eligible", "unavailable", "rejected"]
 _MAX_RSS_MB = 18_432.0
 _MIN_COMPLETION = 0.95
+_SAFE_UNAVAILABLE_REASONS = frozenset(
+    {
+        "invalid_audio_asset",
+        "invalid_local_checkpoint",
+        "invalid_provider_output",
+        "missing_huggingface_token",
+        "missing_pyannote_api_key",
+        "provider_runtime_unsupported",
+        "provider_timeout",
+        "provider_unavailable",
+        "unsupported_speaker_count",
+    }
+)
 
 
 class CandidateMetrics(BaseModel):
@@ -27,6 +40,13 @@ class CandidateMetrics(BaseModel):
     unavailable_reason: str | None = None
 
     model_config = ConfigDict(strict=True, extra="forbid")
+
+    @field_validator("unavailable_reason")
+    @classmethod
+    def safe_unavailable_reason(cls, value: str | None) -> str | None:
+        if value is None or value in _SAFE_UNAVAILABLE_REASONS:
+            return value
+        return "provider_unavailable"
 
     @model_validator(mode="after")
     def finite_metrics(self) -> CandidateMetrics:
@@ -70,7 +90,11 @@ def _base_status(
     for candidate in candidates:
         reason: str | None = None
         if candidate.unavailable_reason is not None:
-            reason = candidate.unavailable_reason
+            reason = (
+                candidate.unavailable_reason
+                if candidate.unavailable_reason in _SAFE_UNAVAILABLE_REASONS
+                else "provider_unavailable"
+            )
         elif candidate.completion_rate < _MIN_COMPLETION:
             reason = "completion_rate_below_0.95"
         elif candidate.peak_rss_mb is None:
@@ -114,27 +138,42 @@ def select_asr_candidate(candidates: list[CandidateMetrics]) -> SelectionDecisio
     if not eligible:
         return _decision(None, status, reasons)
 
+    def ranking(item: CandidateMetrics) -> tuple[float, float, float, str]:
+        assert item.cer is not None
+        assert item.median_latency_ms is not None
+        assert item.peak_rss_mb is not None
+        return item.cer, item.median_latency_ms, item.peak_rss_mb, item.candidate_id
+
     stable = sorted(
         (candidate for candidate in eligible if candidate.provider == "faster-whisper"),
-        key=lambda item: item.candidate_id,
+        key=ranking,
     )
     modern = sorted(
         (candidate for candidate in eligible if candidate.provider == "qwen3-asr"),
-        key=lambda item: item.candidate_id,
+        key=ranking,
     )
-    if not stable or not modern:
-        selected = min(
-            eligible,
-            key=lambda item: (
-                item.cer if item.cer is not None else float("inf"),
-                item.median_latency_ms if item.median_latency_ms is not None else float("inf"),
-                item.candidate_id,
-            ),
-        )
-        return _decision(selected, status, reasons)
+    supported_ids = {candidate.candidate_id for candidate in (*stable, *modern)}
+    for candidate in eligible:
+        if candidate.candidate_id not in supported_ids:
+            status[candidate.candidate_id] = "rejected"
+            reasons[candidate.candidate_id] = "unsupported_asr_candidate_provider"
+    for group in (stable, modern):
+        for candidate in group[1:]:
+            status[candidate.candidate_id] = "rejected"
+            reasons[candidate.candidate_id] = "superseded_within_provider_group"
 
-    baseline = stable[0]
-    qwen = modern[0]
+    baseline = stable[0] if stable else None
+    qwen = modern[0] if modern else None
+    if baseline is None and qwen is None:
+        return _decision(None, status, reasons)
+    if baseline is None:
+        assert qwen is not None
+        reasons[qwen.candidate_id] = "selected_as_only_eligible_provider"
+        return _decision(qwen, status, reasons)
+    if qwen is None:
+        reasons[baseline.candidate_id] = "selected_as_only_eligible_provider"
+        return _decision(baseline, status, reasons)
+
     assert baseline.cer is not None and qwen.cer is not None
     assert baseline.median_latency_ms is not None and qwen.median_latency_ms is not None
     improvement = baseline.cer - qwen.cer

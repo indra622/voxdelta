@@ -82,6 +82,54 @@ def test_explicit_unavailable_reason_is_preserved_safely() -> None:
     assert decision.reasons == {"qwen": "provider_runtime_unsupported"}
 
 
+def test_arbitrary_unavailable_reason_is_never_persisted() -> None:
+    sentinel = "/private/call.wav transcript-secret hf_token provider-payload"
+    candidate = _candidate("qwen", "qwen3-asr", cer=0.1).model_copy(
+        update={"unavailable_reason": sentinel}
+    )
+
+    decision = select_asr_candidate([candidate])
+
+    assert decision.reasons == {"qwen": "provider_unavailable"}
+    serialized = decision.model_dump_json().lower()
+    for fragment in ("private", "transcript", "secret", "token", "payload"):
+        assert fragment not in serialized
+
+
+def test_candidate_contract_sanitizes_arbitrary_unavailable_reason() -> None:
+    candidate = CandidateMetrics(
+        candidate_id="qwen",
+        task="asr",
+        provider="qwen3-asr",
+        model="Qwen3-ASR-1.7B",
+        completion_rate=0.0,
+        unavailable_reason="/private/audio.wav transcript-secret token payload",
+    )
+
+    assert candidate.unavailable_reason == "provider_unavailable"
+    assert "private" not in candidate.model_dump_json().lower()
+
+
+def test_multiple_candidates_per_provider_select_best_and_reject_every_other() -> None:
+    decision = select_asr_candidate(
+        [
+            _candidate("stable-a", "faster-whisper", cer=0.30, latency=50),
+            _candidate("stable-z", "faster-whisper", cer=0.20, latency=100),
+            _candidate("qwen-a", "qwen3-asr", cer=0.25, latency=50),
+            _candidate("qwen-z", "qwen3-asr", cer=0.18, latency=190),
+        ]
+    )
+
+    assert decision.selected_candidate_id == "qwen-z"
+    assert decision.candidate_status == {
+        "stable-a": "rejected",
+        "stable-z": "rejected",
+        "qwen-a": "rejected",
+        "qwen-z": "eligible",
+    }
+    assert set(decision.reasons) == set(decision.candidate_status)
+
+
 def test_duplicate_ids_and_non_asr_tasks_are_rejected() -> None:
     same = _candidate("same", "faster-whisper", cer=0.1)
     with pytest.raises(ValueError, match="duplicate"):

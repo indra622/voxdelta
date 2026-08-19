@@ -13,6 +13,7 @@ from voxdelta.providers.asr_alignment import (
     align_mixed,
     align_separate,
     validate_asset,
+    validate_mixed_segments,
     validated_words,
 )
 from voxdelta.providers.base import ProviderError
@@ -61,6 +62,8 @@ def _words(output: object, duration: float) -> list[AlignedWord]:
         return validated_words(records(), duration)
     except ProviderError:
         raise
+    except TimeoutError:
+        raise ProviderError("provider_timeout") from None
     except Exception:
         raise ProviderError("invalid_provider_output") from None
 
@@ -93,6 +96,8 @@ class FasterWhisperProvider:
             )
         except ProviderError:
             raise
+        except TimeoutError:
+            raise ProviderError("provider_timeout") from None
         except Exception:
             raise ProviderError("provider_unavailable") from None
         return self._model
@@ -116,6 +121,8 @@ class FasterWhisperProvider:
 
     def transcribe(self, asset: AudioAsset, segments: list[SpeakerSegment]) -> list[Utterance]:
         duration, paths = validate_asset(asset)
+        if asset.channel_mode == "mixed":
+            validate_mixed_segments(segments, duration)
         with LOCAL_ASR_INFERENCE_LOCK:
             if asset.channel_mode == "separate":
                 result, omitted = align_separate(

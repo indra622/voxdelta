@@ -230,7 +230,7 @@ def test_hostile_or_malformed_pipeline_output_has_a_safe_typed_error(output: obj
         provider.diarize(_asset())
 
     assert raised.value.code == "invalid_provider_output"
-    assert str(raised.value) == "The diarization provider returned invalid output."
+    assert str(raised.value) == "The provider returned invalid output."
     assert "private" not in str(raised.value)
 
 

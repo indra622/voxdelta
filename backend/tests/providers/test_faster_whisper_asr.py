@@ -132,6 +132,49 @@ def test_exact_overlap_tie_is_deterministic() -> None:
     assert [utterance.speaker_id for utterance in utterances] == ["SPEAKER_00"]
 
 
+@pytest.mark.parametrize(
+    "segments",
+    [
+        [SpeakerSegment(start=0, end=4, speaker_id="only", confidence=1)],
+        [
+            SpeakerSegment(start=0, end=1, speaker_id="a", confidence=1),
+            SpeakerSegment(start=1, end=2, speaker_id="b", confidence=1),
+            SpeakerSegment(start=2, end=4, speaker_id="c", confidence=1),
+        ],
+    ],
+)
+def test_mixed_alignment_requires_exactly_two_distinct_speakers(
+    segments: list[SpeakerSegment],
+) -> None:
+    from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
+
+    factory = FakeFactory(FakeModel([FakeSegment([FakeWord(0.0, 0.5, "word")])]))
+    provider = FasterWhisperProvider(model_factory=factory)
+
+    with pytest.raises(ProviderError) as raised:
+        provider.transcribe(_asset(), segments)
+
+    assert raised.value.code == "unsupported_speaker_count"
+    assert factory.calls == []
+
+
+def test_grouped_overlapping_words_cover_the_complete_interval() -> None:
+    from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
+
+    model = FakeModel([FakeSegment([FakeWord(0.0, 2.0, "긴"), FakeWord(1.0, 1.5, "겹침")])])
+    provider = FasterWhisperProvider(model_factory=FakeFactory(model))
+    segments = [
+        SpeakerSegment(start=0, end=3, speaker_id="SPEAKER_00", confidence=1),
+        SpeakerSegment(start=3, end=4, speaker_id="SPEAKER_01", confidence=1),
+    ]
+
+    utterances = provider.transcribe(_asset(), segments)
+
+    assert [(item.start, item.end, item.transcript) for item in utterances] == [
+        (0.0, 2.0, "긴 겹침")
+    ]
+
+
 def test_separate_channels_are_fixed_and_merged_chronologically() -> None:
     from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
 
@@ -154,6 +197,29 @@ def test_separate_channels_are_fixed_and_merged_chronologically() -> None:
     assert [(u.speaker_id, u.transcript) for u in utterances] == [
         ("SPEAKER_01", "오른쪽"),
         ("SPEAKER_00", "왼쪽"),
+    ]
+
+
+def test_separate_grouped_overlap_covers_all_channel_words() -> None:
+    from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
+
+    class ChannelModel(FakeModel):
+        def transcribe(self, path: str, **kwargs: object) -> tuple[object, object]:
+            del kwargs
+            words = (
+                [FakeWord(0.0, 2.0, "긴"), FakeWord(1.0, 1.5, "겹침")]
+                if path.endswith("left.wav")
+                else []
+            )
+            return iter([FakeSegment(words)]), object()
+
+    provider = FasterWhisperProvider(model_factory=FakeFactory(ChannelModel([])))
+    asset = _asset(mode="separate", paths=("normalized/left.wav", "normalized/right.wav"))
+
+    utterances = provider.transcribe(asset, _segments())
+
+    assert [(item.start, item.end, item.transcript) for item in utterances] == [
+        (0.0, 2.0, "긴 겹침")
     ]
 
 
@@ -204,6 +270,51 @@ def test_iterator_and_runtime_exceptions_are_sanitized() -> None:
     assert raised.value.code == "invalid_provider_output"
     assert "private" not in str(raised.value).lower()
     assert "secret" not in str(raised.value).lower()
+
+
+@pytest.mark.parametrize("failure_point", ["factory", "model", "segments", "words"])
+def test_timeout_is_preserved_across_lazy_faster_whisper_boundaries(
+    failure_point: str,
+) -> None:
+    from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
+
+    class TimeoutIterator:
+        def __iter__(self) -> TimeoutIterator:
+            return self
+
+        def __next__(self) -> object:
+            raise TimeoutError("/private/call.wav transcript-secret provider-payload")
+
+    class TimeoutFactory:
+        def __call__(self, model_id: str, *, device: str, compute_type: str) -> FakeModel:
+            del model_id, device, compute_type
+            raise TimeoutError("/private/model token-secret")
+
+    if failure_point == "factory":
+        provider = FasterWhisperProvider(model_factory=TimeoutFactory())
+    elif failure_point == "model":
+        provider = FasterWhisperProvider(model_factory=FakeFactory(FakeModel(TimeoutError())))
+    elif failure_point == "segments":
+
+        class SegmentTimeoutModel(FakeModel):
+            def transcribe(self, path: str, **kwargs: object) -> tuple[object, object]:
+                del path, kwargs
+                return TimeoutIterator(), object()
+
+        provider = FasterWhisperProvider(model_factory=FakeFactory(SegmentTimeoutModel([])))
+    else:
+        provider = FasterWhisperProvider(
+            model_factory=FakeFactory(FakeModel([FakeSegment(TimeoutIterator())]))
+        )
+
+    with pytest.raises(ProviderError) as raised:
+        provider.transcribe(_asset(), _segments())
+
+    assert raised.value.code == "provider_timeout"
+    serialized = str(raised.value).lower()
+    assert "private" not in serialized
+    assert "secret" not in serialized
+    assert "payload" not in serialized
 
 
 def test_device_and_model_are_validated_before_factory() -> None:
