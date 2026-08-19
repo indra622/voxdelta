@@ -329,6 +329,11 @@ async def test_upload_rejects_cap_plus_one_and_empty_and_cleans_partial_state(
         for path in artifacts_module._OPERATION_LOCKS  # noqa: SLF001
         if artifacts.root in path.parents
     ]
+    assert not [
+        path
+        for path in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
+        if artifacts.root in path.parents
+    ]
     assert not list((artifacts.root / ".incoming").glob("*"))
     assert str(tmp_path) not in "".join(response.text for response in oversized + empty)
 
@@ -512,6 +517,45 @@ async def test_upload_close_failure_is_sanitized_and_cleans_job(
 
 
 @pytest.mark.asyncio
+async def test_upload_ownership_spans_file_close_until_adoption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path)
+    original_close = StarletteUploadFile.close
+    observed: list[Path] = []
+
+    async def reconcile_during_close(self: UploadFile) -> None:
+        candidates = list((artifacts.root / ".incoming").glob(".upload-*"))
+        if not candidates:
+            await original_close(self)
+            return
+        assert len(candidates) == 1 and not observed
+        incoming = candidates[0]
+        observed.append(incoming)
+        os.utime(incoming, (0, 0))
+        assert (
+            ArtifactStore(artifacts.root).remove_stale_incoming_uploads(
+                lease_seconds=10,
+                now=1000,
+            )
+            == 0
+        )
+        await original_close(self)
+
+    monkeypatch.setattr(StarletteUploadFile, "close", reconcile_during_close)
+    async with client_for(app) as client:
+        response = await upload(client)
+
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+    assert observed
+    assert not observed[0].exists()
+    assert observed[0].absolute() not in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
+    assert repository.get_job(job_id)["status"] == "paused"
+
+
+@pytest.mark.asyncio
 async def test_upload_cleanup_continues_after_source_unlink_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -625,9 +669,11 @@ def test_reconciliation_cleans_only_stale_absent_state_and_recovers_pending_job(
     lock_id = "e" * 32
     claimed_id = "f" * 32
 
-    descriptor, stale_incoming = artifacts.open_incoming_upload(incoming_id, ".wav")
-    os.write(descriptor, b"stale")
-    os.close(descriptor)
+    incoming_directory = artifacts.root / ".incoming"
+    incoming_directory.mkdir(mode=0o700, parents=True)
+    stale_incoming = incoming_directory / f".upload-{incoming_id}-crash.wav"
+    stale_incoming.write_bytes(b"stale")
+    stale_incoming.chmod(0o600)
     os.utime(stale_incoming, (0, 0))
 
     descriptor, orphan_incoming = artifacts.open_incoming_upload(orphan_id, ".wav")
@@ -669,6 +715,42 @@ def test_reconciliation_cleans_only_stale_absent_state_and_recovers_pending_job(
     assert repository.get_job(claimed_id)["status"] == "running"
     assert (artifacts.root / ".deleted" / f"{tombstone_id}.tombstone").is_file()
     assert (artifacts.root / ".locks" / f"{lock_id}.lock").is_file()
+
+
+def test_symlink_root_is_canonical_for_persisted_source_and_pending_recovery(
+    tmp_path: Path,
+) -> None:
+    real_root = tmp_path / "real-jobs"
+    real_root.mkdir()
+    alias_root = tmp_path / "jobs-alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    artifacts = ArtifactStore(alias_root)
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    runner = PipelineRunner(
+        repository,
+        artifacts,
+        AudioService(artifacts.root, 60, 3600),
+    )
+    job_id = "9" * 32
+    descriptor, incoming = artifacts.open_incoming_upload(job_id, ".wav")
+    os.write(descriptor, FIXTURE.read_bytes())
+    os.fsync(descriptor)
+    os.close(descriptor)
+    source = artifacts.adopt_incoming_upload(job_id, incoming, ".wav")
+    repository.create_job(str(source), job_id=job_id)
+
+    recovered = reconcile_local_state(
+        repository,
+        artifacts,
+        runner,
+        lease_seconds=10,
+        now=1000,
+    )
+
+    assert artifacts.root == real_root.resolve()
+    assert source.parent == real_root.resolve() / job_id
+    assert recovered == (job_id,)
+    assert repository.get_job(job_id)["status"] == "paused"
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,9 @@ from pathlib import Path
 from voxdelta.domain.models import StageName, StageStatus
 from voxdelta.jobs._ids import (
     JobAbsenceProof,
+    _activate_job_absence_proof,
     _issue_job_absence_proof,
+    _revoke_job_absence_proof,
     validate_canonical_job_id,
     validate_job_id,
 )
@@ -180,7 +182,12 @@ class JobRepository:
             database.execute("BEGIN IMMEDIATE")
             job = database.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if job is None:
-                discard_if_absent(_issue_job_absence_proof(job_id))
+                proof = _issue_job_absence_proof(job_id, lambda: database.in_transaction)
+                _activate_job_absence_proof(proof)
+                try:
+                    discard_if_absent(proof)
+                finally:
+                    _revoke_job_absence_proof(proof)
                 return False
             stages = database.execute(
                 "SELECT * FROM stages WHERE job_id = ? ORDER BY rowid", (job_id,)
@@ -206,7 +213,12 @@ class JobRepository:
             database.execute("BEGIN IMMEDIATE")
             if database.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone():
                 return False
-            discard(_issue_job_absence_proof(job_id))
+            proof = _issue_job_absence_proof(job_id, lambda: database.in_transaction)
+            _activate_job_absence_proof(proof)
+            try:
+                discard(proof)
+            finally:
+                _revoke_job_absence_proof(proof)
             return True
 
     def list_pristine_pending_jobs(self) -> list[tuple[str, str]]:

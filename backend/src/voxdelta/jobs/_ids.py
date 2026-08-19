@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from threading import get_ident
 
 _RESERVED_JOB_COMPONENTS = frozenset({".deleted", ".incoming", ".locks"})
 _CANONICAL_JOB_ID = re.compile(r"[0-9a-f]{32}")
@@ -15,6 +17,15 @@ _ABSENCE_PROOF_AUTHORITY = object()
 class JobAbsenceProof:
     job_id: str
     _authority: object
+    _state: _JobAbsenceProofState
+
+
+@dataclass(slots=True)
+class _JobAbsenceProofState:
+    transaction_is_active: Callable[[], bool]
+    issuing_thread: int
+    active: bool = False
+    consumed: bool = False
 
 
 def validate_job_id(job_id: str) -> None:
@@ -45,9 +56,27 @@ def validate_canonical_job_id(job_id: str) -> None:
         raise ValueError("job ID must be exactly 32 lowercase hexadecimal characters")
 
 
-def _issue_job_absence_proof(job_id: str) -> JobAbsenceProof:
+def _issue_job_absence_proof(
+    job_id: str,
+    transaction_is_active: Callable[[], bool],
+) -> JobAbsenceProof:
     validate_canonical_job_id(job_id)
-    return JobAbsenceProof(job_id, _ABSENCE_PROOF_AUTHORITY)
+    return JobAbsenceProof(
+        job_id,
+        _ABSENCE_PROOF_AUTHORITY,
+        _JobAbsenceProofState(transaction_is_active, get_ident()),
+    )
+
+
+def _activate_job_absence_proof(proof: JobAbsenceProof) -> None:
+    if proof._authority is not _ABSENCE_PROOF_AUTHORITY or proof._state.active:
+        raise ValueError("job absence proof could not be activated")
+    proof._state.active = True
+
+
+def _revoke_job_absence_proof(proof: JobAbsenceProof) -> None:
+    if proof._authority is _ABSENCE_PROOF_AUTHORITY:
+        proof._state.active = False
 
 
 def validate_job_absence_proof(proof: object, job_id: str) -> None:
@@ -58,6 +87,15 @@ def validate_job_absence_proof(proof: object, job_id: str) -> None:
         or proof._authority is not _ABSENCE_PROOF_AUTHORITY
     ):
         raise ValueError("a repository-issued job absence proof is required")
+    if (
+        not proof._state.active
+        or proof._state.issuing_thread != get_ident()
+        or not proof._state.transaction_is_active()
+    ):
+        raise ValueError("job absence proof requires its active transaction callback")
+    if proof._state.consumed:
+        raise ValueError("job absence proof has already been consumed")
+    proof._state.consumed = True
 
 
 __all__ = [

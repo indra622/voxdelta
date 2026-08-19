@@ -58,6 +58,15 @@ _OPERATION_LOCKS: dict[Path, _ProcessLockEntry] = {}
 _OPERATION_LOCKS_GUARD = threading.Lock()
 
 
+@dataclass(slots=True)
+class _IncomingOwner:
+    lease_descriptor: int | None
+
+
+_INCOMING_OWNERS: dict[Path, _IncomingOwner] = {}
+_INCOMING_OWNERS_GUARD = threading.Lock()
+
+
 @contextmanager
 def _operation_process_lock(path: Path) -> Iterator[None]:
     """Reference-count the process fallback while leaving the cross-process file durable."""
@@ -77,6 +86,87 @@ def _operation_process_lock(path: Path) -> Iterator[None]:
             entry.users -= 1
             if entry.users == 0 and _OPERATION_LOCKS.get(lexical) is entry:
                 del _OPERATION_LOCKS[lexical]
+
+
+def _incoming_owner_key(path: Path) -> Path:
+    return path if path.is_absolute() else path.absolute()
+
+
+def _register_incoming_owner(path: Path, descriptor: int) -> None:
+    lease_descriptor: int | None = None
+    if fcntl is not None:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        lease_descriptor = os.dup(descriptor)
+    key = _incoming_owner_key(path)
+    with _INCOMING_OWNERS_GUARD:
+        if key in _INCOMING_OWNERS:
+            if lease_descriptor is not None:
+                os.close(lease_descriptor)
+            raise ValueError(_INCOMING_VALIDATION_ERROR)
+        _INCOMING_OWNERS[key] = _IncomingOwner(lease_descriptor)
+
+
+def _release_incoming_owner(path: Path) -> None:
+    key = _incoming_owner_key(path)
+    with _INCOMING_OWNERS_GUARD:
+        owner = _INCOMING_OWNERS.pop(key, None)
+    if owner is not None and owner.lease_descriptor is not None:
+        os.close(owner.lease_descriptor)
+
+
+@contextmanager
+def _stale_incoming_ownership(path: Path) -> Iterator[bool]:
+    """Try to own a stale candidate without disrupting an active writer/adopter.
+
+    On platforms without ``fcntl``, the registry protects overlapping stores in this process;
+    cross-process ownership detection is unavailable there.
+    """
+
+    key = _incoming_owner_key(path)
+    fallback_owner: _IncomingOwner | None = None
+    with _INCOMING_OWNERS_GUARD:
+        already_owned = key in _INCOMING_OWNERS
+        if not already_owned and fcntl is None:
+            fallback_owner = _IncomingOwner(None)
+            _INCOMING_OWNERS[key] = fallback_owner
+    if already_owned:
+        yield False
+        return
+
+    descriptor = -1
+    try:
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            current = path.lstat()
+        except (FileNotFoundError, OSError):
+            yield False
+            return
+        if (
+            _is_link_like(path)
+            or not stat.S_ISREG(opened.st_mode)
+            or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            yield False
+            return
+        if fcntl is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno in {errno.EACCES, errno.EAGAIN}:
+                    yield False
+                    return
+                raise
+        yield True
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if fallback_owner is not None:
+            with _INCOMING_OWNERS_GUARD:
+                if _INCOMING_OWNERS.get(key) is fallback_owner:
+                    del _INCOMING_OWNERS[key]
 
 
 def _is_link_like(path: Path) -> bool:
@@ -159,7 +249,7 @@ class ArtifactStore:
     """Store one versioned JSON artifact per pipeline stage and job."""
 
     def __init__(self, root: Path) -> None:
-        self.root = root
+        self.root = Path(root).expanduser().resolve(strict=False)
 
     def _control_directory(self, name: str, *, create: bool, error_message: str) -> Path:
         if create:
@@ -394,6 +484,7 @@ class ArtifactStore:
         path = Path(name)
         try:
             os.fchmod(descriptor, 0o600)
+            _register_incoming_owner(path, descriptor)
         except BaseException:
             os.close(descriptor)
             path.unlink(missing_ok=True)
@@ -405,8 +496,11 @@ class ArtifactStore:
         """Remove one exact staged upload and persist its directory entry removal."""
 
         candidate = self._validated_incoming_path(path, require_file=False)
-        candidate.unlink(missing_ok=True)
-        _fsync_directory(candidate.parent)
+        try:
+            candidate.unlink(missing_ok=True)
+            _fsync_directory(candidate.parent)
+        finally:
+            _release_incoming_owner(candidate)
 
     def adopt_incoming_upload(self, job_id: str, path: Path, suffix: str) -> Path:
         """Move one admitted upload into a new exact job directory and persist the move."""
@@ -459,6 +553,8 @@ class ArtifactStore:
             except Exception:
                 pass
             raise
+        finally:
+            _release_incoming_owner(incoming)
 
     def _discard_unregistered_job_under_absence_proof(
         self,
@@ -504,8 +600,11 @@ class ArtifactStore:
                 or now - metadata.st_mtime < lease_seconds
             ):
                 continue
-            candidate.unlink()
-            removed += 1
+            with _stale_incoming_ownership(candidate) as acquired:
+                if not acquired:
+                    continue
+                candidate.unlink()
+                removed += 1
         if removed:
             _fsync_directory(directory)
         return removed

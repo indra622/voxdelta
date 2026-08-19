@@ -374,6 +374,100 @@ def test_incoming_upload_is_private_then_atomically_adopted_into_exact_new_job(
     assert root in synced
 
 
+def test_active_old_incoming_upload_is_owned_across_writer_close_until_adoption(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "jobs"
+    owner = ArtifactStore(root)
+    reconciler = ArtifactStore(root)
+    descriptor, incoming = owner.open_incoming_upload("a" * 32, ".wav")
+    os.write(descriptor, b"admitted")
+    os.close(descriptor)
+    os.utime(incoming, (0, 0))
+    lease_descriptor = artifacts_module._INCOMING_OWNERS[  # noqa: SLF001
+        incoming.absolute()
+    ].lease_descriptor
+
+    assert reconciler.remove_stale_incoming_uploads(lease_seconds=10, now=1000) == 0
+    assert incoming.is_file()
+
+    adopted = owner.adopt_incoming_upload("a" * 32, incoming, ".wav")
+
+    assert adopted.read_bytes() == b"admitted"
+    assert incoming.absolute() not in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
+    if lease_descriptor is not None:
+        with pytest.raises(OSError) as closed:
+            os.fstat(lease_descriptor)
+        assert closed.value.errno == errno.EBADF
+
+
+def test_non_posix_incoming_owner_registry_preserves_active_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(artifacts_module, "fcntl", None)
+    root = tmp_path / "jobs"
+    owner = ArtifactStore(root)
+    descriptor, incoming = owner.open_incoming_upload("c" * 32, ".wav")
+    os.close(descriptor)
+    os.utime(incoming, (0, 0))
+
+    assert (
+        ArtifactStore(root).remove_stale_incoming_uploads(
+            lease_seconds=10,
+            now=1000,
+        )
+        == 0
+    )
+    owner.discard_incoming_upload(incoming)
+
+    assert not incoming.exists()
+    assert incoming.absolute() not in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
+
+
+@pytest.mark.skipif(os.name != "posix", reason="cross-process flock is POSIX-specific")
+def test_stale_incoming_becomes_reclaimable_after_owner_process_exits(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    script = "\n".join(
+        (
+            "import os, sys",
+            "from pathlib import Path",
+            "from voxdelta.jobs.artifacts import ArtifactStore",
+            f"store = ArtifactStore(Path({str(root)!r}))",
+            "descriptor, incoming = store.open_incoming_upload('b' * 32, '.wav')",
+            "os.write(descriptor, b'crash-leftover')",
+            "os.close(descriptor)",
+            "os.utime(incoming, (0, 0))",
+            "print(incoming, flush=True)",
+            "sys.stdin.read()",
+        )
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        incoming = Path(child.stdout.readline().strip())
+        reconciler = ArtifactStore(root)
+
+        assert reconciler.remove_stale_incoming_uploads(lease_seconds=10, now=1000) == 0
+        assert incoming.is_file()
+
+        assert child.stdin is not None
+        child.stdin.close()
+        assert child.wait(timeout=5) == 0
+
+        assert reconciler.remove_stale_incoming_uploads(lease_seconds=10, now=1000) == 1
+        assert not incoming.exists()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
 def test_discard_incoming_leaves_no_tombstone_lock_or_public_job_discard(tmp_path: Path) -> None:
     root = tmp_path / "jobs"
     store = ArtifactStore(root)
@@ -385,6 +479,7 @@ def test_discard_incoming_leaves_no_tombstone_lock_or_public_job_discard(tmp_pat
     assert not (root / ".deleted").exists()
     assert not (root / ".locks").exists()
     assert not hasattr(store, "discard_unregistered_job")
+    assert incoming.absolute() not in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
 
 
 def test_unregistered_job_discard_rejects_direct_call_without_absence_proof(

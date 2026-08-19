@@ -9,6 +9,8 @@ from typing import cast
 import pytest
 
 from voxdelta.domain.models import StageName, StageStatus
+from voxdelta.jobs._ids import JobAbsenceProof
+from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.repository import JobRepository
 
 
@@ -408,6 +410,53 @@ def test_resolve_create_after_error_distinguishes_commit_absence_and_mismatch(
         )
 
     assert discarded == ["absent"]
+
+
+def test_absence_proof_cannot_be_replayed_after_callback_returns(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    store = ArtifactStore(tmp_path / "jobs")
+    job_id = "d" * 32
+    captured: list[JobAbsenceProof] = []
+
+    assert repository.discard_if_absent(job_id, captured.append)
+    sentinel = store.job_dir(job_id) / "sentinel"
+    sentinel.write_text("preserve", encoding="utf-8")
+    repository.create_job(str(sentinel), job_id=job_id)
+    assert repository.claim_stage(job_id, StageName.NORMALIZE) is not None
+
+    with pytest.raises(ValueError, match="active transaction"):
+        store._discard_unregistered_job_under_absence_proof(  # noqa: SLF001
+            job_id,
+            captured[0],
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+    assert repository.get_job(job_id)["status"] == "running"
+
+
+def test_absence_proof_is_revoked_when_callback_raises(tmp_path: Path) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    store = ArtifactStore(tmp_path / "jobs")
+    job_id = "e" * 32
+    captured: list[JobAbsenceProof] = []
+
+    def fail_after_capture(proof: JobAbsenceProof) -> None:
+        captured.append(proof)
+        raise RuntimeError("callback interrupted")
+
+    with pytest.raises(RuntimeError, match="interrupted"):
+        repository.discard_if_absent(job_id, fail_after_capture)
+
+    sentinel = store.job_dir(job_id) / "sentinel"
+    sentinel.write_text("preserve", encoding="utf-8")
+    repository.create_job(str(sentinel), job_id=job_id)
+    with pytest.raises(ValueError, match="active transaction"):
+        store._discard_unregistered_job_under_absence_proof(  # noqa: SLF001
+            job_id,
+            captured[0],
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
 
 
 @pytest.mark.parametrize(
