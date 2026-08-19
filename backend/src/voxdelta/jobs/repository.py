@@ -6,21 +6,10 @@ import json
 import sqlite3
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 from voxdelta.domain.models import StageName, StageStatus
-
-
-def _validate_job_id(job_id: str) -> None:
-    if (
-        not job_id
-        or job_id in {".", ".."}
-        or "/" in job_id
-        or "\\" in job_id
-        or Path(job_id).is_absolute()
-        or PureWindowsPath(job_id).is_absolute()
-    ):
-        raise ValueError("job ID must be a non-empty path component")
+from voxdelta.jobs._ids import validate_job_id
 
 
 class JobRepository:
@@ -88,6 +77,7 @@ class JobRepository:
     ) -> None:
         """Persist a stage transition, rejecting unknown jobs or stage rows."""
 
+        validate_job_id(job_id)
         if not isinstance(stage, StageName):
             raise KeyError(str(stage))
         now = datetime.now(UTC).isoformat()
@@ -122,6 +112,7 @@ class JobRepository:
     def get_job(self, job_id: str) -> dict[str, object]:
         """Return one job and its ordered stage mapping."""
 
+        validate_job_id(job_id)
         with self._connect() as database:
             job = database.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
             if job is None:
@@ -134,7 +125,7 @@ class JobRepository:
     def delete_job(self, job_id: str) -> None:
         """Delete a job and cascade its stages in one transaction."""
 
-        _validate_job_id(job_id)
+        validate_job_id(job_id)
         with self._connect() as database:
             deleted = database.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
             if deleted.rowcount != 1:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -88,9 +89,95 @@ def test_artifact_write_cleans_temporary_and_preserves_target_when_replace_fails
     assert list(target.parent.iterdir()) == [target]
 
 
+def test_artifact_write_fsyncs_containing_directory_after_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ArtifactStore(tmp_path / "jobs")
+    expected_directory = tmp_path / "jobs" / "j1"
+    events: list[tuple[str, Path]] = []
+    real_replace = os.replace
+
+    def observed_replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+        real_replace(source, target)
+        events.append(("replace", Path(target)))
+
+    def observed_directory_fsync(directory: Path) -> None:
+        assert (directory / "report.v1.json").exists()
+        events.append(("directory_fsync", directory))
+
+    monkeypatch.setattr(artifacts_module.os, "replace", observed_replace)
+    monkeypatch.setattr(
+        artifacts_module, "_fsync_directory", observed_directory_fsync, raising=False
+    )
+
+    target = store.write_model("j1", StageName.REPORT, analysis_report())
+
+    assert events == [("replace", target), ("directory_fsync", expected_directory)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory descriptors are POSIX-specific")
+def test_directory_fsync_opens_syncs_and_closes_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[tuple[str, object]] = []
+    expected_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+
+    def observed_open(path: str | os.PathLike[str], flags: int) -> int:
+        events.append(("open", (Path(path), flags)))
+        return 41
+
+    def observed_fsync(descriptor: int) -> None:
+        events.append(("fsync", descriptor))
+
+    def observed_close(descriptor: int) -> None:
+        events.append(("close", descriptor))
+
+    monkeypatch.setattr(artifacts_module.os, "open", observed_open)
+    monkeypatch.setattr(artifacts_module.os, "fsync", observed_fsync)
+    monkeypatch.setattr(artifacts_module.os, "close", observed_close)
+
+    artifacts_module._fsync_directory(tmp_path)
+
+    assert events == [
+        ("open", (tmp_path, expected_flags)),
+        ("fsync", 41),
+        ("close", 41),
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory descriptors are POSIX-specific")
+def test_directory_fsync_falls_back_when_the_filesystem_does_not_support_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed: list[int] = []
+    monkeypatch.setattr(artifacts_module.os, "open", lambda path, flags: 42)
+
+    def unsupported_fsync(descriptor: int) -> None:
+        raise OSError(errno.EINVAL, "directory fsync unsupported")
+
+    monkeypatch.setattr(artifacts_module.os, "fsync", unsupported_fsync)
+    monkeypatch.setattr(artifacts_module.os, "close", closed.append)
+
+    artifacts_module._fsync_directory(tmp_path)
+
+    assert closed == [42]
+
+
 @pytest.mark.parametrize(
     "job_id",
-    ["", ".", "..", "../escape", "nested/job", r"nested\job", "/absolute", r"C:\absolute"],
+    [
+        "",
+        ".",
+        "..",
+        "../escape",
+        "nested/job",
+        r"nested\job",
+        "/absolute",
+        r"C:\absolute",
+        "C:",
+        "C:..",
+        "C:foo",
+    ],
 )
 @pytest.mark.parametrize("operation", ["job_dir", "write_model", "read_model", "delete_job"])
 def test_every_artifact_path_operation_rejects_unsafe_job_ids(
@@ -107,6 +194,32 @@ def test_every_artifact_path_operation_rejects_unsafe_job_ids(
             store.read_model(job_id, StageName.REPORT, AnalysisReport)
         else:
             store.delete_job(job_id)
+
+
+@pytest.mark.parametrize("target_location", ["outside", "sibling"])
+@pytest.mark.parametrize("operation", ["job_dir", "write_model", "read_model"])
+def test_artifact_operations_reject_existing_job_directory_symlinks(
+    target_location: str, operation: str, tmp_path: Path
+) -> None:
+    root = tmp_path / "jobs"
+    root.mkdir()
+    target = tmp_path / "outside" if target_location == "outside" else root / "j10"
+    target.mkdir()
+    artifact = target / "report.v1.json"
+    original = analysis_report(warning="sentinel").model_dump_json()
+    artifact.write_text(original, encoding="utf-8")
+    (root / "j1").symlink_to(target, target_is_directory=True)
+    store = ArtifactStore(root)
+
+    with pytest.raises(ValueError, match="job directory"):
+        if operation == "job_dir":
+            store.job_dir("j1")
+        elif operation == "write_model":
+            store.write_model("j1", StageName.REPORT, analysis_report(warning="overwrite"))
+        else:
+            store.read_model("j1", StageName.REPORT, AnalysisReport)
+
+    assert artifact.read_text(encoding="utf-8") == original
 
 
 def test_delete_job_removes_only_the_exact_job_directory(tmp_path: Path) -> None:

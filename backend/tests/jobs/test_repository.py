@@ -94,10 +94,36 @@ def test_delete_job_rejects_an_unknown_job(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "job_id", ["", ".", "..", "../escape", "nested/job", r"nested\job", "/absolute"]
+    "job_id",
+    [
+        "",
+        ".",
+        "..",
+        "../escape",
+        "nested/job",
+        r"nested\job",
+        "/absolute",
+        "C:",
+        "C:..",
+        "C:foo",
+    ],
 )
 def test_repository_delete_rejects_unsafe_job_ids(job_id: str, tmp_path: Path) -> None:
     repository = JobRepository(tmp_path / "voxdelta.sqlite3")
 
     with pytest.raises(ValueError, match="job ID"):
         repository.delete_job(job_id)
+
+
+@pytest.mark.parametrize("job_id", ["C:", "C:..", "C:foo"])
+@pytest.mark.parametrize("operation", ["get_job", "set_stage"])
+def test_repository_operations_reject_drive_qualified_job_ids(
+    job_id: str, operation: str, tmp_path: Path
+) -> None:
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+
+    with pytest.raises(ValueError, match="job ID"):
+        if operation == "get_job":
+            repository.get_job(job_id)
+        else:
+            repository.set_stage(job_id, StageName.NORMALIZE, StageStatus.RUNNING)
