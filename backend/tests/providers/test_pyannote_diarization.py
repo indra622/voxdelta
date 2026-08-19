@@ -3,9 +3,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import voxdelta.providers.pyannote_diarization as pyannote_module
 from voxdelta.credentials import Credentials
 from voxdelta.domain.models import AudioAsset
 from voxdelta.providers.base import DiarizationProvider, ProviderError
@@ -279,13 +281,77 @@ def test_missing_huggingface_token_fails_before_factory_or_audio_access() -> Non
     assert factory.calls == []
 
 
-def test_local_checkpoint_bypasses_token_and_uses_safe_directory_name(tmp_path: Path) -> None:
+def test_default_loader_disables_telemetry_before_construction_and_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    emissions: list[str] = []
+    telemetry_enabled = True
+
+    def set_telemetry_metrics(enabled: bool) -> None:
+        nonlocal telemetry_enabled
+        assert enabled is False
+        telemetry_enabled = enabled
+        events.append("telemetry-disabled")
+
+    def emit_if_enabled(event: str) -> None:
+        if telemetry_enabled:
+            emissions.append(event)
+
+    class ModulePipeline:
+        @classmethod
+        def from_pretrained(cls, model: str, *, token: str | None) -> ModulePipeline:
+            nonlocal telemetry_enabled
+            assert model == "pyannote/speaker-diarization-community-1"
+            assert token == "token"
+            emit_if_enabled("pipeline-construction")
+            events.append("pipeline-constructed")
+            telemetry_enabled = True
+            events.append("telemetry-reenabled")
+            return cls()
+
+        def __call__(self, audio_path: str, **kwargs: int) -> object:
+            del audio_path, kwargs
+            emit_if_enabled("pipeline-inference")
+            events.append("pipeline-invoked")
+            return FakeOutput([(0.0, 5.0, "a"), (5.0, 10.0, "b")])
+
+    modules = {
+        "pyannote.audio": SimpleNamespace(Pipeline=ModulePipeline),
+        "pyannote.audio.telemetry": SimpleNamespace(set_telemetry_metrics=set_telemetry_metrics),
+    }
+
+    def import_fake_module(name: str) -> object:
+        events.append(f"imported:{name}")
+        return modules[name]
+
+    monkeypatch.setattr(pyannote_module, "import_module", import_fake_module)
+    provider = PyannoteDiarizationProvider(Credentials(HUGGINGFACE_TOKEN="token"))
+
+    provider.diarize(_asset())
+
+    assert events == [
+        "imported:pyannote.audio",
+        "imported:pyannote.audio.telemetry",
+        "telemetry-disabled",
+        "pipeline-constructed",
+        "telemetry-reenabled",
+        "telemetry-disabled",
+        "pipeline-invoked",
+    ]
+    assert emissions == []
+
+
+def test_local_checkpoint_ignores_configured_token_and_uses_safe_directory_name(
+    tmp_path: Path,
+) -> None:
     checkpoint = tmp_path / "community-checkpoint"
     checkpoint.mkdir()
+    (checkpoint / "config.yaml").write_text("pipeline: {}\n", encoding="utf-8")
     pipeline = FakePipeline(FakeOutput([(0.0, 5.0, "a"), (5.0, 10.0, "b")]))
     factory = FakeFactory(pipeline)
     provider = PyannoteDiarizationProvider(
-        Credentials(HUGGINGFACE_TOKEN=None),
+        Credentials(HUGGINGFACE_TOKEN="must-not-reach-loader"),
         model_path=checkpoint,
         pipeline_factory=factory,
     )
@@ -296,6 +362,54 @@ def test_local_checkpoint_bypasses_token_and_uses_safe_directory_name(tmp_path: 
     assert factory.calls == [(str(checkpoint.resolve()), None)]
     assert provider.provenance.model == "community-checkpoint"
     assert str(tmp_path) not in provider.provenance.model_dump_json()
+
+
+def test_local_checkpoint_file_uses_parent_directory_for_provenance(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "named-checkpoint"
+    checkpoint.mkdir()
+    config = checkpoint / "config.yaml"
+    config.write_text("pipeline: {}\n", encoding="utf-8")
+    pipeline = FakePipeline(FakeOutput([(0.0, 5.0, "a"), (5.0, 10.0, "b")]))
+    factory = FakeFactory(pipeline)
+    provider = PyannoteDiarizationProvider(
+        Credentials(HUGGINGFACE_TOKEN="must-not-reach-loader"),
+        model_path=config,
+        pipeline_factory=factory,
+    )
+
+    provider.diarize(_asset())
+
+    assert factory.calls == [(str(config.resolve()), None)]
+    assert provider.provenance.model == "named-checkpoint"
+    assert str(tmp_path) not in provider.provenance.model_dump_json()
+
+
+@pytest.mark.parametrize("kind", ["missing", "empty-directory", "wrong-file", "symlink"])
+def test_invalid_local_checkpoint_is_rejected_without_path_disclosure(
+    tmp_path: Path, kind: str
+) -> None:
+    private_name = "private-checkpoint-sentinel"
+    candidate = tmp_path / private_name
+    if kind == "empty-directory":
+        candidate.mkdir()
+    elif kind == "wrong-file":
+        candidate.write_text("not a checkpoint", encoding="utf-8")
+    elif kind == "symlink":
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "config.yaml").write_text("pipeline: {}\n", encoding="utf-8")
+        candidate.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ProviderError) as raised:
+        PyannoteDiarizationProvider(
+            Credentials(HUGGINGFACE_TOKEN="must-not-reach-loader"),
+            model_path=candidate,
+            pipeline_factory=FakeFactory(AssertionError("factory must not be called")),
+        )
+
+    assert raised.value.code == "invalid_local_checkpoint"
+    assert private_name not in str(raised.value)
+    assert str(tmp_path) not in str(raised.value)
 
 
 @pytest.mark.parametrize(

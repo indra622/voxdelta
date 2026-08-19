@@ -17,6 +17,7 @@ from voxdelta.domain.models import (
 
 ProviderErrorCode = Literal[
     "invalid_audio_asset",
+    "invalid_local_checkpoint",
     "invalid_provider_output",
     "missing_huggingface_token",
     "missing_pyannote_api_key",
@@ -27,6 +28,7 @@ ProviderErrorCode = Literal[
 
 _PROVIDER_ERROR_MESSAGES: dict[ProviderErrorCode, str] = {
     "invalid_audio_asset": "The normalized audio asset is invalid.",
+    "invalid_local_checkpoint": "The local model checkpoint is invalid.",
     "invalid_provider_output": "The diarization provider returned invalid output.",
     "missing_huggingface_token": "A Hugging Face token is required for this model.",
     "missing_pyannote_api_key": "A pyannoteAI API key is required for this provider.",

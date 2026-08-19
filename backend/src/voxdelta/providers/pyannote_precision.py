@@ -31,5 +31,6 @@ class PyannotePrecisionProvider(_PyannoteAdapter):
                 retention_policy_url=retention_policy_url,
             ),
             credential_name="pyannoteai",
+            local_checkpoint=False,
             pipeline_factory=pipeline_factory,
         )

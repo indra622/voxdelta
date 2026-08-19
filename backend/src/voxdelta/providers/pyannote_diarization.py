@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from importlib import import_module
 from math import isfinite
@@ -35,6 +35,20 @@ class _Segment(Protocol):
     end: object
 
 
+class _TelemetryDisabledPipeline:
+    def __init__(
+        self,
+        pipeline: _Pipeline,
+        set_telemetry_metrics: Callable[[bool], None],
+    ) -> None:
+        self._pipeline = pipeline
+        self._set_telemetry_metrics = set_telemetry_metrics
+
+    def __call__(self, audio_path: str, **kwargs: int) -> object:
+        self._set_telemetry_metrics(False)
+        return self._pipeline(audio_path, **kwargs)
+
+
 @dataclass(frozen=True, slots=True)
 class DiarizationTimelines:
     """Overlap evidence plus a transcript-alignment timeline from one inference."""
@@ -53,8 +67,36 @@ class _Turn:
 def _default_pipeline_factory(model: str, *, token: str | None) -> _Pipeline:
     """Import pyannote only at the exact point the selected provider is first used."""
 
-    pipeline_class = import_module("pyannote.audio").Pipeline
-    return cast(_Pipeline, pipeline_class.from_pretrained(model, token=token))
+    pyannote_audio = import_module("pyannote.audio")
+    telemetry = import_module("pyannote.audio.telemetry")
+    set_telemetry_metrics = cast(Callable[[bool], None], telemetry.set_telemetry_metrics)
+    set_telemetry_metrics(False)
+    pipeline_class = pyannote_audio.Pipeline
+    pipeline = cast(_Pipeline, pipeline_class.from_pretrained(model, token=token))
+    return _TelemetryDisabledPipeline(pipeline, set_telemetry_metrics)
+
+
+def _local_checkpoint(model_path: Path) -> tuple[str, str]:
+    try:
+        if model_path.is_symlink():
+            raise ProviderError("invalid_local_checkpoint")
+        resolved = model_path.resolve(strict=True)
+        if resolved.is_dir():
+            config = resolved / "config.yaml"
+            if config.is_symlink() or not config.is_file():
+                raise ProviderError("invalid_local_checkpoint")
+            model_name = resolved.name
+        elif resolved.is_file() and resolved.name == "config.yaml":
+            model_name = resolved.parent.name
+        else:
+            raise ProviderError("invalid_local_checkpoint")
+    except ProviderError:
+        raise
+    except (OSError, RuntimeError):
+        raise ProviderError("invalid_local_checkpoint") from None
+    if not model_name:
+        raise ProviderError("invalid_local_checkpoint")
+    return str(resolved), model_name
 
 
 def _safe_provider_error(error: Exception) -> ProviderError:
@@ -188,12 +230,14 @@ class _PyannoteAdapter:
         model_reference: str,
         provenance: ProviderProvenance,
         credential_name: Literal["huggingface", "pyannoteai"],
+        local_checkpoint: bool,
         pipeline_factory: PipelineFactory | None,
     ) -> None:
         self.provenance = provenance
         self._credentials = credentials
         self._model_reference = model_reference
         self._credential_name = credential_name
+        self._local_checkpoint = local_checkpoint
         self._pipeline_factory = pipeline_factory or _default_pipeline_factory
         self._pipeline: _Pipeline | None = None
 
@@ -210,8 +254,8 @@ class _PyannoteAdapter:
     def _load_pipeline(self) -> _Pipeline:
         if self._pipeline is not None:
             return self._pipeline
-        secret = self._secret()
-        if secret is None and not Path(self._model_reference).is_absolute():
+        secret = None if self._local_checkpoint else self._secret()
+        if secret is None and not self._local_checkpoint:
             raise ProviderError(self._missing_code())
         try:
             self._pipeline = self._pipeline_factory(
@@ -299,12 +343,10 @@ class PyannoteDiarizationProvider(_PyannoteAdapter):
         if model_path is None:
             model_reference = COMMUNITY_MODEL_ID
             model_name = "speaker-diarization-community-1"
+            local_checkpoint = False
         else:
-            resolved = model_path.resolve()
-            model_reference = str(resolved)
-            model_name = resolved.name
-            if not model_name:
-                raise ValueError("local checkpoint must name a directory")
+            model_reference, model_name = _local_checkpoint(model_path)
+            local_checkpoint = True
         super().__init__(
             credentials,
             model_reference=model_reference,
@@ -314,5 +356,6 @@ class PyannoteDiarizationProvider(_PyannoteAdapter):
                 remote=False,
             ),
             credential_name="huggingface",
+            local_checkpoint=local_checkpoint,
             pipeline_factory=pipeline_factory,
         )
