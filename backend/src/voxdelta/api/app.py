@@ -14,6 +14,7 @@ from typing import Annotated, BinaryIO, cast
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -440,6 +441,22 @@ def create_app(
         _RequestBodyLimitMiddleware,
         max_bytes=max_upload_bytes + MULTIPART_OVERHEAD_BYTES,
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        request: Request,
+        error: RequestValidationError,
+    ) -> JSONResponse:
+        del request, error
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": {
+                    "code": "invalid_request",
+                    "message": "The request is invalid.",
+                }
+            },
+        )
 
     @app.get("/api/config/providers", response_model=ProviderConfiguration)
     def provider_configuration() -> ProviderConfiguration:

@@ -11,7 +11,8 @@ analysis of the recording's actual speech or emotion.
 
 ## Setup
 
-Install [uv](https://docs.astral.sh/uv/), FFmpeg, and `jq`, then run from the repository root:
+Install [uv](https://docs.astral.sh/uv/), FFmpeg, `curl`, and `jq`, then run from the repository
+root:
 
 ```bash
 uv python install 3.12
@@ -83,7 +84,10 @@ keeps the development service off external network interfaces.
 ## HTTP API
 
 All job errors use a stable public `detail` payload and omit host paths, credentials, transcripts,
-provider payloads, and internal cache/claim metadata.
+provider payloads, and internal cache/claim metadata. Framework-level request validation failures
+return HTTP 422 as
+`{"detail":{"code":"invalid_request","message":"The request is invalid."}}` without echoing the
+invalid body.
 
 - `GET /api/config/providers` returns all eight pipeline stages with public provider provenance,
   transmitted-content declarations, and retention-policy URLs. Fake provider stages are local,
@@ -181,7 +185,8 @@ uv run uvicorn voxdelta.api.app:app \
 SERVER_PID=$!
 
 for _ in $(seq 1 100); do
-  if curl -fsS http://127.0.0.1:8765/api/config/providers \
+  if curl --connect-timeout 1 --max-time 2 -fsS \
+    http://127.0.0.1:8765/api/config/providers \
     >"$SMOKE_ROOT/providers.json"; then
     break
   fi
@@ -189,7 +194,7 @@ for _ in $(seq 1 100); do
 done
 jq -e '.stages | length == 8' "$SMOKE_ROOT/providers.json" >/dev/null
 
-UPLOAD_CODE="$(curl -sS \
+UPLOAD_CODE="$(curl --connect-timeout 2 --max-time 60 -sS \
   -o "$SMOKE_ROOT/created.json" \
   -w '%{http_code}' \
   -F 'file=@tests/fixtures/synthetic_65s.wav;type=audio/wav' \
@@ -199,7 +204,8 @@ test "$UPLOAD_CODE" = 202
 JOB_ID="$(jq -er '.job_id' "$SMOKE_ROOT/created.json")"
 
 for _ in $(seq 1 100); do
-  curl -fsS "http://127.0.0.1:8765/api/jobs/$JOB_ID" \
+  curl --connect-timeout 2 --max-time 10 -fsS \
+    "http://127.0.0.1:8765/api/jobs/$JOB_ID" \
     >"$SMOKE_ROOT/paused.json"
   if jq -e \
     '.status == "paused" and .stages.confirm_roles.status == "paused"' \
@@ -230,7 +236,7 @@ jq -e \
   --argjson observed "$(jq '.role_candidate.speakers' "$SMOKE_ROOT/paused.json")" \
   "$SMOKE_ROOT/roles.json" >/dev/null
 
-ROLE_CODE="$(curl -sS \
+ROLE_CODE="$(curl --connect-timeout 2 --max-time 60 -sS \
   -o "$SMOKE_ROOT/role-response.json" \
   -w '%{http_code}' \
   -H 'Content-Type: application/json' \
@@ -239,7 +245,8 @@ ROLE_CODE="$(curl -sS \
 test "$ROLE_CODE" = 200
 
 for _ in $(seq 1 100); do
-  curl -fsS "http://127.0.0.1:8765/api/jobs/$JOB_ID" \
+  curl --connect-timeout 2 --max-time 10 -fsS \
+    "http://127.0.0.1:8765/api/jobs/$JOB_ID" \
     >"$SMOKE_ROOT/completed.json"
   if jq -e '.status == "completed" and .stages.report.status == "completed"' \
     "$SMOKE_ROOT/completed.json" >/dev/null; then
@@ -250,7 +257,7 @@ done
 jq -e '.status == "completed" and .stages.report.status == "completed"' \
   "$SMOKE_ROOT/completed.json" >/dev/null
 
-RANGE_CODE="$(curl -sS \
+RANGE_CODE="$(curl --connect-timeout 2 --max-time 30 -sS \
   -D "$SMOKE_ROOT/range.headers" \
   -o "$SMOKE_ROOT/range.bin" \
   -w '%{http_code}' \
@@ -260,12 +267,13 @@ test "$RANGE_CODE" = 206
 grep -Eiq '^content-range: bytes 0-1023/[0-9]+' "$SMOKE_ROOT/range.headers"
 test "$(wc -c <"$SMOKE_ROOT/range.bin" | tr -d ' ')" = 1024
 
-curl -fsS "http://127.0.0.1:8765/api/jobs/$JOB_ID/report" \
+curl --connect-timeout 2 --max-time 30 -fsS \
+  "http://127.0.0.1:8765/api/jobs/$JOB_ID/report" \
   >"$SMOKE_ROOT/report.json"
 jq -e 'has("transitions") and (.utterances | length > 0)' \
   "$SMOKE_ROOT/report.json" >/dev/null
 
-DELETE_CODE="$(curl -sS \
+DELETE_CODE="$(curl --connect-timeout 2 --max-time 30 -sS \
   -o /dev/null \
   -w '%{http_code}' \
   -X DELETE \

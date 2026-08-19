@@ -227,6 +227,76 @@ async def test_docs_and_provider_disclosures_are_public_and_secret_free(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_request_validation_errors_are_uniform_and_never_echo_input(
+    tmp_path: Path,
+) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+    transcript = "PRIVATE_TRANSCRIPT_SENTINEL"
+    provider_payload = "PRIVATE_PROVIDER_PAYLOAD_SENTINEL"
+    expected = {
+        "detail": {
+            "code": "invalid_request",
+            "message": "The request is invalid.",
+        }
+    }
+
+    async with client_for(app) as client:
+        invalid_role = await client.post(
+            "/api/jobs/validation-sentinel/roles",
+            json={
+                "mapping": {
+                    "SPEAKER_00": "customer",
+                    "SPEAKER_01": "PRIVATE_INVALID_ROLE_SENTINEL",
+                },
+                "transcript": transcript,
+                "provider_payload": {"raw": provider_payload},
+            },
+        )
+        malformed_retry = await client.post(
+            "/api/jobs/validation-sentinel/retry",
+            json={
+                "stage": {"transcript": transcript},
+                "provider_payload": provider_payload,
+            },
+        )
+        missing_multipart_file = await client.post(
+            "/api/jobs",
+            data={
+                "transcript": transcript,
+                "provider_payload": provider_payload,
+            },
+        )
+
+    for response in (invalid_role, malformed_retry, missing_multipart_file):
+        assert response.status_code == 422
+        assert response.json() == expected
+        assert transcript not in response.text
+        assert provider_payload not in response.text
+        assert "PRIVATE_INVALID_ROLE_SENTINEL" not in response.text
+        assert str(tmp_path) not in response.text
+
+
+@pytest.mark.asyncio
+async def test_validation_handler_preserves_openapi_and_intentional_http_errors(
+    tmp_path: Path,
+) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        openapi = await client.get("/openapi.json")
+        missing = await client.get("/api/jobs/missing")
+
+    assert openapi.status_code == 200
+    assert missing.status_code == 404
+    assert missing.json() == {
+        "detail": {
+            "code": "job_not_found",
+            "message": "The requested job was not found.",
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_upload_pauses_persists_diagnostic_false_and_never_trusts_filename(
     tmp_path: Path,
 ) -> None:

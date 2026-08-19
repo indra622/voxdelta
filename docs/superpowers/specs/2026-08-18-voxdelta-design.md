@@ -284,7 +284,7 @@ ASR candidate selection first requires at least 95% completion on the consultati
 
 ## 13. Repository and Version Control
 
-- Local path: `/Users/hosungmini/codes/voxdelta`
+- Repository root: `.` (the current Git checkout)
 - GitHub owner: `indra622`
 - Repository visibility: Private
 - Default branch: `main`
