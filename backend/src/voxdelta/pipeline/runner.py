@@ -562,12 +562,29 @@ class PipelineRunner:
         except (OSError, TypeError, ValueError, ValidationError):
             return None
 
-    def _invalidate_from(self, job_id: str, stage: StageName) -> None:
+    def _job_deleting_error(self) -> PipelineStateError:
+        return PipelineStateError(
+            "job_deleting",
+            "The job is being deleted and cannot be retried.",
+        )
+
+    def _invalidate_from_under_operation_lock(self, job_id: str, stage: StageName) -> None:
+        job = self._repository.get_job(job_id)
+        if job.get("status") == "deleting":
+            raise self._job_deleting_error()
         selected = downstream_stages(stage)
-        with self._artifacts.operation_lock(job_id):
+        try:
             self._repository.invalidate_stages(job_id, selected)
-            for selected_stage in selected:
-                self._artifacts.delete_stage(job_id, selected_stage)
+        except ValueError:
+            if self._repository.get_job(job_id).get("status") == "deleting":
+                raise self._job_deleting_error() from None
+            raise
+        for selected_stage in selected:
+            self._artifacts.delete_stage(job_id, selected_stage)
+
+    def _invalidate_from(self, job_id: str, stage: StageName) -> None:
+        with self._artifacts.operation_lock(job_id):
+            self._invalidate_from_under_operation_lock(job_id, stage)
 
     def _public_failure(self, stage: StageName, error: BaseException) -> PipelineValidationError:
         if isinstance(error, PipelineValidationError):
@@ -1219,21 +1236,19 @@ class PipelineRunner:
 
         if not isinstance(stage, StageName):
             raise PipelineValidationError("invalid_stage", "Select a valid pipeline stage.")
-        job = self._repository.get_job(job_id)
-        if job.get("status") == "deleting":
-            raise PipelineStateError(
-                "job_deleting",
-                "The job is being deleted and cannot be retried.",
-            )
+        self._repository.get_job(job_id)
         with self._job_lock(job_id):
-            job = self._repository.get_job(job_id)
-            if job.get("status") == "deleting":
-                raise PipelineStateError(
-                    "job_deleting",
-                    "The job is being deleted and cannot be retried.",
-                )
-            self._invalidate_from(job_id, stage)
-            return self._run_locked(job_id)
+            with self._artifacts.operation_lock(job_id):
+                self._invalidate_from_under_operation_lock(job_id, stage)
+            try:
+                result = self._run_locked(job_id)
+            except KeyError:
+                if self._artifacts.deletion_tombstone_exists(job_id):
+                    raise self._job_deleting_error() from None
+                raise
+            if result.get("status") == "deleting":
+                raise self._job_deleting_error()
+            return result
 
 
 __all__ = ["PipelineRunner", "PipelineStateError", "PipelineValidationError"]

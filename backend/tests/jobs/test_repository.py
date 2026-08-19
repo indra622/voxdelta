@@ -350,28 +350,18 @@ def test_delete_job_rejects_an_unknown_job(tmp_path: Path) -> None:
         repository.delete_job("missing")
 
 
-def test_discard_unstarted_job_removes_only_a_pristine_pending_job(tmp_path: Path) -> None:
+def test_create_job_accepts_one_explicit_validated_id_and_rejects_reuse(tmp_path: Path) -> None:
     repository = JobRepository(tmp_path / "voxdelta.sqlite3")
-    pristine = repository.create_job("")
-    claimed = repository.create_job("")
-    completed = repository.create_job("")
-    assert repository.claim_stage(claimed, StageName.NORMALIZE) is not None
-    with sqlite3.connect(repository.path) as database:
-        database.execute(
-            "UPDATE stages SET status = 'completed' WHERE job_id = ? AND stage = 'normalize'",
-            (completed,),
-        )
+    selected = "a" * 32
 
-    repository.discard_unstarted_job(pristine)
-    with pytest.raises(KeyError):
-        repository.get_job(pristine)
-    with pytest.raises(ValueError, match="unstarted"):
-        repository.discard_unstarted_job(claimed)
-    with pytest.raises(ValueError, match="unstarted"):
-        repository.discard_unstarted_job(completed)
+    created = repository.create_job("source.wav", job_id=selected)
 
-    assert repository.get_job(claimed)["stages"]["normalize"]["status"] == "running"
-    assert repository.get_job(completed)["stages"]["normalize"]["status"] == "completed"
+    assert created == selected
+    assert repository.get_job(selected)["source_name"] == "source.wav"
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.create_job("other.wav", job_id=selected)
+    with pytest.raises(ValueError, match="job ID"):
+        repository.create_job("escape.wav", job_id="../escape")
 
 
 @pytest.mark.parametrize(

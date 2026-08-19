@@ -65,6 +65,18 @@ class _RequestBodyLimitExceeded(Exception):
     pass
 
 
+def _upload_too_large_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=413,
+        content={
+            "detail": {
+                "code": "upload_too_large",
+                "message": "The uploaded file exceeds the configured size limit.",
+            }
+        },
+    )
+
+
 class _RequestBodyLimitMiddleware:
     """Stop oversized upload bodies while the multipart parser is still reading ASGI messages."""
 
@@ -80,6 +92,17 @@ class _RequestBodyLimitMiddleware:
         ):
             await self._app(scope, receive, send)
             return
+
+        content_lengths = [
+            value.strip()
+            for name, value in scope.get("headers", [])
+            if name.lower() == b"content-length"
+        ]
+        if len(content_lengths) == 1 and content_lengths[0].isdigit():
+            declared_length = int(content_lengths[0])
+            if declared_length > self._max_bytes:
+                await _upload_too_large_response()(scope, receive, send)
+                return
 
         total = 0
         limit_exceeded = False
@@ -108,16 +131,7 @@ class _RequestBodyLimitMiddleware:
         except _RequestBodyLimitExceeded:
             if response_started:
                 raise
-            response = JSONResponse(
-                status_code=413,
-                content={
-                    "detail": {
-                        "code": "upload_too_large",
-                        "message": "The uploaded file exceeds the configured size limit.",
-                    }
-                },
-            )
-            await response(scope, receive, send)
+            await _upload_too_large_response()(scope, receive, send)
 
 
 class _ContextCloser:
@@ -236,42 +250,43 @@ def _public_job(repository: JobRepository, runner: PipelineRunner, job_id: str) 
     )
 
 
-def _cleanup_failed_upload(
-    repository: JobRepository,
+def _cleanup_incoming_upload(
     artifacts: ArtifactStore,
-    job_id: str,
     descriptor: int | None,
-    destination: Path | None,
+    incoming: Path | None,
 ) -> None:
     if descriptor is not None:
         try:
             os.close(descriptor)
         except OSError:
             pass
-    if destination is not None:
+    if incoming is not None:
         try:
-            destination.unlink(missing_ok=True)
+            artifacts.discard_incoming_upload(incoming)
         except Exception:
             pass
-    discarded = False
+
+
+def _rollback_registered_upload(
+    repository: JobRepository,
+    artifacts: ArtifactStore,
+    job_id: str,
+) -> None:
     try:
-        with artifacts.operation_lock(job_id):
-            try:
-                artifacts.discard_unstarted_job(job_id)
-            except Exception:
-                pass
-            try:
-                repository.discard_unstarted_job(job_id)
-                discarded = True
-            except Exception:
-                pass
+        repository.delete_job(job_id)
+    except Exception:
+        return
+    try:
+        artifacts.discard_unregistered_job(job_id)
     except Exception:
         pass
-    if not discarded:
-        try:
-            repository.fail_unhandled_job(job_id)
-        except Exception:
-            pass
+
+
+def _discard_unregistered_upload(artifacts: ArtifactStore, job_id: str) -> None:
+    try:
+        artifacts.discard_unregistered_job(job_id)
+    except Exception:
+        pass
 
 
 def _parse_range(raw: str | None, size: int) -> tuple[int, int] | None:
@@ -381,16 +396,12 @@ def create_app(
                     "message": "Upload a WAV, MP3, or M4A audio file.",
                 },
             )
-        job_id = repository.create_job("", diagnostic_capture=diagnostic_capture)
-        destination: Path | None = None
+        job_id = uuid4().hex
+        incoming: Path | None = None
         descriptor: int | None = None
         failure: BaseException | None = None
         try:
-            directory = artifacts.job_dir(job_id)
-            destination = directory / f"source-upload-{uuid4().hex}{suffix}"
-            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(destination, flags, 0o600)
+            descriptor, incoming = artifacts.open_incoming_upload(job_id, suffix)
             total = 0
             while chunk := await uploaded_file.read(UPLOAD_CHUNK_BYTES):
                 total += len(chunk)
@@ -424,13 +435,7 @@ def create_app(
             if failure is None:
                 failure = error
         if failure is not None:
-            _cleanup_failed_upload(
-                repository,
-                artifacts,
-                job_id,
-                descriptor,
-                destination,
-            )
+            _cleanup_incoming_upload(artifacts, descriptor, incoming)
             if isinstance(failure, _UploadAdmissionError):
                 raise HTTPException(
                     status_code=failure.status_code,
@@ -443,17 +448,37 @@ def create_app(
                     "message": "The upload could not be stored safely.",
                 },
             ) from None
+        assert incoming is not None
         try:
-            repository.update_source_name(job_id, str(destination))
+            destination = artifacts.adopt_incoming_upload(job_id, incoming, suffix)
+        except BaseException:
+            _cleanup_incoming_upload(artifacts, None, incoming)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "upload_failed",
+                    "message": "The upload could not be stored safely.",
+                },
+            ) from None
+        try:
+            repository.create_job(
+                str(destination),
+                diagnostic_capture=diagnostic_capture,
+                job_id=job_id,
+            )
+        except BaseException:
+            _discard_unregistered_upload(artifacts, job_id)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "upload_failed",
+                    "message": "The upload could not be stored safely.",
+                },
+            ) from None
+        try:
             background_tasks.add_task(_safe_background_run, runner, job_id)
         except BaseException:
-            _cleanup_failed_upload(
-                repository,
-                artifacts,
-                job_id,
-                descriptor,
-                destination,
-            )
+            _rollback_registered_upload(repository, artifacts, job_id)
             raise HTTPException(
                 status_code=500,
                 detail={

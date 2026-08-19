@@ -11,6 +11,7 @@ import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
@@ -39,16 +40,38 @@ _LINKED_JOB_DIRECTORY_ERROR = (
 )
 _OPERATION_LOCK_VALIDATION_ERROR = "job operation lock could not be validated safely"
 _TOMBSTONE_VALIDATION_ERROR = "job deletion tombstone could not be validated safely"
-_OPERATION_LOCKS: dict[Path, threading.Lock] = {}
+_INCOMING_VALIDATION_ERROR = "incoming upload could not be validated safely"
+
+
+@dataclass(slots=True)
+class _ProcessLockEntry:
+    lock: threading.Lock
+    users: int = 0
+
+
+_OPERATION_LOCKS: dict[Path, _ProcessLockEntry] = {}
 _OPERATION_LOCKS_GUARD = threading.Lock()
 
 
-def _operation_process_lock(path: Path) -> threading.Lock:
-    """Return the process-wide fallback used when cross-process flock is unavailable."""
+@contextmanager
+def _operation_process_lock(path: Path) -> Iterator[None]:
+    """Reference-count the process fallback while leaving the cross-process file durable."""
 
     lexical = path if path.is_absolute() else path.absolute()
     with _OPERATION_LOCKS_GUARD:
-        return _OPERATION_LOCKS.setdefault(lexical, threading.Lock())
+        entry = _OPERATION_LOCKS.get(lexical)
+        if entry is None:
+            entry = _ProcessLockEntry(threading.Lock())
+            _OPERATION_LOCKS[lexical] = entry
+        entry.users += 1
+    try:
+        with entry.lock:
+            yield
+    finally:
+        with _OPERATION_LOCKS_GUARD:
+            entry.users -= 1
+            if entry.users == 0 and _OPERATION_LOCKS.get(lexical) is entry:
+                del _OPERATION_LOCKS[lexical]
 
 
 def _is_link_like(path: Path) -> bool:
@@ -193,23 +216,19 @@ class ArtifactStore:
             raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
         return True
 
-    def mark_deletion_tombstone(self, job_id: str) -> Path:
-        """Atomically and durably fence every future write for one random job ID."""
-
-        target = self._tombstone_path(job_id, create_directory=True)
-        create_flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-        create_flags |= getattr(os, "O_NOFOLLOW", 0)
-        existing_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-        existing_flags |= getattr(os, "O_NOFOLLOW", 0)
-        created = False
+    def _tombstone_payload(self, target: Path, *, sync: bool) -> bytes | None:
+        if not target.exists() and not _is_link_like(target):
+            return None
+        if _is_link_like(target):
+            raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(target, create_flags, 0o600)
-            created = True
-        except FileExistsError:
-            try:
-                descriptor = os.open(target, existing_flags)
-            except OSError:
-                raise ValueError(_TOMBSTONE_VALIDATION_ERROR) from None
+            descriptor = os.open(target, flags)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ValueError(_TOMBSTONE_VALIDATION_ERROR) from None
         try:
             opened = os.fstat(descriptor)
             current = target.lstat()
@@ -225,23 +244,53 @@ class ArtifactStore:
             ):
                 raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
             os.fchmod(descriptor, 0o600)
-            payload = job_id.encode("ascii")
-            if created:
-                remaining = memoryview(payload)
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written <= 0:
-                        raise OSError("tombstone write made no progress")
-                    remaining = remaining[written:]
-            else:
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                persisted = os.read(descriptor, len(payload) + 1)
-                if persisted != payload:
-                    raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
-            os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            payload = os.read(descriptor, 4096)
+            if sync:
+                os.fsync(descriptor)
+            return payload
         finally:
             os.close(descriptor)
-        _fsync_directory(target.parent)
+
+    def _replace_tombstone(self, target: Path, payload: bytes) -> None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("tombstone write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            # Never replace a linked or non-regular entry, even inside the private directory.
+            self._tombstone_payload(target, sync=False)
+            os.replace(temporary, target)
+            persisted = self._tombstone_payload(target, sync=True)
+            if persisted != payload:
+                raise ValueError(_TOMBSTONE_VALIDATION_ERROR)
+            _fsync_directory(target.parent)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+
+    def mark_deletion_tombstone(self, job_id: str) -> Path:
+        """Atomically and durably fence every future write for one random job ID."""
+
+        target = self._tombstone_path(job_id, create_directory=True)
+        expected = job_id.encode("ascii")
+        if self._tombstone_payload(target, sync=True) != expected:
+            self._replace_tombstone(target, expected)
+        else:
+            _fsync_directory(target.parent)
         return target
 
     def _job_path(
@@ -293,12 +342,134 @@ class ArtifactStore:
 
         return self._job_path(job_id, create=True, require_directory=True)
 
+    def _validate_upload_suffix(self, suffix: str) -> None:
+        if suffix not in {".wav", ".mp3", ".m4a"}:
+            raise ValueError(_INCOMING_VALIDATION_ERROR)
+
+    def _validated_incoming_path(self, path: Path, *, require_file: bool) -> Path:
+        directory = self._control_directory(
+            ".incoming",
+            create=False,
+            error_message=_INCOMING_VALIDATION_ERROR,
+        )
+        candidate = Path(path)
+        try:
+            is_local = candidate.parent.resolve() == directory.resolve()
+        except (OSError, RuntimeError):
+            raise ValueError(_INCOMING_VALIDATION_ERROR) from None
+        if not is_local or _is_link_like(candidate):
+            raise ValueError(_INCOMING_VALIDATION_ERROR)
+        if not candidate.exists():
+            if require_file:
+                raise FileNotFoundError(candidate)
+            return candidate
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            raise ValueError(_INCOMING_VALIDATION_ERROR) from None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(_INCOMING_VALIDATION_ERROR)
+        return candidate
+
+    def open_incoming_upload(self, job_id: str, suffix: str) -> tuple[int, Path]:
+        """Create one private upload file outside every public job directory."""
+
+        validate_job_id(job_id)
+        self._validate_upload_suffix(suffix)
+        directory = self._control_directory(
+            ".incoming",
+            create=True,
+            error_message=_INCOMING_VALIDATION_ERROR,
+        )
+        descriptor, name = tempfile.mkstemp(
+            dir=directory,
+            prefix=f".upload-{job_id}-",
+            suffix=suffix,
+        )
+        path = Path(name)
+        try:
+            os.fchmod(descriptor, 0o600)
+        except BaseException:
+            os.close(descriptor)
+            path.unlink(missing_ok=True)
+            _fsync_directory(directory)
+            raise
+        return descriptor, path
+
+    def discard_incoming_upload(self, path: Path) -> None:
+        """Remove one exact staged upload and persist its directory entry removal."""
+
+        candidate = self._validated_incoming_path(path, require_file=False)
+        candidate.unlink(missing_ok=True)
+        _fsync_directory(candidate.parent)
+
+    def adopt_incoming_upload(self, job_id: str, path: Path, suffix: str) -> Path:
+        """Move one admitted upload into a new exact job directory and persist the move."""
+
+        validate_job_id(job_id)
+        self._validate_upload_suffix(suffix)
+        incoming = self._validated_incoming_path(path, require_file=True)
+        if self.deletion_tombstone_exists(job_id):
+            raise FileExistsError(job_id)
+        self.root.mkdir(parents=True, exist_ok=True)
+        directory = self.root / job_id
+        if _is_link_like(directory):
+            raise ValueError(_LINKED_JOB_DIRECTORY_ERROR)
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            raise FileExistsError(job_id) from None
+        destination = directory / f"source-upload{suffix}"
+        try:
+            os.replace(incoming, destination)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(destination, flags)
+            try:
+                opened = os.fstat(descriptor)
+                current = destination.lstat()
+                if (
+                    _is_link_like(destination)
+                    or not stat.S_ISREG(opened.st_mode)
+                    or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                ):
+                    raise ValueError(_INCOMING_VALIDATION_ERROR)
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            _fsync_directory(directory)
+            _fsync_directory(self.root)
+            return destination
+        except BaseException:
+            try:
+                if directory.exists() and not _is_link_like(directory):
+                    shutil.rmtree(directory)
+                    _fsync_directory(self.root)
+            except Exception:
+                pass
+            try:
+                self.discard_incoming_upload(incoming)
+            except Exception:
+                pass
+            raise
+
+    def discard_unregistered_job(self, job_id: str) -> None:
+        """Remove an adopted directory whose repository insert is known to have failed."""
+
+        directory = self._job_path(job_id, create=False, require_directory=False)
+        if directory.exists():
+            shutil.rmtree(directory)
+        _fsync_directory(self.root)
+
     @contextmanager
     def operation_lock(self, job_id: str) -> Iterator[None]:
         """Serialize one job's claim/reset transitions across runner processes.
 
         POSIX uses ``flock`` on a validated root-control file. Platforms without ``fcntl``
         retain process-wide per-path serialization but cannot promise cross-process locking.
+        Lock files intentionally remain durable because unlinking a potentially shared inode can
+        split later callers onto a different lock; only the reference-counted memory entry expires.
         """
 
         validate_job_id(job_id)
@@ -421,18 +592,6 @@ class ArtifactStore:
             create=False,
             require_directory=False,
             allow_deleted=True,
-        )
-        if resolved_target.exists():
-            shutil.rmtree(resolved_target)
-        _fsync_directory(self.root)
-
-    def discard_unstarted_job(self, job_id: str) -> None:
-        """Remove a never-scheduled job directory without permanently fencing its random ID."""
-
-        resolved_target = self._job_path(
-            job_id,
-            create=False,
-            require_directory=False,
         )
         if resolved_target.exists():
             shutil.rmtree(resolved_target)

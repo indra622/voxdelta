@@ -52,16 +52,16 @@ class PreClaimFailRunner(PipelineRunner):
         raise RuntimeError("private pre-claim failure /absolute/path")
 
 
-class FailingDeleteStore(ArtifactStore):
-    def discard_unstarted_job(self, job_id: str) -> None:
-        del job_id
-        raise OSError("private artifact cleanup path")
-
-
-class FailingDeleteRepository(JobRepository):
-    def discard_unstarted_job(self, job_id: str) -> None:
-        del job_id
-        raise RuntimeError("private database cleanup row")
+class FailingCreateRepository(JobRepository):
+    def create_job(
+        self,
+        source_name: str,
+        diagnostic_capture: bool = False,
+        *,
+        job_id: str | None = None,
+    ) -> str:
+        del source_name, diagnostic_capture, job_id
+        raise RuntimeError("private database create failure")
 
 
 class FailOnceFinalizeRepository(JobRepository):
@@ -138,16 +138,19 @@ async def raw_chunked_request(
     body: bytes,
     *,
     include_content_length: bool,
+    content_length_values: list[bytes] | None = None,
     chunk_size: int = 4096,
-) -> tuple[list[dict[str, object]], int]:
+) -> tuple[list[dict[str, object]], int, int]:
     """Drive the ASGI app without allowing an HTTP client to pre-buffer the request."""
 
     offset = 0
     received = 0
+    receive_calls = 0
     sent: list[dict[str, object]] = []
 
     async def receive() -> dict[str, object]:
-        nonlocal offset, received
+        nonlocal offset, receive_calls, received
+        receive_calls += 1
         chunk = body[offset : offset + chunk_size]
         offset += len(chunk)
         received += len(chunk)
@@ -162,7 +165,9 @@ async def raw_chunked_request(
 
     boundary = b"voxdelta-boundary"
     headers = [(b"content-type", b"multipart/form-data; boundary=" + boundary)]
-    if include_content_length:
+    if content_length_values is not None:
+        headers.extend((b"content-length", value) for value in content_length_values)
+    elif include_content_length:
         headers.append((b"content-length", str(len(body)).encode("ascii")))
     scope = {
         "type": "http",
@@ -178,7 +183,7 @@ async def raw_chunked_request(
         "server": ("test", 80),
     }
     await app(scope, receive, send)  # type: ignore[arg-type]
-    return sent, received
+    return sent, received, receive_calls
 
 
 def job_count(repository: JobRepository) -> int:
@@ -228,7 +233,7 @@ async def test_upload_pauses_persists_diagnostic_false_and_never_trusts_filename
     assert row["diagnostic_capture"] == 0
     source = Path(str(row["source_name"]))
     assert source.parent == artifacts.job_dir(job_id)
-    assert source.name.startswith("source-upload-")
+    assert source.name == "source-upload.wav"
     assert source.suffix == ".wav"
     assert source.stat().st_mode & 0o777 == 0o600
     assert "private-call" not in source.name
@@ -302,7 +307,38 @@ async def test_upload_rejects_cap_plus_one_and_empty_and_cleans_partial_state(
     assert job_count(repository) == 0
     assert not artifacts.root.exists() or not list(artifacts.root.glob("[!.]*"))
     assert not (artifacts.root / ".deleted").exists()
+    assert not (artifacts.root / ".locks").exists()
+    assert not [
+        path
+        for path in artifacts_module._OPERATION_LOCKS  # noqa: SLF001
+        if artifacts.root in path.parents
+    ]
+    assert not list((artifacts.root / ".incoming").glob("*"))
     assert str(tmp_path) not in "".join(response.text for response in oversized + empty)
+
+
+@pytest.mark.asyncio
+async def test_invalid_admissions_preserve_claimed_job_and_sentinel(tmp_path: Path) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path, max_upload_bytes=8)
+    claimed = repository.create_job("existing.wav")
+    assert repository.claim_stage(claimed, StageName.NORMALIZE) is not None
+    sentinel = artifacts.job_dir(claimed) / "sentinel.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+
+    async with client_for(app) as client:
+        responses = [
+            await client.post(
+                "/api/jobs",
+                files={"file": ("call.wav", b"123456789", "audio/wav")},
+            )
+            for _ in range(3)
+        ]
+
+    assert all(response.status_code == 413 for response in responses)
+    assert repository.get_job(claimed)["stages"]["normalize"]["status"] == "running"
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+    assert not (artifacts.root / ".deleted").exists()
+    assert not (artifacts.root / ".locks").exists()
 
 
 @pytest.mark.asyncio
@@ -323,7 +359,7 @@ async def test_raw_multipart_ingress_stops_near_request_cap_before_parsing(
         )
     )
 
-    sent, received = await raw_chunked_request(
+    sent, received, receive_calls = await raw_chunked_request(
         app,
         body,
         include_content_length=include_content_length,
@@ -342,8 +378,69 @@ async def test_raw_multipart_ingress_stops_near_request_cap_before_parsing(
     }
     assert received <= 8 + (64 * 1024) + 4096
     assert received < len(body)
+    if include_content_length:
+        assert receive_calls == 0
+    else:
+        assert receive_calls > 0
     assert job_count(repository) == 0
     assert not artifacts.root.exists()
+
+
+@pytest.mark.asyncio
+async def test_obviously_oversized_content_length_rejects_without_receiving_body(
+    tmp_path: Path,
+) -> None:
+    app, repository, artifacts, _ = build_harness(tmp_path, max_upload_bytes=8)
+    body = b"x" * (3 * 1024 * 1024)
+
+    sent, received, receive_calls = await raw_chunked_request(
+        app,
+        body,
+        include_content_length=False,
+        content_length_values=[str(8 + (64 * 1024) + 1).encode("ascii")],
+    )
+
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    assert start["status"] == 413
+    assert received == 0
+    assert receive_calls == 0
+    assert job_count(repository) == 0
+    assert not artifacts.root.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content_length_values",
+    [[b"invalid"], [b"-1"], [b"1", b"9999999"]],
+)
+async def test_malformed_or_conflicting_content_length_uses_streaming_cap(
+    tmp_path: Path,
+    content_length_values: list[bytes],
+) -> None:
+    app, repository, _, _ = build_harness(tmp_path, max_upload_bytes=8)
+    boundary = b"voxdelta-boundary"
+    body = b"".join(
+        (
+            b"--" + boundary + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="call.wav"\r\n',
+            b"Content-Type: audio/wav\r\n\r\n",
+            b"x" * (3 * 1024 * 1024),
+            b"\r\n--" + boundary + b"--\r\n",
+        )
+    )
+
+    sent, received, receive_calls = await raw_chunked_request(
+        app,
+        body,
+        include_content_length=False,
+        content_length_values=content_length_values,
+    )
+
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    assert start["status"] == 413
+    assert 0 < received <= 8 + (64 * 1024) + 4096
+    assert receive_calls > 0
+    assert job_count(repository) == 0
 
 
 @pytest.mark.asyncio
@@ -373,6 +470,8 @@ async def test_upload_close_failure_is_sanitized_and_cleans_job(
     assert job_count(repository) == 0
     assert not artifacts.root.exists() or not list(artifacts.root.glob("[!.]*"))
     assert not (artifacts.root / ".deleted").exists()
+    assert not (artifacts.root / ".locks").exists()
+    assert not list((artifacts.root / ".incoming").glob("*"))
     assert "private" not in response.text
     assert str(tmp_path) not in response.text
 
@@ -384,7 +483,7 @@ async def test_upload_cleanup_continues_after_source_unlink_failure(
     original_unlink = Path.unlink
 
     def failing_source_unlink(self: Path, *args: object, **kwargs: object) -> None:
-        if self.name.startswith("source-upload-"):
+        if self.name.startswith(".upload-"):
             raise OSError("private unlink path")
         original_unlink(self, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -410,45 +509,25 @@ async def test_upload_cleanup_continues_after_source_unlink_failure(
 
 
 @pytest.mark.asyncio
-async def test_upload_cleanup_continues_after_artifact_delete_failure(tmp_path: Path) -> None:
-    jobs_root = tmp_path / "jobs"
-    artifacts = FailingDeleteStore(jobs_root)
-    app, repository, _, _ = build_harness(
-        tmp_path,
-        max_upload_bytes=1,
-        artifacts_override=artifacts,
-    )
-    async with client_for(app) as client:
-        response = await client.post(
-            "/api/jobs",
-            files={"file": ("call.wav", b"12", "audio/wav")},
-        )
-
-    assert response.status_code == 413
-    assert job_count(repository) == 0
-    assert not list(jobs_root.rglob("source-upload-*"))
-
-
-@pytest.mark.asyncio
-async def test_upload_cleanup_repository_delete_failure_falls_back_to_failed_state(
+async def test_database_create_failure_after_adopt_discards_unregistered_directory(
     tmp_path: Path,
 ) -> None:
-    repository = FailingDeleteRepository(tmp_path / "voxdelta.sqlite3")
+    repository = FailingCreateRepository(tmp_path / "voxdelta.sqlite3")
     app, _, artifacts, _ = build_harness(
         tmp_path,
-        max_upload_bytes=1,
         repository_override=repository,
     )
     async with client_for(app) as client:
-        response = await client.post(
-            "/api/jobs",
-            files={"file": ("call.wav", b"12", "audio/wav")},
-        )
+        response = await upload(client)
 
-    assert response.status_code == 413
-    with sqlite3.connect(repository.path) as database:
-        assert database.execute("SELECT status FROM jobs").fetchone() == ("failed",)
-    assert not list(artifacts.root.rglob("source-upload-*"))
+    assert response.status_code == 500
+    assert job_count(repository) == 0
+    assert not [
+        path for path in artifacts.root.iterdir() if path.is_dir() and not path.name.startswith(".")
+    ]
+    assert not list((artifacts.root / ".incoming").glob("*"))
+    assert not (artifacts.root / ".deleted").exists()
+    assert not (artifacts.root / ".locks").exists()
     assert "private" not in response.text
 
 
@@ -975,6 +1054,30 @@ async def test_retry_of_deleting_job_is_a_conflict_not_not_found(tmp_path: Path)
         "code": "job_deleting",
         "message": "The job is being deleted and cannot be retried.",
     }
+
+
+@pytest.mark.asyncio
+async def test_retry_delete_race_from_repository_value_error_remains_http_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, repository, _, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        original_invalidate = repository.invalidate_stages
+
+        def deleting_invalidate(selected_job_id: str, stages: tuple[StageName, ...]) -> None:
+            repository.begin_delete(selected_job_id)
+            original_invalidate(selected_job_id, stages)
+
+        monkeypatch.setattr(repository, "invalidate_stages", deleting_invalidate)
+        response = await client.post(
+            f"/api/jobs/{job_id}/retry",
+            json={"stage": "diarize"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "job_deleting"
 
 
 @pytest.mark.asyncio

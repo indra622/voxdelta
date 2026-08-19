@@ -8,6 +8,7 @@ import threading
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -28,7 +29,7 @@ from voxdelta.domain.models import (
 )
 from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.repository import JobRepository
-from voxdelta.pipeline.runner import PipelineRunner, PipelineValidationError
+from voxdelta.pipeline.runner import PipelineRunner, PipelineStateError, PipelineValidationError
 from voxdelta.pipeline.stages import (
     EmotionArtifact,
     MediaReference,
@@ -104,6 +105,21 @@ class BlockingDeleteStore(ArtifactStore):
             self.delete_entered.set()
             assert self.release_delete.wait(timeout=5)
         super().delete_stage(job_id, stage)
+
+
+class DeletingOnOperationLockStore(ArtifactStore):
+    def __init__(self, root: Path, repository: JobRepository) -> None:
+        super().__init__(root)
+        self.repository = repository
+        self.armed_job_id: str | None = None
+
+    @contextmanager
+    def operation_lock(self, job_id: str):  # type: ignore[no-untyped-def]
+        with super().operation_lock(job_id):
+            if self.armed_job_id == job_id:
+                self.armed_job_id = None
+                self.repository.begin_delete(job_id)
+            yield
 
 
 class ReversedDiarizer(FakeDiarizationProvider):
@@ -724,6 +740,24 @@ def test_retry_rejects_invalid_stage_and_unknown_job_without_mutation(tmp_path: 
 
     assert repository.get_job(job_id) == before
     assert store.artifact_path(job_id, StageName.NORMALIZE).exists()
+
+
+def test_retry_translates_delete_race_inside_operation_lock_to_conflict(tmp_path: Path) -> None:
+    runner, repository, store, job_id = _harness(tmp_path)
+    runner.run_until_pause(job_id)
+    racing_store = DeletingOnOperationLockStore(store.root, repository)
+    racing_runner = PipelineRunner(
+        repository,
+        racing_store,
+        AudioService(store.root, 60, 3600),
+    )
+    racing_store.armed_job_id = job_id
+
+    with pytest.raises(PipelineStateError) as raised:
+        racing_runner.retry(job_id, StageName.DIARIZE)
+
+    assert raised.value.code == "job_deleting"
+    assert repository.get_job(job_id)["status"] == "deleting"
 
 
 @pytest.mark.parametrize(

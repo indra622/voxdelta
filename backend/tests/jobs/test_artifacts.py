@@ -333,20 +333,63 @@ def test_delete_job_removes_only_the_exact_job_directory(tmp_path: Path) -> None
     assert sibling.read_text(encoding="utf-8") == "j10"
 
 
-def test_discard_unstarted_job_removes_directory_without_tombstone_and_syncs_root(
+def test_operation_lock_keeps_durable_file_but_releases_process_registry_entry(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    lock_path = root / ".locks" / "j1.lock"
+
+    with store.operation_lock("j1"):
+        assert lock_path.absolute() in artifacts_module._OPERATION_LOCKS  # noqa: SLF001
+
+    assert lock_path.is_file()
+    assert lock_path.absolute() not in artifacts_module._OPERATION_LOCKS  # noqa: SLF001
+
+
+def test_incoming_upload_is_private_then_atomically_adopted_into_exact_new_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "jobs"
     store = ArtifactStore(root)
-    (store.job_dir("j1") / "partial.wav").write_bytes(b"partial")
     synced: list[Path] = []
     monkeypatch.setattr(artifacts_module, "_fsync_directory", synced.append)
+    descriptor, incoming = store.open_incoming_upload("j1", ".wav")
+    os.write(descriptor, b"admitted")
+    os.fsync(descriptor)
+    os.close(descriptor)
 
-    store.discard_unstarted_job("j1")
+    adopted = store.adopt_incoming_upload("j1", incoming, ".wav")
 
-    assert not (root / "j1").exists()
+    assert incoming.parent == root / ".incoming"
+    assert not incoming.exists()
+    assert adopted == root / "j1" / "source-upload.wav"
+    assert adopted.read_bytes() == b"admitted"
+    assert adopted.stat().st_mode & 0o777 == 0o600
+    assert (root / ".incoming").stat().st_mode & 0o777 == 0o700
     assert not (root / ".deleted").exists()
-    assert synced == [root]
+    assert not (root / ".locks").exists()
+    assert adopted.parent in synced
+    assert root in synced
+
+
+def test_discard_incoming_and_unregistered_job_leave_no_tombstone_or_lock(tmp_path: Path) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    descriptor, incoming = store.open_incoming_upload("j1", ".wav")
+    os.close(descriptor)
+    store.discard_incoming_upload(incoming)
+    descriptor, incoming = store.open_incoming_upload("j2", ".wav")
+    os.write(descriptor, b"stored")
+    os.close(descriptor)
+    store.adopt_incoming_upload("j2", incoming, ".wav")
+
+    store.discard_unregistered_job("j2")
+
+    assert not incoming.exists()
+    assert not (root / "j2").exists()
+    assert not (root / ".deleted").exists()
+    assert not (root / ".locks").exists()
 
 
 def test_existing_tombstone_fsync_failure_is_retried_before_job_removal(
@@ -375,6 +418,44 @@ def test_existing_tombstone_fsync_failure_is_retried_before_job_removal(
 
     assert fsync_attempts >= 2
     assert not (root / "j1").exists()
+
+
+def test_partial_atomic_tombstone_repair_failure_retries_and_preserves_expected_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    store.job_dir("j1")
+    deleted = root / ".deleted"
+    deleted.mkdir(mode=0o700)
+    tombstone = deleted / "j1.tombstone"
+    tombstone.write_bytes(b"j")
+    tombstone.chmod(0o600)
+    real_write = artifacts_module.os.write
+    write_calls = 0
+
+    def fail_after_partial_write(descriptor: int, payload: object) -> int:
+        nonlocal write_calls
+        write_calls += 1
+        if write_calls == 1:
+            return real_write(descriptor, bytes(payload)[:1])
+        if write_calls == 2:
+            raise OSError("partial tombstone repair")
+        return real_write(descriptor, payload)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(artifacts_module.os, "write", fail_after_partial_write)
+
+    with pytest.raises(OSError, match="partial tombstone repair"):
+        store.delete_job("j1")
+    assert tombstone.read_bytes() == b"j"
+    assert (root / "j1").is_dir()
+    assert not list(deleted.glob("*.tmp"))
+
+    store.delete_job("j1")
+
+    assert tombstone.read_bytes() == b"j1"
+    assert not (root / "j1").exists()
+    assert not list(deleted.glob("*.tmp"))
 
 
 def test_delete_job_persists_tombstone_that_blocks_stale_process_logger(tmp_path: Path) -> None:
