@@ -121,6 +121,7 @@ def test_public_loader_rejects_unsafe_env_file_permissions(tmp_path: Path) -> No
     assert secret not in message
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission modes are required")
 def test_exact_0600_env_file_permissions_are_accepted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
