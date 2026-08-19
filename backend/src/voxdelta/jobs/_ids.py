@@ -13,6 +13,10 @@ _CANONICAL_JOB_ID = re.compile(r"[0-9a-f]{32}")
 _ABSENCE_PROOF_AUTHORITY = object()
 
 
+def _transaction_inactive() -> bool:
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class JobAbsenceProof:
     job_id: str
@@ -69,7 +73,13 @@ def _issue_job_absence_proof(
 
 
 def _activate_job_absence_proof(proof: JobAbsenceProof) -> None:
-    if proof._authority is not _ABSENCE_PROOF_AUTHORITY or proof._state.active:
+    if (
+        proof._authority is not _ABSENCE_PROOF_AUTHORITY
+        or proof._state.active
+        or proof._state.consumed
+        or proof._state.issuing_thread != get_ident()
+        or not proof._state.transaction_is_active()
+    ):
         raise ValueError("job absence proof could not be activated")
     proof._state.active = True
 
@@ -77,6 +87,8 @@ def _activate_job_absence_proof(proof: JobAbsenceProof) -> None:
 def _revoke_job_absence_proof(proof: JobAbsenceProof) -> None:
     if proof._authority is _ABSENCE_PROOF_AUTHORITY:
         proof._state.active = False
+        proof._state.issuing_thread = -1
+        proof._state.transaction_is_active = _transaction_inactive
 
 
 def validate_job_absence_proof(proof: object, job_id: str) -> None:

@@ -495,8 +495,9 @@ class ArtifactStore:
     def discard_incoming_upload(self, path: Path) -> None:
         """Remove one exact staged upload and persist its directory entry removal."""
 
-        candidate = self._validated_incoming_path(path, require_file=False)
+        candidate = Path(path)
         try:
+            candidate = self._validated_incoming_path(candidate, require_file=True)
             candidate.unlink(missing_ok=True)
             _fsync_directory(candidate.parent)
         finally:
@@ -505,54 +506,56 @@ class ArtifactStore:
     def adopt_incoming_upload(self, job_id: str, path: Path, suffix: str) -> Path:
         """Move one admitted upload into a new exact job directory and persist the move."""
 
-        validate_job_id(job_id)
-        self._validate_upload_suffix(suffix)
-        incoming = self._validated_incoming_path(path, require_file=True)
-        if self.deletion_tombstone_exists(job_id):
-            raise FileExistsError(job_id)
-        self.root.mkdir(parents=True, exist_ok=True)
-        directory = self.root / job_id
-        if _is_link_like(directory):
-            raise ValueError(_LINKED_JOB_DIRECTORY_ERROR)
+        incoming = Path(path)
         try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            raise FileExistsError(job_id) from None
-        destination = directory / f"source-upload{suffix}"
-        try:
-            os.replace(incoming, destination)
-            _fsync_directory(incoming.parent)
-            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(destination, flags)
+            validate_job_id(job_id)
+            self._validate_upload_suffix(suffix)
+            incoming = self._validated_incoming_path(incoming, require_file=True)
+            if self.deletion_tombstone_exists(job_id):
+                raise FileExistsError(job_id)
+            self.root.mkdir(parents=True, exist_ok=True)
+            directory = self.root / job_id
+            if _is_link_like(directory):
+                raise ValueError(_LINKED_JOB_DIRECTORY_ERROR)
             try:
-                opened = os.fstat(descriptor)
-                current = destination.lstat()
-                if (
-                    _is_link_like(destination)
-                    or not stat.S_ISREG(opened.st_mode)
-                    or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
-                ):
-                    raise ValueError(_INCOMING_VALIDATION_ERROR)
-                os.fchmod(descriptor, 0o600)
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            _fsync_directory(directory)
-            _fsync_directory(self.root)
-            return destination
-        except BaseException:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                raise FileExistsError(job_id) from None
+            destination = directory / f"source-upload{suffix}"
             try:
-                if directory.exists() and not _is_link_like(directory):
-                    shutil.rmtree(directory)
-                    _fsync_directory(self.root)
-            except Exception:
-                pass
-            try:
-                self.discard_incoming_upload(incoming)
-            except Exception:
-                pass
-            raise
+                os.replace(incoming, destination)
+                _fsync_directory(incoming.parent)
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(destination, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                    current = destination.lstat()
+                    if (
+                        _is_link_like(destination)
+                        or not stat.S_ISREG(opened.st_mode)
+                        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                    ):
+                        raise ValueError(_INCOMING_VALIDATION_ERROR)
+                    os.fchmod(descriptor, 0o600)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                _fsync_directory(directory)
+                _fsync_directory(self.root)
+                return destination
+            except BaseException:
+                try:
+                    if directory.exists() and not _is_link_like(directory):
+                        shutil.rmtree(directory)
+                        _fsync_directory(self.root)
+                except Exception:
+                    pass
+                try:
+                    self.discard_incoming_upload(incoming)
+                except Exception:
+                    pass
+                raise
         finally:
             _release_incoming_owner(incoming)
 

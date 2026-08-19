@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -457,6 +459,43 @@ def test_absence_proof_is_revoked_when_callback_raises(tmp_path: Path) -> None:
         )
 
     assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="descriptor accounting is POSIX-specific")
+def test_revoked_absence_proofs_do_not_retain_sqlite_descriptors(tmp_path: Path) -> None:
+    import resource
+
+    repository = JobRepository(tmp_path / "voxdelta.sqlite3")
+    captured: list[JobAbsenceProof] = []
+
+    def open_descriptor_count() -> int:
+        maximum = min(int(resource.getrlimit(resource.RLIMIT_NOFILE)[0]), 4096)
+        count = 0
+        for descriptor in range(maximum):
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                continue
+            count += 1
+        return count
+
+    gc.collect()
+    baseline = open_descriptor_count()
+    for _ in range(128):
+        assert repository.discard_if_absent("a" * 32, captured.append)
+
+    def capture_then_fail(proof: JobAbsenceProof) -> None:
+        captured.append(proof)
+        raise RuntimeError("callback interrupted")
+
+    for _ in range(128):
+        with pytest.raises(RuntimeError, match="interrupted"):
+            repository.discard_if_absent("b" * 32, capture_then_fail)
+
+    gc.collect()
+
+    assert len(captured) == 256
+    assert open_descriptor_count() <= baseline + 2
 
 
 @pytest.mark.parametrize(

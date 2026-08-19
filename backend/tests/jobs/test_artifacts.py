@@ -482,6 +482,71 @@ def test_discard_incoming_leaves_no_tombstone_lock_or_public_job_discard(tmp_pat
     assert incoming.absolute() not in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
 
 
+@pytest.mark.parametrize("operation", ["adopt", "discard"])
+@pytest.mark.parametrize("replacement", ["symlink", "directory", "missing"])
+def test_incoming_validation_failure_releases_ownership_without_touching_outside(
+    operation: str,
+    replacement: str,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "jobs"
+    store = ArtifactStore(root)
+    descriptor, incoming = store.open_incoming_upload("a" * 32, ".wav")
+    os.write(descriptor, b"owned")
+    os.close(descriptor)
+    lease_descriptor = artifacts_module._INCOMING_OWNERS[  # noqa: SLF001
+        incoming.absolute()
+    ].lease_descriptor
+    incoming.unlink()
+    outside = tmp_path / "outside"
+    outside.write_text("preserve", encoding="utf-8")
+    if replacement == "symlink":
+        incoming.symlink_to(outside)
+    elif replacement == "directory":
+        incoming.mkdir()
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        if operation == "adopt":
+            store.adopt_incoming_upload("a" * 32, incoming, ".wav")
+        else:
+            store.discard_incoming_upload(incoming)
+
+    assert outside.read_text(encoding="utf-8") == "preserve"
+    assert incoming.absolute() not in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
+    assert not (root / ("a" * 32)).exists()
+    if lease_descriptor is not None:
+        with pytest.raises(OSError) as closed:
+            os.fstat(lease_descriptor)
+        assert closed.value.errno == errno.EBADF
+
+
+def test_double_incoming_cleanup_releases_lease_descriptor_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "jobs")
+    descriptor, incoming = store.open_incoming_upload("a" * 32, ".wav")
+    os.close(descriptor)
+    lease_descriptor = artifacts_module._INCOMING_OWNERS[  # noqa: SLF001
+        incoming.absolute()
+    ].lease_descriptor
+    real_close = artifacts_module.os.close
+    closed: list[int] = []
+
+    def record_close(selected: int) -> None:
+        closed.append(selected)
+        real_close(selected)
+
+    monkeypatch.setattr(artifacts_module.os, "close", record_close)
+    store.discard_incoming_upload(incoming)
+    with pytest.raises(FileNotFoundError):
+        store.discard_incoming_upload(incoming)
+
+    assert incoming.absolute() not in artifacts_module._INCOMING_OWNERS  # noqa: SLF001
+    if lease_descriptor is not None:
+        assert closed.count(lease_descriptor) == 1
+
+
 def test_unregistered_job_discard_rejects_direct_call_without_absence_proof(
     tmp_path: Path,
 ) -> None:
