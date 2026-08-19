@@ -8,16 +8,73 @@ from voxdelta.domain.models import Role, Utterance
 
 _OPENING_SECONDS = 30.0
 _AGENT_CUES = ("상담원", "고객센터", "무엇을 도와", "도와드리")
-_EXPLICIT_SELF_INTRODUCTION = re.compile(r"(?:저는|제\s*이름은)\s+\S(?:.*\S)?입니다[.!?…]*$")
-_GREETED_NAME_INTRODUCTION = re.compile(
-    r"^(?:안녕하세요|안녕하십니까)[,.!?\s]+[가-힣]{3}입니다[.!?…]*$"
+_EXPLICIT_SELF_INTRODUCTION = re.compile(r"(?:저는|제\s*이름은)\s+(?P<body>.+)입니다[.!?…]*$")
+_GREETED_SELF_INTRODUCTION = re.compile(
+    r"^(?:안녕하세요|안녕하십니까)[,.!?\s]+(?P<body>.+)입니다[.!?…]*$"
 )
+_HANGUL_NAME_TOKEN = re.compile(r"[가-힣]{2,4}")
+_SERVICE_OR_TITLE_PREFIXES = (
+    "고객센터",
+    "콜센터",
+    "서비스",
+    "상담원",
+    "상담사",
+    "담당자",
+    "매니저",
+    "직원",
+)
+_STATUS_OR_POLICY_FRAGMENTS = (
+    "처리",
+    "점검",
+    "확인",
+    "진행",
+    "정책",
+    "규정",
+    "약관",
+    "상태",
+    "정상",
+    "오류",
+    "완료",
+    "예정",
+    "불가",
+    "가능",
+    "지연",
+    "중단",
+    "종료",
+)
+_STATUS_SUFFIXES = ("중", "완료", "예정", "불가", "가능")
+
+
+def _looks_like_name_token(body: str, *, prefix_requires_service_or_title: bool) -> bool:
+    parts = body.replace(",", " ").split()
+    if not parts:
+        return False
+    final_token = parts[-1]
+    if not _HANGUL_NAME_TOKEN.fullmatch(final_token):
+        return False
+    if any(fragment in final_token for fragment in _STATUS_OR_POLICY_FRAGMENTS):
+        return False
+    if final_token.endswith(_STATUS_SUFFIXES):
+        return False
+    if prefix_requires_service_or_title and len(parts) > 1:
+        prefix = " ".join(parts[:-1])
+        return any(marker in prefix for marker in _SERVICE_OR_TITLE_PREFIXES)
+    return True
 
 
 def _is_self_introduction(transcript: str) -> bool:
-    return bool(
-        _EXPLICIT_SELF_INTRODUCTION.search(transcript)
-        or _GREETED_NAME_INTRODUCTION.fullmatch(transcript)
+    explicit = _EXPLICIT_SELF_INTRODUCTION.search(transcript)
+    if explicit is not None:
+        return _looks_like_name_token(
+            explicit.group("body"),
+            prefix_requires_service_or_title=False,
+        )
+    greeted = _GREETED_SELF_INTRODUCTION.fullmatch(transcript)
+    if greeted is None:
+        return False
+    return _looks_like_name_token(
+        greeted.group("body"),
+        prefix_requires_service_or_title=True,
     )
 
 

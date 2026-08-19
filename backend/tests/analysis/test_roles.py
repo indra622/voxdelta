@@ -109,6 +109,56 @@ def test_suggest_roles_counts_common_greeted_name_introductions(introduction: st
 
 
 @pytest.mark.parametrize(
+    "introduction",
+    [
+        "안녕하세요, 허준입니다.",
+        "안녕하세요, 김민수입니다.",
+        "안녕하세요, 남궁민수입니다.",
+        "안녕하세요, 행복서비스 매니저 이영희입니다.",
+    ],
+)
+def test_suggest_roles_accepts_reviewer_opening_introduction_examples(
+    introduction: str,
+) -> None:
+    utterances = [
+        _utterance("s1-first", "S1", 0.0, introduction),
+        _utterance("s2-first", "S2", 0.5, "문의가 있습니다"),
+    ]
+
+    assert suggest_roles(utterances) == {"S1": Role.AGENT, "S2": Role.CUSTOMER}
+
+
+@pytest.mark.parametrize("name", ["이준", "박서준", "제갈민수"])
+def test_suggest_roles_accepts_two_to_four_hangul_name_tokens(name: str) -> None:
+    utterances = [
+        _utterance("s1-first", "S1", 0.0, f"안녕하십니까? {name}입니다"),
+        _utterance("s2-first", "S2", 0.5, "문의가 있습니다"),
+    ]
+
+    assert suggest_roles(utterances) == {"S1": Role.AGENT, "S2": Role.CUSTOMER}
+
+
+@pytest.mark.parametrize(
+    "introduction",
+    [
+        "저는 허준입니다.",
+        "제 이름은 김민수입니다.",
+        "안녕하세요. 저는 남궁민수입니다.",
+        "저는 행복서비스 담당자 이영희입니다.",
+    ],
+)
+def test_suggest_roles_preserves_explicit_self_introduction_forms(
+    introduction: str,
+) -> None:
+    utterances = [
+        _utterance("s1-first", "S1", 0.0, introduction),
+        _utterance("s2-first", "S2", 0.5, "문의가 있습니다"),
+    ]
+
+    assert suggest_roles(utterances) == {"S1": Role.AGENT, "S2": Role.CUSTOMER}
+
+
+@pytest.mark.parametrize(
     "non_introduction",
     [
         "현재 처리 상태입니다.",
@@ -122,6 +172,38 @@ def test_suggest_roles_does_not_score_policy_or_status_sentences(
 ) -> None:
     utterances = [
         _utterance("s1-first", "S1", 0.0, non_introduction),
+        _utterance("s2-first", "S2", 0.5, "문의가 있습니다"),
+    ]
+
+    assert suggest_roles(utterances) is None
+
+
+@pytest.mark.parametrize(
+    "status_token",
+    [
+        "정책",
+        "규정",
+        "정상",
+        "오류",
+        "완료",
+        "예정",
+        "불가",
+        "가능",
+        "처리중",
+        "점검중",
+        "확인중",
+        "진행중",
+        "처리완료",
+        "점검예정",
+        "이용약관",
+        "처리불가",
+    ],
+)
+def test_suggest_roles_rejects_two_to_four_hangul_status_or_policy_tokens(
+    status_token: str,
+) -> None:
+    utterances = [
+        _utterance("s1-first", "S1", 0.0, f"안녕하세요, {status_token}입니다."),
         _utterance("s2-first", "S2", 0.5, "문의가 있습니다"),
     ]
 
