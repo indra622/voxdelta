@@ -184,20 +184,11 @@ def test_fake_emotion_is_deterministic_without_mutating_global_random_state() ->
     assert first.provider.schema_version == "1"
 
 
-def test_fake_emotion_uses_dominant_grouped_score_as_confidence() -> None:
+def test_fake_emotion_preserves_provider_confidence_and_maps_grouped_state() -> None:
     result = FakeEmotionProvider().analyze("u6", Path("slice.wav"), "x")
-    probabilities = result.probabilities
-    dissatisfied = sum(probabilities[label] for label in ("sadness", "disgust", "fear"))
-    expected_confidence = max(
-        probabilities["happiness"],
-        probabilities["neutral"],
-        probabilities["anger"],
-        dissatisfied,
-    )
 
-    assert result.confidence == pytest.approx(expected_confidence)
-    assert result.confidence < 0.55
-    assert result.operational_state == "uncertain"
+    assert result.confidence == 0.85
+    assert result.operational_state == "dissatisfied"
 
 
 @pytest.mark.parametrize(
@@ -256,13 +247,12 @@ def test_fake_emotion_uses_dominant_grouped_score_as_confidence() -> None:
 def test_operational_state_compares_four_canonical_scores(
     probabilities: dict[EmotionLabel, float], expected_state: str
 ) -> None:
-    state, confidence = _derive_operational_state(probabilities)
+    state = _derive_operational_state(probabilities, confidence=0.85)
 
     assert state == expected_state
-    assert confidence == pytest.approx(0.6)
 
 
-def test_operational_state_confidence_threshold_is_inclusive() -> None:
+def test_operational_state_varies_confidence_independently_at_threshold() -> None:
     probabilities = _probabilities(
         happiness=0.15,
         anger=0.1,
@@ -273,10 +263,27 @@ def test_operational_state_confidence_threshold_is_inclusive() -> None:
         surprise=0.1,
     )
 
-    state, confidence = _derive_operational_state(probabilities)
+    below_threshold = _derive_operational_state(probabilities, confidence=0.549999)
+    at_threshold = _derive_operational_state(probabilities, confidence=0.55)
 
-    assert confidence == pytest.approx(0.55)
-    assert state == "dissatisfied"
+    assert below_threshold == "uncertain"
+    assert at_threshold == "dissatisfied"
+
+
+@pytest.mark.parametrize("confidence", [-0.001, 1.001, math.inf, math.nan])
+def test_operational_state_rejects_invalid_provider_confidence(confidence: float) -> None:
+    probabilities = _probabilities(
+        happiness=0.6,
+        anger=0.05,
+        disgust=0.05,
+        fear=0.05,
+        neutral=0.1,
+        sadness=0.05,
+        surprise=0.1,
+    )
+
+    with pytest.raises(ValueError, match="confidence must be finite and between zero and one"):
+        _derive_operational_state(probabilities, confidence=confidence)
 
 
 @pytest.mark.parametrize("surprise", [0.2, 0.21])
@@ -293,9 +300,8 @@ def test_operational_state_treats_surprise_tie_or_dominance_as_uncertain(
         surprise=surprise,
     )
 
-    state, confidence = _derive_operational_state(probabilities)
+    state = _derive_operational_state(probabilities, confidence=0.85)
 
-    assert confidence == pytest.approx(0.55)
     assert state == "uncertain"
 
 

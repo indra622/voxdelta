@@ -30,6 +30,7 @@ from voxdelta.providers.base import (
 _MODEL_VERSION = "deterministic-v1"
 _SCHEMA_VERSION = "1"
 _FAKE_SEGMENT_COUNT = 6
+_FAKE_EMOTION_CONFIDENCE = 0.85
 _CONFIDENCE_THRESHOLD = 0.55
 _EMOTION_LABELS: tuple[EmotionLabel, ...] = (
     "happiness",
@@ -73,7 +74,11 @@ def _local_provenance(name: str) -> ProviderProvenance:
 
 def _derive_operational_state(
     probabilities: dict[EmotionLabel, float],
-) -> tuple[OperationalState, float]:
+    confidence: float,
+) -> OperationalState:
+    if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise ValueError("confidence must be finite and between zero and one")
+
     scores: tuple[tuple[OperationalState, float], ...] = (
         ("satisfied", probabilities["happiness"]),
         ("stable", probabilities["neutral"]),
@@ -84,13 +89,13 @@ def _derive_operational_state(
         ("escalated", probabilities["anger"]),
     )
     # max() keeps the first item on ties, making the specification order above the tie-break.
-    state, confidence = max(scores, key=lambda item: item[1])
+    state = max(scores, key=lambda item: item[1])[0]
     non_surprise_peak = max(
         probabilities[label] for label in _EMOTION_LABELS if label != "surprise"
     )
     if probabilities["surprise"] >= non_surprise_peak or confidence < _CONFIDENCE_THRESHOLD:
-        return "uncertain", confidence
-    return state, confidence
+        return "uncertain"
+    return state
 
 
 class FakeDiarizationProvider(DiarizationProvider):
@@ -165,13 +170,16 @@ class FakeEmotionProvider(EmotionProvider):
         }
 
         negative_intensity = math.fsum(probabilities[label] for label in _NEGATIVE_EMOTION_LABELS)
-        operational_state, confidence = _derive_operational_state(probabilities)
+        operational_state = _derive_operational_state(
+            probabilities,
+            confidence=_FAKE_EMOTION_CONFIDENCE,
+        )
         return EmotionResult(
             utterance_id=utterance_id,
             probabilities=probabilities,
             operational_state=operational_state,
             negative_intensity=negative_intensity,
-            confidence=confidence,
+            confidence=_FAKE_EMOTION_CONFIDENCE,
             provider=self.provenance,
         )
 
