@@ -19,6 +19,7 @@ from voxdelta.domain.models import (
 )
 from voxdelta.evaluation.emotion_experiment import (
     EmotionExperimentReport,
+    build_partial_last4_development_manifest,
     build_stratified_smoke_manifest,
     evaluate_emotion_checkpoint,
     write_experiment_report,
@@ -166,6 +167,51 @@ def test_build_smoke_manifest_refuses_existing_output(tmp_path: Path) -> None:
         )
 
     assert output.read_text(encoding="utf-8") == "owner data"
+
+
+def test_build_development_manifest_is_balanced_deterministic_and_test_free(
+    tmp_path: Path,
+) -> None:
+    source = _write_source_manifest(
+        tmp_path / "source",
+        train_count=101,
+        validation_count=26,
+        test_count=2,
+    )
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+
+    summary = build_partial_last4_development_manifest(source, first)
+    build_partial_last4_development_manifest(source, second)
+
+    assert summary.total_count == 875
+    assert summary.split_counts == {"train": 700, "validation": 175}
+    selected = load_manifest(first)
+    assert Counter((item.split, item.emotion) for item in selected) == Counter(
+        {
+            **{("train", label): 100 for label in LABELS},
+            **{("validation", label): 25 for label in LABELS},
+        }
+    )
+    assert all(item.split != "test" for item in selected)
+    assert {item.transcript for item in selected} == {""}
+    assert first.read_bytes() == second.read_bytes()
+    assert stat.S_IMODE(first.stat().st_mode) == 0o600
+
+
+def test_build_development_manifest_refuses_existing_output(tmp_path: Path) -> None:
+    source = _write_source_manifest(
+        tmp_path / "source",
+        train_count=101,
+        validation_count=26,
+        test_count=2,
+    )
+    output = tmp_path / "existing.jsonl"
+    output.write_text("owner-data", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="development_manifest_publication_failed"):
+        build_partial_last4_development_manifest(source, output)
+    assert output.read_text(encoding="utf-8") == "owner-data"
 
 
 class FakeProvider:
@@ -481,6 +527,30 @@ def test_build_cli_writes_summary_without_private_content(tmp_path: Path) -> Non
     assert completed.stdout == "smoke manifest: 28 items\n"
     assert output.is_file()
     assert str(source) not in completed.stdout
+
+
+def test_development_manifest_cli_failure_is_sanitized(tmp_path: Path) -> None:
+    private_manifest = tmp_path / "private-source-item-id.jsonl"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/build_emotion_development_manifest.py",
+            "--manifest",
+            str(private_manifest),
+            "--output",
+            str(tmp_path / "development.jsonl"),
+        ],
+        cwd=BACKEND,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "development manifest failed\n"
+    assert "private" not in completed.stderr
 
 
 def test_evaluation_cli_failure_is_sanitized(tmp_path: Path) -> None:

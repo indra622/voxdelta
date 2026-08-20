@@ -52,6 +52,17 @@ class SmokeManifestSummary(BaseModel):
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class DevelopmentManifestSummary(BaseModel):
+    """Aggregate identity of the fixed partial-last-four development manifest."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    total_count: Literal[875]
+    split_counts: dict[Literal["train", "validation"], int]
+    label_counts: dict[EmotionLabel, int]
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class EmotionExperimentReport(BaseModel):
     """Aggregate-only held-out metrics for one local emotion checkpoint."""
 
@@ -218,6 +229,58 @@ def build_stratified_smoke_manifest(
         total_count=len(selected),
         split_counts=dict(Counter(item.split for item in selected)),
         label_counts=dict(Counter(cast(EmotionLabel, item.emotion) for item in selected)),
+        manifest_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def build_partial_last4_development_manifest(
+    source: Path, output: Path
+) -> DevelopmentManifestSummary:
+    """Publish the fixed balanced train/validation-only development manifest."""
+
+    if not source.is_absolute() or not output.is_absolute():
+        raise ValueError("invalid_development_manifest")
+    try:
+        items = load_manifest(source)
+        validate_disjoint_splits(items)
+        if any(item.source != "emotion" or item.emotion not in CANONICAL_LABELS for item in items):
+            raise ValueError
+        selected: list[DatasetItem] = []
+        for split, count in (("train", 100), ("validation", 25)):
+            for label in CANONICAL_LABELS:
+                candidates = sorted(
+                    (
+                        item
+                        for item in items
+                        if item.source == "emotion"
+                        and item.split == split
+                        and item.emotion == label
+                    ),
+                    key=lambda item: _rank(item, 622),
+                )
+                if len(candidates) < count:
+                    raise ValueError
+                selected.extend(
+                    item.model_copy(update={"transcript": ""}) for item in candidates[:count]
+                )
+    except Exception:
+        raise ValueError("invalid_development_manifest") from None
+
+    payload = b"".join(
+        json.dumps(
+            item.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+        + b"\n"
+        for item in sorted(selected, key=lambda item: item.id)
+    )
+    _publish_private_file(output, payload, "development_manifest_publication_failed")
+    return DevelopmentManifestSummary(
+        total_count=875,
+        split_counts={"train": 700, "validation": 175},
+        label_counts={label: 125 for label in CANONICAL_LABELS},
         manifest_sha256=hashlib.sha256(payload).hexdigest(),
     )
 
