@@ -31,7 +31,7 @@
 - Consumes: `DatasetItem`, `load_manifest`, `validate_disjoint_splits`, and a trusted full emotion JSONL manifest.
 - Produces: `SmokeManifestSummary` and `build_stratified_smoke_manifest(source: Path, output: Path, *, train_per_label: int = 20, validation_per_label: int = 5, test_per_label: int = 5, seed: int = 622) -> SmokeManifestSummary`.
 
-- [ ] **Step 1: Write failing deterministic-selection tests**
+- [x] **Step 1: Write failing deterministic-selection tests**
 
 ```python
 def test_build_smoke_manifest_is_balanced_deterministic_and_transcript_free(tmp_path: Path) -> None:
@@ -66,13 +66,13 @@ def test_build_smoke_manifest_rejects_scarce_cells_and_existing_output(tmp_path:
     assert output.read_text(encoding="utf-8") == "owner data"
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run: `cd backend && uv run pytest tests/evaluation/test_emotion_experiment.py -q`
 
 Expected: collection fails because `voxdelta.evaluation.emotion_experiment` does not exist.
 
-- [ ] **Step 3: Implement the selection and atomic writer**
+- [x] **Step 3: Implement the selection and atomic writer**
 
 ```python
 CANONICAL_LABELS: tuple[EmotionLabel, ...] = (
@@ -166,7 +166,7 @@ def _publish_private_file(path: Path, payload: bytes, error_code: str) -> None:
         raise ValueError(error_code) from None
 ```
 
-- [ ] **Step 4: Run focused tests and static checks**
+- [x] **Step 4: Run focused tests and static checks**
 
 Run:
 
@@ -180,7 +180,7 @@ uv run mypy src/voxdelta/evaluation/emotion_experiment.py
 
 Expected: all checks pass.
 
-- [ ] **Step 5: Commit the manifest boundary**
+- [x] **Step 5: Commit the manifest boundary**
 
 ```bash
 git add backend/src/voxdelta/evaluation/emotion_experiment.py backend/tests/evaluation/test_emotion_experiment.py
@@ -199,7 +199,7 @@ git commit -m "feat: build deterministic emotion smoke manifests"
 - Consumes: a smoke manifest, a published local checkpoint, an architecture name, and the production emotion provider interface.
 - Produces: `EmotionExperimentReport`, `evaluate_emotion_checkpoint(...)`, and `write_experiment_report(...)`.
 
-- [ ] **Step 1: Write failing aggregate-metric and privacy tests**
+- [x] **Step 1: Write failing aggregate-metric and privacy tests**
 
 ```python
 def test_evaluation_report_has_aggregate_metrics_without_item_content(tmp_path: Path) -> None:
@@ -236,13 +236,13 @@ def test_report_writer_is_atomic_private_and_refuses_existing_output(tmp_path: P
     assert output.read_bytes() == original
 ```
 
-- [ ] **Step 2: Run the tests and verify RED**
+- [x] **Step 2: Run the tests and verify RED**
 
 Run: `cd backend && uv run pytest tests/evaluation/test_emotion_experiment.py -q`
 
 Expected: failures because `EmotionExperimentReport` and evaluator functions are absent.
 
-- [ ] **Step 3: Implement report contracts and aggregate metrics**
+- [x] **Step 3: Implement report contracts and aggregate metrics**
 
 ```python
 class EmotionExperimentReport(BaseModel):
@@ -389,7 +389,7 @@ def evaluate_emotion_checkpoint(
 
 `write_experiment_report` serializes `report.model_dump(mode="json")` with sorted keys, compact separators, `allow_nan=False`, a trailing newline, and `_publish_private_file(..., "experiment_report_publication_failed")`.
 
-- [ ] **Step 4: Add failure-boundary tests**
+- [x] **Step 4: Add failure-boundary tests**
 
 ```python
 def test_evaluation_rejects_hash_mismatch_and_zero_completion(tmp_path: Path) -> None:
@@ -413,7 +413,7 @@ def test_evaluation_rejects_hash_mismatch_and_zero_completion(tmp_path: Path) ->
         )
 ```
 
-- [ ] **Step 5: Run focused tests and static checks**
+- [x] **Step 5: Run focused tests and static checks**
 
 Run:
 
@@ -427,7 +427,7 @@ uv run mypy src/voxdelta/evaluation/emotion_experiment.py
 
 Expected: all checks pass.
 
-- [ ] **Step 6: Commit aggregate evaluation**
+- [x] **Step 6: Commit aggregate evaluation**
 
 ```bash
 git add backend/src/voxdelta/evaluation/emotion_experiment.py backend/tests/evaluation/test_emotion_experiment.py
@@ -449,7 +449,7 @@ git commit -m "feat: evaluate local emotion checkpoints"
 - Consumes: Task 1 and Task 2 public functions plus the existing provider predictor.
 - Produces: sanitized CLI exit statuses and consistent utterance-embedding extraction in training and inference.
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 ```python
 def test_build_cli_writes_summary_without_private_content(tmp_path: Path) -> None:
@@ -477,7 +477,7 @@ def test_cli_failures_are_sanitized(tmp_path: Path) -> None:
     assert "private" not in completed.stderr
 ```
 
-- [ ] **Step 2: Write a failing real-predictor contract test**
+- [x] **Step 2: Write a failing real-predictor contract test**
 
 ```python
 def test_predictor_requests_the_same_embedding_contract_as_training(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -497,7 +497,7 @@ def test_predictor_requests_the_same_embedding_contract_as_training(monkeypatch:
     ]
 ```
 
-- [ ] **Step 3: Run the tests and verify RED**
+- [x] **Step 3: Run the tests and verify RED**
 
 Run:
 
@@ -508,7 +508,7 @@ uv run pytest tests/evaluation/test_emotion_experiment.py tests/providers/test_e
 
 Expected: CLI files are missing and inference omits `extract_embedding=True`.
 
-- [ ] **Step 4: Implement the two thin CLIs**
+- [x] **Step 4: Implement the two thin CLIs**
 
 Implement `build_emotion_smoke_manifest.py` with this boundary:
 
@@ -585,7 +585,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 ```
 
-- [ ] **Step 5: Align emotion2vec inference embedding extraction**
+- [x] **Step 5: Align emotion2vec inference embedding extraction**
 
 ```python
 output = self._encoder.generate(
@@ -595,7 +595,7 @@ output = self._encoder.generate(
 )
 ```
 
-- [ ] **Step 6: Run focused tests and static checks**
+- [x] **Step 6: Run focused tests and static checks**
 
 Run:
 
@@ -609,7 +609,7 @@ uv run mypy src scripts
 
 Expected: all checks pass.
 
-- [ ] **Step 7: Commit CLI and provider parity**
+- [x] **Step 7: Commit CLI and provider parity**
 
 ```bash
 git add backend/scripts/build_emotion_smoke_manifest.py backend/scripts/evaluate_emotion_checkpoint.py backend/src/voxdelta/providers/emotion2vec_emotion.py backend/tests/evaluation/test_emotion_experiment.py backend/tests/providers/test_emotion2vec_emotion.py
@@ -628,7 +628,7 @@ git commit -m "feat: run real-data emotion smoke experiments"
 - Consumes: the generated CLIs, existing `train_emotion.py`, and local AI Hub manifest.
 - Produces: reproducible commands, ignored smoke artifacts, and verified aggregate experiment evidence.
 
-- [ ] **Step 1: Document the three-command workflow**
+- [x] **Step 1: Document the three-command workflow**
 
 ```bash
 cd backend
@@ -654,7 +654,7 @@ uv run python scripts/evaluate_emotion_checkpoint.py \
 
 Explain that this smoke run is an integration check, not final quality evidence, and that full-training comparison remains emotion2vec+ versus XLS-R on the fixed full splits.
 
-- [ ] **Step 2: Run the full repository quality gate**
+- [x] **Step 2: Run the full repository quality gate**
 
 Run:
 
@@ -670,7 +670,7 @@ git diff --check
 
 Expected: all checks pass, with only the existing Windows-specific skip on macOS.
 
-- [ ] **Step 3: Commit documentation**
+- [x] **Step 3: Commit documentation**
 
 ```bash
 git add data/README.md docs/superpowers/plans/2026-08-20-emotion-real-data-smoke.md

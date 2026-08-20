@@ -85,3 +85,42 @@ for manifest in sorted(Path("../data/manifests").glob("*.jsonl")):
 print("manifest hashes verified")
 PY
 ```
+
+## Run a real-data emotion smoke experiment
+
+Before a full 36,665-item training run, exercise the real model boundary on a deterministic balanced
+subset. From `backend/`, resolve the canonical checkout once so every generated output path is
+absolute:
+
+```bash
+VOXDELTA_ROOT="$(cd .. && pwd -P)"
+
+uv run python scripts/build_emotion_smoke_manifest.py \
+  --manifest "$VOXDELTA_ROOT/data/manifests/emotion.jsonl" \
+  --output "$VOXDELTA_ROOT/data/manifests/emotion-smoke.jsonl"
+
+uv run python scripts/train_emotion.py \
+  --manifest "$VOXDELTA_ROOT/data/manifests/emotion-smoke.jsonl" \
+  --output "$VOXDELTA_ROOT/data/models/emotion2vec-plus-large-smoke" \
+  --architecture emotion2vec-plus \
+  --base-model iic/emotion2vec_plus_large \
+  --freeze-encoder \
+  --seed 622
+
+uv run python scripts/evaluate_emotion_checkpoint.py \
+  --manifest "$VOXDELTA_ROOT/data/manifests/emotion-smoke.jsonl" \
+  --checkpoint "$VOXDELTA_ROOT/data/models/emotion2vec-plus-large-smoke" \
+  --output "$VOXDELTA_ROOT/data/benchmarks/emotion2vec-plus-large-smoke.json" \
+  --architecture emotion2vec-plus \
+  --device auto
+```
+
+The default smoke manifest contains 20 train, 5 validation, and 5 test items per emotion: 210 items
+total. The aggregate report contains macro-F1, per-label F1, a canonical-order confusion matrix,
+10-bin expected calibration error, latency, and RSS. It does not contain transcripts, item IDs,
+audio paths, raw probabilities, or per-item predictions.
+
+This smoke run proves model download, real-audio preprocessing, training, checkpoint publication,
+production-provider loading, and held-out inference. Its small-sample quality is not final model
+evidence. The later full comparison trains both frozen-encoder emotion2vec+ and the XLS-R 300M
+baseline on the fixed full splits, then evaluates each once on the full test split.
