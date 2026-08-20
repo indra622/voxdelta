@@ -277,6 +277,21 @@ def test_report_writer_is_atomic_private_and_refuses_existing_output(tmp_path: P
     assert output.read_bytes() == original
 
 
+def test_report_writer_never_uses_an_overwriting_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def reject_overwrite(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("overwriting rename is forbidden")
+
+    monkeypatch.setattr("voxdelta.evaluation.emotion_experiment.os.replace", reject_overwrite)
+    output = tmp_path / "report.json"
+
+    write_experiment_report(output, _report_fixture())
+
+    assert output.is_file()
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+
+
 def test_evaluation_rejects_hash_mismatch(tmp_path: Path) -> None:
     manifest = _smoke_evaluation_manifest(tmp_path)
     test_item = next(item for item in load_manifest(manifest) if item.split == "test")

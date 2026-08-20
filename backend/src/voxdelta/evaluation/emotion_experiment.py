@@ -130,7 +130,11 @@ def _publish_private_file(path: Path, payload: bytes, error_code: str) -> None:
             os.fsync(handle.fileno())
         if target.exists():
             raise OSError
-        os.replace(temporary, target)
+        os.link(temporary, target)
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
         temporary = None
         if os.name == "posix":
             descriptor = os.open(target.parent, os.O_RDONLY)
