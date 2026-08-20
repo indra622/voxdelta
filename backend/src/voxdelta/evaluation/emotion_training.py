@@ -32,7 +32,7 @@ SAMPLE_RATE = 16_000
 MIN_SAMPLES = SAMPLE_RATE // 2
 WINDOW_SAMPLES = SAMPLE_RATE * 20
 PREPROCESS_VERSION = "emotion-audio-v1"
-EMOTION2VEC_REVISION: Literal["v2.0.4"] = "v2.0.4"
+EMOTION2VEC_REVISION: Literal["v2.0.5"] = "v2.0.5"
 CANONICAL_LABELS: tuple[EmotionLabel, ...] = (
     "happiness",
     "anger",
@@ -72,7 +72,7 @@ class Emotion2VecTrainingProfile(BaseModel):
 
     architecture: Literal["emotion2vec-plus"] = "emotion2vec-plus"
     encoder_id: Literal["iic/emotion2vec_plus_large"] = "iic/emotion2vec_plus_large"
-    encoder_revision: Literal["v2.0.4"] = EMOTION2VEC_REVISION
+    encoder_revision: Literal["v2.0.5"] = EMOTION2VEC_REVISION
     freeze_encoder: Literal[True] = True
     hidden_size: Literal[256] = 256
     dropout: float = 0.1

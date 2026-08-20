@@ -8,7 +8,7 @@ Prove that VoxDelta can train and evaluate a real `emotion2vec+ large` seven-emo
 
 The source manifest is `data/manifests/emotion.jsonl`: 36,665 Korean dialogue utterances in 16 kHz mono PCM16, labeled as happiness, anger, disgust, fear, neutral, sadness, or surprise. Only rows with at least three matching votes among five annotators are present. The deterministic full split is train 29,476, validation 3,569, and test 3,620.
 
-This phase adds a deterministic real-data smoke path, trains the frozen-encoder `iic/emotion2vec_plus_large@v2.0.4` candidate, evaluates it on a held-out smoke test subset, and emits an aggregate report. Full emotion2vec+ training, XLS-R full fine-tuning, final call-center gold evaluation, and production default selection remain later phases.
+This phase adds a deterministic real-data smoke path, trains the frozen-encoder `iic/emotion2vec_plus_large@v2.0.5` candidate, evaluates it on a held-out smoke test subset, and emits an aggregate report. Full emotion2vec+ training, XLS-R full fine-tuning, final call-center gold evaluation, and production default selection remain later phases.
 
 ## Approaches Considered
 
@@ -29,7 +29,7 @@ The selection fails closed if any of the seven labels lacks the requested count 
 The smoke manifest is passed to the existing `train_emotion.py` boundary with the exact production emotion2vec+ profile:
 
 - encoder: `iic/emotion2vec_plus_large`
-- revision: `v2.0.4`
+- revision: `v2.0.5`
 - encoder frozen
 - seven-class `LayerNorm → Linear(256) → GELU → Dropout(0.1) → Linear(7)` head
 - AdamW at `1e-3`, batch size 64, at most 20 epochs, patience 3, seed 622

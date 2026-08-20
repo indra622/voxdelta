@@ -44,7 +44,7 @@ def _checkpoint(path: Path) -> Path:
                 "schema_version": "1",
                 "architecture": "emotion2vec-plus",
                 "model_id": "iic/emotion2vec_plus_large",
-                "encoder_revision": "v2.0.4",
+                "encoder_revision": "v2.0.5",
                 "encoder_hash": "b" * 64,
                 "embedding_size": 4,
                 "freeze_encoder": True,
@@ -104,7 +104,7 @@ def test_import_is_lazy_and_default_encoder_is_exact(tmp_path: Path) -> None:
         (
             (tmp_path / "checkpoint").resolve(),
             "iic/emotion2vec_plus_large",
-            "v2.0.4",
+            "v2.0.5",
             "b" * 64,
             "cpu",
             True,
@@ -212,7 +212,7 @@ def test_malformed_checkpoint_metadata_is_safe(tmp_path: Path) -> None:
                 "schema_version": "1",
                 "architecture": "emotion2vec-plus",
                 "model_id": "wrong",
-                "encoder_revision": "v2.0.4",
+                "encoder_revision": "v2.0.5",
                 "encoder_hash": "not-sha",
                 "embedding_size": 4,
                 "freeze_encoder": False,
@@ -257,12 +257,12 @@ def test_default_encoder_factory_passes_device_and_pinned_revision(
             return object()
 
     monkeypatch.setattr(module, "import_module", lambda name: Funasr())
-    module._default_encoder_factory("iic/emotion2vec_plus_large", revision="v2.0.4", device=device)
+    module._default_encoder_factory("iic/emotion2vec_plus_large", revision="v2.0.5", device=device)
 
     assert calls == [
         {
             "model": "iic/emotion2vec_plus_large",
-            "model_revision": "v2.0.4",
+            "model_revision": "v2.0.5",
             "device": device,
             "disable_update": True,
         }

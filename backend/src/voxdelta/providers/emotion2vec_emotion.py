@@ -172,7 +172,7 @@ class Emotion2VecEmotionProvider:
         )
         self.provenance = ProviderProvenance(
             name="emotion2vec-plus",
-            model="emotion2vec-plus-large-seven-emotion@v2.0.4",
+            model="emotion2vec-plus-large-seven-emotion@v2.0.5",
             remote=False,
             revision=self._checkpoint.digest,
         )

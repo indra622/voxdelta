@@ -43,7 +43,7 @@ def test_profiles_are_strict_and_exact() -> None:
     )
     modern = Emotion2VecTrainingProfile()
     assert modern.encoder_id == "iic/emotion2vec_plus_large"
-    assert modern.encoder_revision == "v2.0.4"
+    assert modern.encoder_revision == "v2.0.5"
     assert modern.freeze_encoder is True
     assert (modern.hidden_size, modern.dropout, modern.learning_rate) == (256, 0.1, 1e-3)
     assert (modern.batch_size, modern.epochs, modern.early_stopping_patience) == (64, 20, 3)
@@ -105,7 +105,7 @@ def test_embedding_cache_key_is_collision_resistant_and_cache_fails_closed(
     assert base != embedding_cache_key("a" * 64, "other", "v1")
     assert base != embedding_cache_key("a" * 64, "iic/emotion2vec_plus_large", "v2")
     assert base != embedding_cache_key(
-        "a" * 64, "iic/emotion2vec_plus_large@v2.0.4#" + "b" * 64, "v1"
+        "a" * 64, "iic/emotion2vec_plus_large@v2.0.5#" + "b" * 64, "v1"
     )
     with pytest.raises(ValueError):
         embedding_cache_key("not-sha", "encoder", "v1")
@@ -260,7 +260,7 @@ def test_checkpoint_publication_is_atomic_complete_and_hashes_validation(
         metrics={"macro_f1": 0.75},
         validation_hash="a" * 64,
         encoder_hash="b" * 64,
-        encoder_revision="v2.0.4",
+        encoder_revision="v2.0.5",
         freeze_encoder=True,
         embedding_size=2,
     )
@@ -275,7 +275,7 @@ def test_checkpoint_publication_is_atomic_complete_and_hashes_validation(
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     assert config["labels"] == list(LABELS)
     assert config["encoder_hash"] == "b" * 64
-    assert config["encoder_revision"] == "v2.0.4"
+    assert config["encoder_revision"] == "v2.0.5"
     assert config["embedding_size"] == 2
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["validation_hash"] == "a" * 64

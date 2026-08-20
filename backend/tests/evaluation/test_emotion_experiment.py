@@ -172,7 +172,7 @@ class FakeProvider:
     def __init__(self, *, fail_all: bool = False) -> None:
         self.provenance = ProviderProvenance(
             name="emotion2vec-plus",
-            model="emotion2vec-plus-large-seven-emotion@v2.0.4",
+            model="emotion2vec-plus-large-seven-emotion@v2.0.5",
             remote=False,
             revision="a" * 64,
         )
@@ -218,7 +218,7 @@ def _smoke_evaluation_manifest(root: Path) -> Path:
 def _report_fixture() -> EmotionExperimentReport:
     return EmotionExperimentReport(
         architecture="emotion2vec-plus",
-        model_id="emotion2vec-plus-large-seven-emotion@v2.0.4",
+        model_id="emotion2vec-plus-large-seven-emotion@v2.0.5",
         checkpoint_digest="a" * 64,
         manifest_digest="b" * 64,
         test_count=7,

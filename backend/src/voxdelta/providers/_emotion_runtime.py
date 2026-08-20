@@ -180,7 +180,7 @@ def validate_checkpoint(
             embedding_size = config.get("embedding_size")
             if (
                 not _sha(config.get("encoder_hash"))
-                or config.get("encoder_revision") != "v2.0.4"
+                or config.get("encoder_revision") != "v2.0.5"
                 or config.get("freeze_encoder") is not True
                 or isinstance(embedding_size, bool)
                 or not isinstance(embedding_size, int)
