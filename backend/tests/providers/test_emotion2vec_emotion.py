@@ -7,6 +7,7 @@ import sys
 import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from voxdelta.providers.base import EmotionProvider, ProviderError
@@ -172,13 +173,17 @@ def test_predictor_requests_the_same_embedding_contract_as_training() -> None:
 
     predictor.predict((0.0,) * 16_000, 16_000)
 
-    assert encoder.calls == [
-        {
-            "input": [0.0] * 16_000,
-            "granularity": "utterance",
-            "extract_embedding": True,
-        }
-    ]
+    assert len(encoder.calls) == 1
+    call = encoder.calls[0]
+    waveform = call.pop("input")
+    assert isinstance(waveform, np.ndarray)
+    assert waveform.dtype == np.float32
+    assert waveform.shape == (16_000,)
+    assert waveform.tolist() == pytest.approx([0.0] * 16_000)
+    assert call == {
+        "granularity": "utterance",
+        "extract_embedding": True,
+    }
 
 
 def test_emotion2vec_uses_shared_seven_label_result_mapping(tmp_path: Path) -> None:

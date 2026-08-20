@@ -9,10 +9,22 @@ import sys
 import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pydantic import ValidationError
 
 LABELS = ("happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise")
+
+
+def test_emotion2vec_input_is_one_float32_waveform() -> None:
+    from voxdelta.evaluation.emotion_training import emotion2vec_input
+
+    waveform = emotion2vec_input((0.25, -0.5, 0.75))
+
+    assert isinstance(waveform, np.ndarray)
+    assert waveform.dtype == np.float32
+    assert waveform.shape == (3,)
+    assert waveform.tolist() == pytest.approx([0.25, -0.5, 0.75])
 
 
 def _wav(path: Path, seconds: float, *, channels: int = 1, rate: int = 16_000) -> Path:

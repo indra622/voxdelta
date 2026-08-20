@@ -140,6 +140,13 @@ def training_clip(clip: AudioClip) -> AudioClip:
     return AudioClip(samples=clip.samples[start : start + WINDOW_SAMPLES])
 
 
+def emotion2vec_input(samples: Sequence[float]) -> Any:
+    """Represent one waveform without FunASR mistaking its samples for a batch."""
+
+    numpy = __import__("numpy")
+    return numpy.asarray(samples, dtype=numpy.float32)
+
+
 def evaluation_windows(clip: AudioClip) -> tuple[AudioClip, ...]:
     return tuple(
         AudioClip(samples=clip.samples[start : start + WINDOW_SAMPLES])
@@ -875,7 +882,7 @@ def _train_emotion2vec(
             pass
         try:
             output = encoder.generate(
-                input=list(clip.samples),
+                input=emotion2vec_input(clip.samples),
                 granularity="utterance",
                 extract_embedding=True,
             )

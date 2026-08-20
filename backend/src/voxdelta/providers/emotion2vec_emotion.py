@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from voxdelta.domain.models import EmotionResult, ProviderProvenance
-from voxdelta.evaluation.emotion_training import encoder_state_hash
+from voxdelta.evaluation.emotion_training import emotion2vec_input, encoder_state_hash
 from voxdelta.providers._emotion_runtime import (
     LOCAL_EMOTION_INFERENCE_LOCK,
     Device,
@@ -96,7 +96,7 @@ class _Emotion2VecPredictor:
         del sample_rate
         try:
             output = self._encoder.generate(
-                input=list(samples),
+                input=emotion2vec_input(samples),
                 granularity="utterance",
                 extract_embedding=True,
             )
