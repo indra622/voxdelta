@@ -324,7 +324,7 @@ git commit -m "feat: evaluate emotion checkpoints by explicit split"
 - Consumes: the balanced trainers, schema-v2 runtime, explicit validation evaluator, fixed manifest, and existing embedding cache.
 - Produces: a distinct candidate checkpoint and aggregate validation evidence; no test metrics.
 
-- [ ] **Step 1: Run the complete repository quality gate**
+- [x] **Step 1: Run the complete repository quality gate**
 
 Run:
 
@@ -340,11 +340,11 @@ git diff --check
 
 Expected: all checks pass, with only the existing platform-specific skip.
 
-- [ ] **Step 2: Verify immutable inputs and empty output targets**
+- [x] **Step 2: Verify immutable inputs and empty output targets**
 
 Verify the baseline checkpoint digest remains `8a5b7c55e0de52391acba7b7c2c74ac69cfd464eb7ab13002b335f1c1b499cf5`, record the six raw source file sizes/mtimes, verify the manifest hash, and assert neither balanced output path exists. Stop rather than overwrite if either target exists.
 
-- [ ] **Step 3: Run cached full emotion2vec+ head retraining**
+- [x] **Step 3: Run cached full emotion2vec+ head retraining**
 
 Run from `backend` with stdout/stderr captured to the runtime log:
 
@@ -360,7 +360,7 @@ uv run python scripts/train_emotion.py \
 
 Expected: the existing `~/.cache/voxdelta/emotion2vec-v1` embeddings are reused and a private schema-v2 checkpoint is atomically published.
 
-- [ ] **Step 4: Reload and evaluate validation only**
+- [x] **Step 4: Reload and evaluate validation only**
 
 ```bash
 uv run python scripts/evaluate_emotion_checkpoint.py \
@@ -374,11 +374,11 @@ uv run python scripts/evaluate_emotion_checkpoint.py \
 
 Expected: 3,569 validation items attempted; report mode 0600; no item-level content; test items untouched.
 
-- [ ] **Step 5: Apply the acceptance rule and verify integrity**
+- [x] **Step 5: Apply the acceptance rule and verify integrity**
 
 Assert report macro-F1 is greater than `0.2082607`, every canonical per-label F1 is greater than zero, probabilities sum to one on a production-provider reload, the balanced checkpoint config records the exact seven weights, the baseline digest is unchanged, and the six raw source file sizes/mtimes are unchanged.
 
-- [ ] **Step 6: Record aggregate results and rerun focused checks**
+- [x] **Step 6: Record aggregate results and rerun focused checks**
 
 Append only aggregate macro-F1, per-label F1, prediction counts, checkpoint digest, validation hash, elapsed time, cache size, and pass/fail outcome to this plan. Then run:
 
@@ -390,9 +390,34 @@ git status --short
 
 Expected: focused tests pass and only intentional tracked plan-result changes remain.
 
-- [ ] **Step 7: Commit verified results**
+- [x] **Step 7: Commit verified results**
 
 ```bash
 git add docs/superpowers/plans/2026-08-20-emotion-class-balanced-training.md
 git commit -m "docs: record balanced emotion training result"
 ```
+
+## Live-run result
+
+The balanced emotion2vec+ head passed the approved validation gate. Training reused the existing
+33,054-file, 775 MB embedding cache and atomically published the new checkpoint in about 5 minutes
+43 seconds. Production-provider evaluation completed all 3,569 validation items in 304.073 seconds.
+The full test split remained sealed.
+
+- validation macro-F1: `0.2400351902` (unweighted baseline: `0.2082606898`)
+- per-label F1: happiness `0.301887`, anger `0.113924`, disgust `0.098765`, fear `0.122905`, neutral `0.281102`, sadness `0.622253`, surprise `0.139410`
+- prediction counts: happiness 767, anger 124, disgust 211, fear 307, neutral 524, sadness 1,344, surprise 292
+- ECE: `0.077883`; median latency: `69.416 ms`; peak RSS: `4,966.281 MB`
+- checkpoint digest: `163af0c33ce47de0ffc3a16b141442946adae70ad295a30cf562b84d141fcfad`
+- validation hash: `c6ec15926c25df84926cf93841ad1d37d86f5344554dad78442aa45e00108182`
+- checkpoint schema: version 2, `inverse-frequency`, exact canonical-order weights `1.5087270308`, `0.7568039437`, `2.4931066565`, `2.0918316656`, `0.9695733693`, `0.3368146811`, `7.3359880538`
+- provider reload: canonical labels present and probability sum exactly `1.0`
+- integrity: baseline digest unchanged; manifest digest `8e23c35b833c70de392c36ad6d3909776da699a29ca28cf99aa970e0faf01e8e`; all six raw source sizes/mtimes unchanged
+- privacy and permissions: checkpoint and aggregate report files mode 0600; report contains no transcript, path, item ID, raw probability, or per-item prediction fields
+- acceptance: **PASS** because macro-F1 improved and all seven per-label F1 values are greater than zero
+
+Logs:
+
+- `/Users/hosungmini/.openclaw/workspace/logs/2026-08-20/voxdelta-emotion2vec-balanced.log`
+- `/Users/hosungmini/.openclaw/workspace/logs/2026-08-20/voxdelta-emotion2vec-balanced-validation.log`
+- `/Users/hosungmini/.openclaw/workspace/logs/2026-08-20/voxdelta-emotion2vec-balanced-provider-check.log`
