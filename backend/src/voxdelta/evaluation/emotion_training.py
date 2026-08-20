@@ -49,11 +49,14 @@ CANONICAL_LABELS: tuple[EmotionLabel, ...] = (
     "surprise",
 )
 
+AdaptationStrategy = Literal["full", "partial-last4"]
+
 
 class Wav2VecTrainingProfile(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     architecture: Literal["wav2vec-xls-r"] = "wav2vec-xls-r"
+    adaptation_strategy: AdaptationStrategy = "full"
     model_id: Literal["facebook/wav2vec2-xls-r-300m"] = "facebook/wav2vec2-xls-r-300m"
     base_model_path: Path
     model_revision: Literal["1a640f32ac3e39899438a2931f9924c02f080a54"] = WAV2VEC_MODEL_REVISION
@@ -81,6 +84,7 @@ class Wav2VecTrainingProfile(BaseModel):
             or self.gradient_accumulation_steps != accumulation_by_batch[self.train_batch_size]
             or self.learning_rate != 2e-5
             or self.warmup_ratio != 0.1
+            or (self.adaptation_strategy == "partial-last4" and self.train_batch_size != 2)
         ):
             raise ValueError("wav2vec training profile is fixed")
         return self

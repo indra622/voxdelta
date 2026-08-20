@@ -97,6 +97,43 @@ def test_wav2vec_profiles_preserve_effective_batch_sixteen(
     assert profile.train_batch_size * profile.gradient_accumulation_steps == 16
 
 
+def test_partial_last4_profile_is_exact_and_memory_bounded(tmp_path: Path) -> None:
+    from voxdelta.evaluation.emotion_training import Wav2VecTrainingProfile
+
+    profile = Wav2VecTrainingProfile(
+        base_model_path=tmp_path.resolve(),
+        adaptation_strategy="partial-last4",
+        train_batch_size=2,
+        eval_batch_size=2,
+        gradient_accumulation_steps=8,
+    )
+
+    assert profile.adaptation_strategy == "partial-last4"
+    assert profile.train_batch_size * profile.gradient_accumulation_steps == 16
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"adaptation_strategy": "partial-last4"},
+        {
+            "adaptation_strategy": "partial-last4",
+            "train_batch_size": 4,
+            "eval_batch_size": 4,
+            "gradient_accumulation_steps": 4,
+        },
+        {"adaptation_strategy": "unknown"},
+    ],
+)
+def test_partial_last4_profile_rejects_non_exact_combinations(
+    tmp_path: Path, metadata: dict[str, object]
+) -> None:
+    from voxdelta.evaluation.emotion_training import Wav2VecTrainingProfile
+
+    with pytest.raises(ValidationError):
+        Wav2VecTrainingProfile.model_validate({"base_model_path": tmp_path.resolve(), **metadata})
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -854,6 +891,81 @@ def test_training_cli_requires_both_approved_xls_r_local_flags(
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr.strip() == "training_error: invalid_training_profile"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--architecture", "emotion2vec-plus", "--adaptation-strategy", "partial-last4"],
+        [
+            "--architecture",
+            "wav2vec-xls-r",
+            "--adaptation-strategy",
+            "partial-last4",
+            "--base-model-path",
+            "/base",
+            "--micro-batch-size",
+            "4",
+        ],
+    ],
+)
+def test_training_cli_rejects_incompatible_partial_last4_flags(
+    tmp_path: Path, arguments: list[str]
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/train_emotion.py",
+            "--manifest",
+            str(tmp_path / "manifest.jsonl"),
+            "--output",
+            str(tmp_path / "output"),
+            "--base-model",
+            "facebook/wav2vec2-xls-r-300m",
+            *arguments,
+        ],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.strip() == "training_error: invalid_training_profile"
+
+
+def test_training_cli_accepts_partial_last4_flag_before_manifest_validation(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/train_emotion.py",
+            "--manifest",
+            str(tmp_path / "missing.jsonl"),
+            "--output",
+            str(tmp_path / "output"),
+            "--architecture",
+            "wav2vec-xls-r",
+            "--adaptation-strategy",
+            "partial-last4",
+            "--base-model",
+            "facebook/wav2vec2-xls-r-300m",
+            "--base-model-path",
+            str(tmp_path.resolve()),
+            "--micro-batch-size",
+            "2",
+        ],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.strip() == "training_error: invalid_training_manifest"
 
 
 def test_evaluation_example_batches_use_exact_profile_batch_size() -> None:
