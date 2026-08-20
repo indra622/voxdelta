@@ -134,6 +134,101 @@ def test_partial_last4_profile_rejects_non_exact_combinations(
         Wav2VecTrainingProfile.model_validate({"base_model_path": tmp_path.resolve(), **metadata})
 
 
+def _fake_wav2vec_model(torch: object, layer_count: int = 24) -> object:
+    model = torch.nn.Module()
+    model.wav2vec2 = torch.nn.Module()
+    model.wav2vec2.feature_extractor = torch.nn.Linear(2, 2)
+    model.wav2vec2.feature_projection = torch.nn.Linear(2, 2)
+    model.wav2vec2.encoder = torch.nn.Module()
+    model.wav2vec2.encoder.layers = torch.nn.ModuleList(
+        torch.nn.Linear(2, 2) for _ in range(layer_count)
+    )
+    model.projector = torch.nn.Linear(2, 2)
+    model.classifier = torch.nn.Linear(2, 7)
+    return model
+
+
+def test_partial_last4_enables_only_exact_allowlist() -> None:
+    import torch
+
+    from voxdelta.evaluation.emotion_training import (
+        PARTIAL_LAST4_PREFIXES,
+        configure_wav2vec_trainable_parameters,
+    )
+
+    model = _fake_wav2vec_model(torch)
+    summary = configure_wav2vec_trainable_parameters(model, "partial-last4")
+    trainable_names = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+
+    assert summary.encoder_layers == (20, 21, 22, 23)
+    assert summary.module_prefixes == PARTIAL_LAST4_PREFIXES
+    assert trainable_names
+    assert all(name.startswith(PARTIAL_LAST4_PREFIXES) for name in trainable_names)
+    assert summary.trainable_parameter_count == sum(
+        parameter.numel() for parameter in summary.parameters
+    )
+    assert 0 < summary.trainable_parameter_count < summary.total_parameter_count
+
+
+@pytest.mark.parametrize("layer_count", [23, 25])
+def test_partial_last4_rejects_unexpected_encoder_depth(layer_count: int) -> None:
+    import torch
+
+    from voxdelta.evaluation.emotion_training import (
+        TrainingError,
+        configure_wav2vec_trainable_parameters,
+    )
+
+    with pytest.raises(TrainingError, match="training_failed"):
+        configure_wav2vec_trainable_parameters(
+            _fake_wav2vec_model(torch, layer_count), "partial-last4"
+        )
+
+
+def test_partial_last4_rejects_missing_required_prefix() -> None:
+    import torch
+
+    from voxdelta.evaluation.emotion_training import (
+        TrainingError,
+        configure_wav2vec_trainable_parameters,
+    )
+
+    model = _fake_wav2vec_model(torch)
+    del model.classifier
+
+    with pytest.raises(TrainingError, match="training_failed"):
+        configure_wav2vec_trainable_parameters(model, "partial-last4")
+
+
+def test_partial_last4_optimizer_receives_only_allowlisted_parameters(tmp_path: Path) -> None:
+    import torch
+
+    from voxdelta.evaluation.emotion_training import (
+        Wav2VecTrainingProfile,
+        build_wav2vec_optimizer,
+    )
+
+    model = _fake_wav2vec_model(torch)
+    profile = Wav2VecTrainingProfile(
+        base_model_path=tmp_path.resolve(),
+        adaptation_strategy="partial-last4",
+        train_batch_size=2,
+        eval_batch_size=2,
+        gradient_accumulation_steps=8,
+    )
+    optimizer, summary = build_wav2vec_optimizer(torch, model, profile)
+
+    optimizer_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    assert optimizer_ids == {id(parameter) for parameter in summary.parameters}
+    assert optimizer_ids == {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+
+
 @pytest.mark.parametrize(
     "metadata",
     [

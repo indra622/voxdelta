@@ -50,6 +50,24 @@ CANONICAL_LABELS: tuple[EmotionLabel, ...] = (
 )
 
 AdaptationStrategy = Literal["full", "partial-last4"]
+PARTIAL_LAST4_ENCODER_LAYERS = (20, 21, 22, 23)
+PARTIAL_LAST4_PREFIXES = (
+    "wav2vec2.encoder.layers.20.",
+    "wav2vec2.encoder.layers.21.",
+    "wav2vec2.encoder.layers.22.",
+    "wav2vec2.encoder.layers.23.",
+    "projector.",
+    "classifier.",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Wav2VecTrainableSummary:
+    parameters: tuple[Any, ...]
+    encoder_layers: tuple[int, ...]
+    module_prefixes: tuple[str, ...]
+    trainable_parameter_count: int
+    total_parameter_count: int
 
 
 class Wav2VecTrainingProfile(BaseModel):
@@ -694,6 +712,72 @@ class TrainingError(RuntimeError):
         super().__init__(code)
 
 
+def configure_wav2vec_trainable_parameters(
+    model: Any, strategy: AdaptationStrategy
+) -> Wav2VecTrainableSummary:
+    named = tuple(model.named_parameters())
+    if not named:
+        raise TrainingError("training_failed")
+    total_count = sum(parameter.numel() for _, parameter in named)
+    if strategy == "full":
+        parameters = tuple(parameter for _, parameter in named)
+        return Wav2VecTrainableSummary(
+            parameters=parameters,
+            encoder_layers=(),
+            module_prefixes=(),
+            trainable_parameter_count=sum(parameter.numel() for parameter in parameters),
+            total_parameter_count=total_count,
+        )
+
+    try:
+        layers = model.wav2vec2.encoder.layers
+        if len(layers) != 24:
+            raise ValueError
+    except Exception:
+        raise TrainingError("training_failed") from None
+
+    seen_prefixes: set[str] = set()
+    trainable: list[Any] = []
+    for name, parameter in named:
+        parameter.requires_grad = False
+        matches = tuple(prefix for prefix in PARTIAL_LAST4_PREFIXES if name.startswith(prefix))
+        if len(matches) > 1:
+            raise TrainingError("training_failed")
+        if matches:
+            parameter.requires_grad = True
+            trainable.append(parameter)
+            seen_prefixes.add(matches[0])
+
+    if seen_prefixes != set(PARTIAL_LAST4_PREFIXES) or not trainable:
+        raise TrainingError("training_failed")
+    if any(
+        parameter.requires_grad and not name.startswith(PARTIAL_LAST4_PREFIXES)
+        for name, parameter in named
+    ):
+        raise TrainingError("training_failed")
+
+    return Wav2VecTrainableSummary(
+        parameters=tuple(trainable),
+        encoder_layers=PARTIAL_LAST4_ENCODER_LAYERS,
+        module_prefixes=PARTIAL_LAST4_PREFIXES,
+        trainable_parameter_count=sum(parameter.numel() for parameter in trainable),
+        total_parameter_count=total_count,
+    )
+
+
+def build_wav2vec_optimizer(
+    torch: Any, model: Any, profile: Wav2VecTrainingProfile
+) -> tuple[Any, Wav2VecTrainableSummary]:
+    summary = configure_wav2vec_trainable_parameters(model, profile.adaptation_strategy)
+    optimizer_parameters = (
+        summary.parameters
+        if profile.adaptation_strategy == "partial-last4"
+        else tuple(model.parameters())
+    )
+    optimizer = torch.optim.AdamW(optimizer_parameters, lr=profile.learning_rate)
+    return optimizer, summary
+
+
 def inverse_frequency_class_weights(
     examples: Sequence[TrainingExample],
 ) -> tuple[float, ...]:
@@ -829,7 +913,7 @@ def _train_wav2vec(
     extractor, model, prepared_base = load_wav2vec_components(transformers, profile.base_model_path)
     torch.random.set_rng_state(initial_torch_state)
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=profile.learning_rate)
+    optimizer, trainable_summary = build_wav2vec_optimizer(torch, model, profile)
     batches_per_epoch = math.ceil(len(train_items) / profile.train_batch_size)
     update_steps = math.ceil(batches_per_epoch / profile.gradient_accumulation_steps)
     total_steps = max(1, update_steps * profile.epochs)
