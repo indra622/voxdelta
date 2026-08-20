@@ -167,3 +167,126 @@ published. Do not disable PyTorch's MPS high-watermark safety control.
 This controlled smoke trains on 140 items and selects on 35 validation items. Evaluation also uses
 those 35 validation items as readiness evidence; it does not evaluate any test-split item and is not
 an unbiased final quality estimate.
+
+## Run the gated partial-last-four XLS-R experiment
+
+Keep the test split sealed throughout this workflow. Both stages evaluate only validation items;
+do not change either evaluation split, build a test-bearing development manifest, or inspect test
+metrics. Run each command separately and stop on its first non-zero exit. The shown micro-batch size,
+adaptation strategy, device, and other training settings are the only authorized profile.
+
+### Stage A: controlled smoke
+
+The Stage A checkpoint and validation report are non-overwriting publication targets. Before
+starting, confirm that both paths below are absent. If either already exists, stop without deleting,
+replacing, or reusing it:
+
+```text
+/Volumes/nvme1/codes/voxdelta/data/models/wav2vec-xls-r-300m-partial-last4-smoke
+/Volumes/nvme1/codes/voxdelta/data/benchmarks/wav2vec-xls-r-300m-partial-last4-smoke-validation.json
+```
+
+From the repository, run:
+
+```bash
+cd /Volumes/nvme1/codes/voxdelta/backend
+VOXDELTA_DATA=/Volumes/nvme1/codes/voxdelta/data
+
+uv run python scripts/train_emotion.py \
+  --manifest "$VOXDELTA_DATA/manifests/emotion-smoke.jsonl" \
+  --output "$VOXDELTA_DATA/models/wav2vec-xls-r-300m-partial-last4-smoke" \
+  --architecture wav2vec-xls-r \
+  --adaptation-strategy partial-last4 \
+  --base-model facebook/wav2vec2-xls-r-300m \
+  --base-model-path "$VOXDELTA_DATA/models/base/wav2vec2-xls-r-300m-1a640f3" \
+  --micro-batch-size 2 \
+  --seed 622
+
+uv run python scripts/evaluate_emotion_checkpoint.py \
+  --manifest "$VOXDELTA_DATA/manifests/emotion-smoke.jsonl" \
+  --checkpoint "$VOXDELTA_DATA/models/wav2vec-xls-r-300m-partial-last4-smoke" \
+  --base-model-path "$VOXDELTA_DATA/models/base/wav2vec2-xls-r-300m-1a640f3" \
+  --output "$VOXDELTA_DATA/benchmarks/wav2vec-xls-r-300m-partial-last4-smoke-validation.json" \
+  --architecture wav2vec-xls-r \
+  --device mps \
+  --split validation
+```
+
+After both commands succeed, enforce the aggregate Stage A quality gate:
+
+```bash
+uv run python -c '
+import json
+from pathlib import Path
+r=json.loads(Path("/Volumes/nvme1/codes/voxdelta/data/benchmarks/wav2vec-xls-r-300m-partial-last4-smoke-validation.json").read_text())
+m=r["confusion_matrix"]
+predicted=sum(any(row[column] for row in m) for column in range(7))
+assert r["item_count"] == 35
+assert r["completed_count"] == 35
+assert r["macro_f1"] > 0.0357143
+assert predicted >= 2
+print("partial-last4 stage A passed")
+'
+```
+
+The expected output is `partial-last4 stage A passed`. Any command failure, assertion failure, or
+different output stops the workflow; Stage B must not run.
+
+### Stage B: balanced development subset
+
+Run Stage B only after Stage A prints its exact pass message. The development manifest, checkpoint,
+and validation report are non-overwriting publication targets. Confirm that all three paths below are
+absent before starting. If any exists, stop without deleting, replacing, or reusing it:
+
+```text
+/Volumes/nvme1/codes/voxdelta/data/manifests/emotion-partial-last4-development.jsonl
+/Volumes/nvme1/codes/voxdelta/data/models/wav2vec-xls-r-300m-partial-last4-development
+/Volumes/nvme1/codes/voxdelta/data/benchmarks/wav2vec-xls-r-300m-partial-last4-development-validation.json
+```
+
+Continue from `backend/` with the same `VOXDELTA_DATA` value:
+
+```bash
+uv run python scripts/build_emotion_development_manifest.py \
+  --manifest "$VOXDELTA_DATA/manifests/emotion.jsonl" \
+  --output "$VOXDELTA_DATA/manifests/emotion-partial-last4-development.jsonl"
+
+uv run python scripts/train_emotion.py \
+  --manifest "$VOXDELTA_DATA/manifests/emotion-partial-last4-development.jsonl" \
+  --output "$VOXDELTA_DATA/models/wav2vec-xls-r-300m-partial-last4-development" \
+  --architecture wav2vec-xls-r \
+  --adaptation-strategy partial-last4 \
+  --base-model facebook/wav2vec2-xls-r-300m \
+  --base-model-path "$VOXDELTA_DATA/models/base/wav2vec2-xls-r-300m-1a640f3" \
+  --micro-batch-size 2 \
+  --seed 622
+
+uv run python scripts/evaluate_emotion_checkpoint.py \
+  --manifest "$VOXDELTA_DATA/manifests/emotion-partial-last4-development.jsonl" \
+  --checkpoint "$VOXDELTA_DATA/models/wav2vec-xls-r-300m-partial-last4-development" \
+  --base-model-path "$VOXDELTA_DATA/models/base/wav2vec2-xls-r-300m-1a640f3" \
+  --output "$VOXDELTA_DATA/benchmarks/wav2vec-xls-r-300m-partial-last4-development-validation.json" \
+  --architecture wav2vec-xls-r \
+  --device mps \
+  --split validation
+```
+
+After all three commands succeed, enforce the aggregate Stage B quality gate:
+
+```bash
+uv run python -c '
+import json
+from pathlib import Path
+r=json.loads(Path("/Volumes/nvme1/codes/voxdelta/data/benchmarks/wav2vec-xls-r-300m-partial-last4-development-validation.json").read_text())
+m=r["confusion_matrix"]
+predicted=sum(any(row[column] for row in m) for column in range(7))
+assert r["item_count"] == 175
+assert r["completed_count"] == 175
+assert r["macro_f1"] > 0.0357143
+assert predicted >= 2
+print("partial-last4 stage B passed")
+'
+```
+
+The expected output is `partial-last4 stage B passed`. Any command or assertion failure is a failed
+experiment. Stop without trying another profile and keep the test split sealed.
