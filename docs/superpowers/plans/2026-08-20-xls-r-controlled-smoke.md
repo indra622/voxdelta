@@ -583,3 +583,40 @@ git commit -m "docs: record XLS-R smoke acceptance"
 ```
 
 Run `git status --short --branch` and require a clean worktree before merge review.
+
+## Acceptance Result
+
+- Completed on 2026-08-20 KST using the canonical NVMe data tree and Apple MPS.
+- The pinned base independently validated at revision
+  `1a640f32ac3e39899438a2931f9924c02f080a54` with weight SHA-256
+  `d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0`.
+  The directory was mode `0700`; its exact three files were mode `0600`.
+- Micro-batch four failed after 1,091.40 seconds under confirmed system memory pressure:
+  swap peaked above 12 GiB, macOS recorded concurrent jetsam activity, the command returned
+  `training_failed`, and no final checkpoint was published.
+- A fresh-process retry with micro-batch two and gradient accumulation eight succeeded in
+  1,640.61 seconds. `/usr/bin/time -l` recorded a maximum resident set size of
+  3,562,782,720 bytes (3,397.73 MiB); Metal/unified-memory use is not included in that RSS,
+  and observed swap peaked above 14 GiB.
+- The schema-3 checkpoint records the pinned revision and base digest, inverse-frequency
+  weighting, seven finite positive class weights, and tree digest
+  `7c4d8beff8a3eaef74289857309b4dc61b3ea000b8ed9b9850cf988ce5e67ec0`.
+  Because this smoke train split is balanced, all seven class weights are `1.0`.
+- Production-provider reload evaluated validation only, completing 35/35 items in 7.4560
+  seconds. Validation macro-F1 was `0.03571428571428571`; per-label F1 was happiness
+  `0.0`, anger `0.0`, disgust `0.0`, fear `0.0`, neutral `0.0`, sadness `0.0`, and
+  surprise `0.25`. All 35 validation items were predicted as surprise.
+- The aggregate report is mode `0600`, has SHA-256
+  `a9aa8bd0640b47c8dc65c24ca11b3188f8b4be04b130d1536b00a7e739533e2e`, and contains
+  no item IDs, audio paths, transcripts, probabilities, or individual predictions.
+- Exact post-run fingerprints for the six licensed source ZIP/CSV files and both full and
+  smoke manifests equal their pre-run fingerprints. No test-split item was evaluated.
+- Recommendation: do not begin the 36,665-item full fine-tune with this exact recipe on the
+  24 GiB Mac. The controlled path is technically valid, but the smoke collapsed to one
+  class and required severe paging even at micro-batch two. Diagnose optimization on a
+  larger balanced development subset and/or move the comparison to higher-memory GPU
+  hardware before authorizing full training. This smoke is not evidence that XLS-R itself
+  is intrinsically incapable; it is a no-go for the current local recipe.
+- Any future final-quality comparison must exclude the 35 test items exposed by the prior
+  emotion2vec smoke or freeze a new untouched holdout from the 3,585 remaining unobserved
+  test items.
