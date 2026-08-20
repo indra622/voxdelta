@@ -3,12 +3,16 @@ from __future__ import annotations
 import csv
 import json
 import os
+import subprocess
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 import pytest
 
 from voxdelta.evaluation.aihub_emotion import import_emotion_dataset, plan_emotion_import
+from voxdelta.evaluation.manifest import load_manifest
+
+BACKEND = Path(__file__).resolve().parents[2]
 
 HEADERS = (
     "wav_id",
@@ -86,6 +90,29 @@ def _write_three_release_fixture(root: Path) -> Path:
             force_zip64=release_name == "5차년도",
         )
     return root
+
+
+def _run_preparer(source: Path, output: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "scripts/prepare_aihub_emotion.py",
+            "--source-root",
+            str(source),
+            "--output-root",
+            str(output),
+            "--max-missing-audio",
+            "0",
+            "--max-orphan-audio",
+            "0",
+        ],
+        cwd=BACKEND,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def test_plan_accepts_three_of_five_votes_and_omits_transcript(tmp_path: Path) -> None:
@@ -343,3 +370,55 @@ def test_import_failure_leaves_no_published_or_staging_output(tmp_path: Path) ->
 
     assert not output.exists()
     assert not list(tmp_path.glob(".normalized.*"))
+
+
+def test_cli_prepares_pairs_consumed_by_manifest_builder(tmp_path: Path) -> None:
+    source = _write_three_release_fixture(tmp_path / "source")
+    normalized = tmp_path / "normalized"
+
+    prepared = _run_preparer(source, normalized)
+
+    assert prepared.returncode == 0
+    assert prepared.stdout == ""
+    assert prepared.stderr == ""
+    consultation = tmp_path / "empty-consultation"
+    consultation.mkdir()
+    manifests = tmp_path / "manifests"
+    built = subprocess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "scripts/build_aihub_manifests.py",
+            "--consultation-root",
+            str(consultation),
+            "--emotion-root",
+            str(normalized / "pairs"),
+            "--output-root",
+            str(manifests),
+        ],
+        cwd=BACKEND,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert built.returncode == 0, built.stderr
+    items = load_manifest(manifests / "emotion.jsonl")
+    assert len(items) == 3
+    assert {item.source for item in items} == {"emotion"}
+    assert {item.transcript for item in items} == {""}
+
+
+def test_cli_sanitizes_import_failures(tmp_path: Path) -> None:
+    source = tmp_path / "PRIVATE_SOURCE_SENTINEL"
+    source.mkdir()
+    output = tmp_path / "PRIVATE_OUTPUT_SENTINEL"
+
+    result = _run_preparer(source, output)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "emotion import failed\n"
+    assert "PRIVATE_SOURCE_SENTINEL" not in result.stderr
+    assert "PRIVATE_OUTPUT_SENTINEL" not in result.stderr
+    assert "Traceback" not in result.stderr

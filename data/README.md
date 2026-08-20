@@ -5,6 +5,7 @@ VoxDelta expects licensed datasets and generated evaluation artifacts in these l
 ```text
 data/raw/aihub/consultation/
 data/raw/aihub/emotion/
+data/derived/aihub/emotion/
 data/manifests/
 data/gold/
 data/jobs/
@@ -17,6 +18,32 @@ artifacts, downloaded models, and benchmark outputs are ignored by Git. Raw data
 clips are not redistributed. Confirm that your AI Hub license permits each intended local use before
 placing data here.
 
+## Prepare AI Hub dataset 263
+
+AI Hub's **감정 분류를 위한 대화 음성 데이터셋** (`dataSetSn=263`) is delivered as
+three annual WAV ZIP archives plus three CP949 CSV files, not as adjacent WAV+JSON pairs. Preserve
+those six source files unchanged under a local source directory, then normalize them from `backend/`:
+
+```bash
+uv run python scripts/prepare_aihub_emotion.py \
+  --source-root '../data/raw/감정 분류를 위한 대화 음성 데이터셋' \
+  --output-root ../data/derived/aihub/emotion \
+  --max-missing-audio 16 \
+  --max-orphan-audio 16
+```
+
+The two mismatch allowances are explicit for the verified 4차년도 release, which contains 16 CSV
+IDs without matching WAV basenames and 16 WAV basenames without CSV rows. The importer reads ZIP64
+with Python instead of macOS `unzip`, requires at least three matching votes among the five emotion
+annotators, and writes only high-consensus items under `emotion/pairs/`. It never copies transcripts:
+the normalized JSON uses an empty transcript, and `import-report.json` contains only opaque IDs and
+counts. Source archives are opened read-only and the completed output is published atomically.
+
+Dataset 263 does not expose real call or speaker identities. The normalized metadata therefore uses
+an item-scoped synthetic grouping key for both fields. Hash-based train/validation/test assignment is
+deterministic, but it must not be described as speaker-disjoint. Use the separately adjudicated
+call-center gold set for the final domain evaluation.
+
 ## Build manifests
 
 From `backend/`, generate deterministic call-level train, validation, and test manifests:
@@ -24,14 +51,18 @@ From `backend/`, generate deterministic call-level train, validation, and test m
 ```bash
 uv run python scripts/build_aihub_manifests.py \
   --consultation-root ../data/raw/aihub/consultation \
-  --emotion-root ../data/raw/aihub/emotion \
+  --emotion-root ../data/derived/aihub/emotion/pairs \
   --output-root ../data/manifests
 ```
 
-The builder requires adjacent audio and JSON files with the same filename stem. It stores absolute
-local audio paths, source identity, and SHA-256 digests in `train.jsonl`, `validation.jsonl`, and
-`test.jsonl`. It also writes sorted source-specific `consultation.jsonl` and `emotion.jsonl`
-manifests; every item in those files retains its deterministic split.
+For an emotion-only build before consultation data is normalized, pass an existing empty local
+directory as `--consultation-root`.
+
+The builder requires adjacent audio and JSON files with the same filename stem. The preparation step
+above creates that layout for dataset 263. The builder stores absolute local audio paths, source
+identity, and SHA-256 digests in `train.jsonl`, `validation.jsonl`, and `test.jsonl`. It also writes
+sorted source-specific `consultation.jsonl` and `emotion.jsonl` manifests; every item in those files
+retains its deterministic split.
 
 ## Validate audio hashes
 
