@@ -677,19 +677,19 @@ git add data/README.md docs/superpowers/plans/2026-08-20-emotion-real-data-smoke
 git commit -m "docs: add real-data emotion smoke workflow"
 ```
 
-- [ ] **Step 4: Run the real smoke manifest build**
+- [x] **Step 4: Run the real smoke manifest build**
 
 Run the first documented command. Verify 210 records, exactly 20/5/5 items per label and split, source audio hashes, and empty transcripts.
 
-- [ ] **Step 5: Run real emotion2vec+ training with a persistent local log**
+- [x] **Step 5: Run real emotion2vec+ training with a persistent local log**
 
 Run the second documented command with stdout/stderr redirected to `logs/2026-08-20/voxdelta-emotion2vec-smoke.log` through the task supervisor. Record start/end time, exit status, model/cache disk use, and sanitized last-error context if it fails.
 
-- [ ] **Step 6: Evaluate the real checkpoint**
+- [x] **Step 6: Evaluate the real checkpoint**
 
 Run the third documented command. Verify the checkpoint contract, 35 test attempts, finite aggregate metrics, report mode 0600, absence of forbidden item-level keys/content, and no changes to source file sizes or mtimes.
 
-- [ ] **Step 7: Re-run focused checks after the live integration**
+- [x] **Step 7: Re-run focused checks after the live integration**
 
 Run:
 
@@ -700,3 +700,8 @@ git status --short
 ```
 
 Expected: tests pass and only intentional tracked documentation changes, if any, remain.
+
+Live-run result: the deterministic manifest contained 210 items with 20/5/5 items per label
+across train/validation/test. The production provider completed all 35 held-out test items. The
+aggregate report recorded macro-F1 0.082792, ECE 0.186114, median latency 64.996 ms, and peak RSS
+4883.484 MB. This is an integration smoke result, not final model-quality evidence.
