@@ -316,3 +316,31 @@ The three immutable input fingerprints remained unchanged. Stage B was not run, 
 artifact was created, and the test split did not remain sealed because the pre-fix loader decoded
 its 35 smoke records. This tainted failure supports a separately designed LoRA or no-training
 baseline rather than another automatic profile change.
+
+### Sealed Stage A recovery rerun evidence (2026-08-21)
+
+At fix commit `e00ef6f`, the focused training-boundary regression passed for both supported
+architectures (`2 passed`) and proved that test records are excluded before audio file access. The
+same authorized `partial-last4` Stage A profile was then rerun with distinct `sealed-rerun`
+checkpoint and report targets. Training completed in 201 seconds of observed wall-clock time with
+50,649,095 trainable parameters out of 315,702,919 total parameters; only encoder layers 20 through
+23 and the projector/classifier were trainable.
+
+Production-provider validation completed 35 of 35 validation items in 6.968602166045457 seconds
+with peak RSS 2,847.453125 MiB. Macro-F1 was `0.03571428571428571`; per-label F1 was anger `0.0`,
+disgust `0.0`, fear `0.0`, happiness `0.0`, neutral `0.0`, sadness `0.0`, and surprise `0.25`.
+The confusion matrix was
+`[[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5]]`,
+with one predicted class.
+
+The exact Stage A gate failed because macro-F1 was not strictly greater than `0.0357143` and the
+predicted-class count was below two. Stage B was not run, and all three development targets remain
+absent. The sealed-rerun checkpoint digest is
+`6dfcf5143493349868cba2ee35be62c21329a03185d6760345c1f93255123fbc`; the sealed-rerun report
+SHA-256 is `4ef926b70a64e4ee6b6c939cbd44eac7981fa2f511d74a37f0d02686c34c49cc`.
+The full manifest, smoke manifest, and prior full validation report retained SHA-256 values
+`8e23c35b833c70de392c36ad6d3909776da699a29ca28cf99aa970e0faf01e8e`,
+`24f33066af38000f2a7be0df31732c9506397d8ac8c26ad165cfcf1d215b6371`, and
+`a9aa8bd0640b47c8dc65c24ca11b3188f8b4be04b130d1536b00a7e739533e2e`, respectively. The
+original tainted checkpoint and report above remain unchanged as historical evidence. This rerun
+did not open or evaluate test audio.
