@@ -246,6 +246,73 @@ def test_checkpoint_traversal_and_extra_metadata_are_rejected(tmp_path: Path) ->
     assert "secret" not in str(raised.value).lower()
 
 
+def test_weighted_schema_v2_checkpoint_loads_without_changing_inference(
+    tmp_path: Path,
+) -> None:
+    from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
+
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    config_path = checkpoint / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update(
+        {
+            "schema_version": "2",
+            "class_weighting": "inverse-frequency",
+            "class_weights": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        }
+    )
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    provider = Wav2VecEmotionProvider(
+        checkpoint,
+        model_factory=FakeFactory(FakePredictor([[0.0] * 7])),
+        hardware_probe=lambda: (False, False),
+    )
+
+    assert provider.provenance.revision is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("class_weighting", "none"),
+        ("class_weights", [1.0] * 6),
+        ("class_weights", [True] + [1.0] * 6),
+        ("class_weights", [0.0] + [1.0] * 6),
+        ("class_weights", [-1.0] + [1.0] * 6),
+        ("class_weights", [math.nan] + [1.0] * 6),
+        ("class_weights", [math.inf] + [1.0] * 6),
+        ("provider_payload", "transcript-secret"),
+    ],
+)
+def test_weighted_schema_v2_checkpoint_metadata_is_strict(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
+
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    config_path = checkpoint / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update(
+        {
+            "schema_version": "2",
+            "class_weighting": "inverse-frequency",
+            "class_weights": [1.0] * 7,
+            field: value,
+        }
+    )
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ProviderError) as raised:
+        Wav2VecEmotionProvider(
+            checkpoint,
+            model_factory=FakeFactory(FakePredictor([[0.0] * 7])),
+        )
+
+    assert raised.value.code == "invalid_local_checkpoint"
+    assert "secret" not in str(raised.value).lower()
+
+
 @pytest.mark.parametrize(
     "metrics",
     [

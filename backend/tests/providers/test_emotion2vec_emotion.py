@@ -233,6 +233,32 @@ def test_malformed_checkpoint_metadata_is_safe(tmp_path: Path) -> None:
     assert raised.value.code == "invalid_local_checkpoint"
 
 
+def test_weighted_schema_v2_checkpoint_loads_without_changing_inference(
+    tmp_path: Path,
+) -> None:
+    from voxdelta.providers.emotion2vec_emotion import Emotion2VecEmotionProvider
+
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    config_path = checkpoint / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update(
+        {
+            "schema_version": "2",
+            "class_weighting": "inverse-frequency",
+            "class_weights": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+        }
+    )
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    provider = Emotion2VecEmotionProvider(
+        checkpoint,
+        model_factory=FakeFactory(FakePredictor([[0.0] * 7])),
+        hardware_probe=lambda: (False, False),
+    )
+
+    assert provider.provenance.revision is not None
+
+
 def test_factory_failure_is_sanitized(tmp_path: Path) -> None:
     from voxdelta.providers.emotion2vec_emotion import Emotion2VecEmotionProvider
 

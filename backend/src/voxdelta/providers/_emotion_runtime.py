@@ -96,6 +96,14 @@ def _sha(value: object) -> bool:
     )
 
 
+def _valid_class_weights(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == len(CANONICAL_LABELS)
+        and all(type(weight) is float and math.isfinite(weight) and weight > 0 for weight in value)
+    )
+
+
 def _invalid_json_constant(value: str) -> None:
     del value
     raise ValueError
@@ -141,6 +149,21 @@ def validate_checkpoint(
             expected_config_keys.update(
                 {"embedding_size", "encoder_hash", "encoder_revision", "freeze_encoder"}
             )
+        if not isinstance(config, dict):
+            raise ValueError
+        schema_version = config.get("schema_version")
+        if schema_version == "1":
+            if set(config) != expected_config_keys:
+                raise ValueError
+        elif schema_version == "2":
+            if (
+                set(config) != expected_config_keys | {"class_weighting", "class_weights"}
+                or config.get("class_weighting") != "inverse-frequency"
+                or not _valid_class_weights(config.get("class_weights"))
+            ):
+                raise ValueError
+        else:
+            raise ValueError
         allowed_metric_keys = {
             "macro_f1",
             "validation_hash",
@@ -148,10 +171,7 @@ def validate_checkpoint(
         }
         required_metric_keys = {"macro_f1", "validation_hash"}
         if (
-            not isinstance(config, dict)
-            or set(config) != expected_config_keys
-            or config.get("schema_version") != "1"
-            or config.get("architecture") != architecture
+            config.get("architecture") != architecture
             or config.get("model_id") != model_id
             or config.get("labels") != list(CANONICAL_LABELS)
             or mapping != expected_mapping

@@ -370,6 +370,8 @@ def test_checkpoint_publication_is_atomic_complete_and_hashes_validation(
         encoder_revision="v2.0.5",
         freeze_encoder=True,
         embedding_size=2,
+        class_weighting="inverse-frequency",
+        class_weights=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0),
     )
     publish_checkpoint(output, payload)
 
@@ -380,12 +382,50 @@ def test_checkpoint_publication_is_atomic_complete_and_hashes_validation(
         "model.safetensors",
     ]
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    assert config["schema_version"] == "2"
     assert config["labels"] == list(LABELS)
     assert config["encoder_hash"] == "b" * 64
     assert config["encoder_revision"] == "v2.0.5"
     assert config["embedding_size"] == 2
+    assert config["class_weighting"] == "inverse-frequency"
+    assert config["class_weights"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["validation_hash"] == "a" * 64
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"class_weighting": "inverse-frequency"},
+        {"class_weights": (1.0,) * 7},
+        {
+            "class_weighting": "inverse-frequency",
+            "class_weights": (1.0,) * 6,
+        },
+        {
+            "class_weighting": "inverse-frequency",
+            "class_weights": (0.0,) + (1.0,) * 6,
+        },
+        {
+            "class_weighting": "inverse-frequency",
+            "class_weights": (float("nan"),) + (1.0,) * 6,
+        },
+    ],
+)
+def test_checkpoint_payload_rejects_incomplete_or_invalid_class_weights(
+    metadata: dict[str, object],
+) -> None:
+    from voxdelta.evaluation.emotion_training import CheckpointPayload
+
+    with pytest.raises(ValidationError):
+        CheckpointPayload(
+            architecture="wav2vec-xls-r",
+            model_id="facebook/wav2vec2-xls-r-300m",
+            weights=b"weights",
+            metrics={"macro_f1": 0.7},
+            validation_hash="a" * 64,
+            **metadata,
+        )
 
 
 def test_checkpoint_failure_leaves_no_partial_output(tmp_path: Path) -> None:

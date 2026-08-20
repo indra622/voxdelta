@@ -194,7 +194,7 @@ git commit -m "feat: balance both emotion training losses"
 - Consumes: fixed strategy and exact weights from Tasks 1-2.
 - Produces: optional `class_weighting` and `class_weights` fields on `CheckpointPayload`; schema-v2 config for balanced checkpoints; schema-v1 runtime compatibility.
 
-- [ ] **Step 1: Write failing publication and compatibility tests**
+- [x] **Step 1: Write failing publication and compatibility tests**
 
 Extend the atomic-publication test payload with:
 
@@ -205,7 +205,7 @@ class_weights=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0),
 
 Assert `config.json` contains schema version `"2"`, method `"inverse-frequency"`, and the exact list. Keep existing provider fixtures at schema v1 to prove legacy loading. Add a schema-v2 provider fixture and parameterize malformed metadata: wrong method, six weights, boolean, zero, negative, NaN, Infinity, and extra keys; each must raise `ProviderError("invalid_local_checkpoint")`.
 
-- [ ] **Step 2: Run checkpoint tests and verify RED**
+- [x] **Step 2: Run checkpoint tests and verify RED**
 
 Run:
 
@@ -216,7 +216,7 @@ uv run pytest tests/evaluation/test_emotion_training.py::test_checkpoint_publica
 
 Expected: failure because weighted metadata is not accepted or published.
 
-- [ ] **Step 3: Add payload validation and schema-v2 publication**
+- [x] **Step 3: Add payload validation and schema-v2 publication**
 
 Add optional fields:
 
@@ -229,7 +229,7 @@ Require both or neither. When present, require exactly seven finite positive non
 
 Pass the profile strategy and computed weights into the payload returned by both training backends.
 
-- [ ] **Step 4: Validate both runtime schemas strictly**
+- [x] **Step 4: Validate both runtime schemas strictly**
 
 In `_emotion_runtime.validate_checkpoint`, construct the architecture-specific base key set first. Accept exactly:
 
@@ -240,11 +240,11 @@ schema_v2_keys = base_keys | {"class_weighting", "class_weights"}
 
 Schema v1 must match `schema_v1_keys`. Schema v2 must match `schema_v2_keys`, method `inverse-frequency`, and a seven-element finite positive float list. Reject every other version/key combination before model loading.
 
-- [ ] **Step 5: Run checkpoint and provider tests**
+- [x] **Step 5: Run checkpoint and provider tests**
 
 Run the Step 2 command. Expected: all pass.
 
-- [ ] **Step 6: Commit checkpoint provenance**
+- [x] **Step 6: Commit checkpoint provenance**
 
 ```bash
 git add backend/src/voxdelta/evaluation/emotion_training.py backend/src/voxdelta/providers/_emotion_runtime.py backend/tests/evaluation/test_emotion_training.py backend/tests/providers/test_wav2vec_emotion.py backend/tests/providers/test_emotion2vec_emotion.py

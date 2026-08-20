@@ -447,10 +447,22 @@ class CheckpointPayload(BaseModel):
     encoder_revision: str | None = None
     freeze_encoder: bool | None = None
     embedding_size: int | None = Field(default=None, gt=0)
+    class_weighting: Literal["inverse-frequency"] | None = None
+    class_weights: tuple[float, ...] | None = None
 
     @model_validator(mode="after")
     def valid_metadata(self) -> CheckpointPayload:
         if not self.model_id or any(not math.isfinite(value) for value in self.metrics.values()):
+            raise ValueError("invalid checkpoint metadata")
+        if (self.class_weighting is None) != (self.class_weights is None):
+            raise ValueError("invalid checkpoint metadata")
+        if self.class_weights is not None and (
+            len(self.class_weights) != len(CANONICAL_LABELS)
+            or any(
+                type(value) is not float or not math.isfinite(value) or value <= 0
+                for value in self.class_weights
+            )
+        ):
             raise ValueError("invalid checkpoint metadata")
         if self.architecture == "emotion2vec-plus":
             if (
@@ -503,11 +515,18 @@ def publish_checkpoint(
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         staging = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=parent))
         config: dict[str, object] = {
-            "schema_version": "1",
+            "schema_version": "2" if payload.class_weighting is not None else "1",
             "architecture": payload.architecture,
             "model_id": payload.model_id,
             "labels": list(CANONICAL_LABELS),
         }
+        if payload.class_weighting is not None:
+            config.update(
+                {
+                    "class_weighting": payload.class_weighting,
+                    "class_weights": payload.class_weights,
+                }
+            )
         if payload.architecture == "emotion2vec-plus":
             config.update(
                 {
@@ -843,9 +862,7 @@ def _train_wav2vec(
                         device=device,
                     )
                     logits = model(**inputs_for(clips)).logits
-                    loss = weighted_cross_entropy(
-                        torch, logits, labels, class_weights, device
-                    )
+                    loss = weighted_cross_entropy(torch, logits, labels, class_weights, device)
                     (loss / profile.gradient_accumulation_steps).backward()
                     if (
                         batch_index % profile.gradient_accumulation_steps == 0
@@ -877,6 +894,8 @@ def _train_wav2vec(
         weights=weights,
         metrics={"macro_f1": best_score},
         validation_hash=validation_set_hash(validation_items),
+        class_weighting=profile.class_weighting,
+        class_weights=class_weights,
     )
 
 
@@ -1043,6 +1062,8 @@ def _train_emotion2vec(
         encoder_revision=profile.encoder_revision,
         freeze_encoder=True,
         embedding_size=embedding_size,
+        class_weighting=profile.class_weighting,
+        class_weights=class_weights,
     )
 
 
