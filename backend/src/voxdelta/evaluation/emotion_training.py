@@ -27,6 +27,10 @@ from voxdelta.evaluation.manifest import (
     read_trusted_regular_file,
     validate_disjoint_splits,
 )
+from voxdelta.evaluation.wav2vec_base import (
+    WAV2VEC_MODEL_REVISION,
+    WAV2VEC_WEIGHTS_SHA256,
+)
 
 SAMPLE_RATE = 16_000
 MIN_SAMPLES = SAMPLE_RATE // 2
@@ -447,6 +451,8 @@ class CheckpointPayload(BaseModel):
     encoder_revision: str | None = None
     freeze_encoder: bool | None = None
     embedding_size: int | None = Field(default=None, gt=0)
+    model_revision: str | None = None
+    base_model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     class_weighting: Literal["inverse-frequency"] | None = None
     class_weights: tuple[float, ...] | None = None
 
@@ -470,15 +476,21 @@ class CheckpointPayload(BaseModel):
                 or self.encoder_revision != EMOTION2VEC_REVISION
                 or self.freeze_encoder is not True
                 or self.embedding_size is None
+                or self.model_revision is not None
+                or self.base_model_sha256 is not None
             ):
                 raise ValueError("emotion2vec metadata is incomplete")
         elif (
-            self.encoder_hash is not None
+            self.model_revision != WAV2VEC_MODEL_REVISION
+            or self.base_model_sha256 != WAV2VEC_WEIGHTS_SHA256
+            or self.class_weighting != "inverse-frequency"
+            or self.class_weights is None
+            or self.encoder_hash is not None
             or self.encoder_revision is not None
             or self.freeze_encoder is not None
             or self.embedding_size is not None
         ):
-            raise ValueError("wav2vec checkpoint cannot contain encoder metadata")
+            raise ValueError("wav2vec metadata is incomplete")
         return self
 
 
@@ -515,7 +527,13 @@ def publish_checkpoint(
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         staging = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=parent))
         config: dict[str, object] = {
-            "schema_version": "2" if payload.class_weighting is not None else "1",
+            "schema_version": (
+                "3"
+                if payload.architecture == "wav2vec-xls-r"
+                else "2"
+                if payload.class_weighting is not None
+                else "1"
+            ),
             "architecture": payload.architecture,
             "model_id": payload.model_id,
             "labels": list(CANONICAL_LABELS),
@@ -534,6 +552,13 @@ def publish_checkpoint(
                     "encoder_hash": payload.encoder_hash,
                     "encoder_revision": payload.encoder_revision,
                     "freeze_encoder": payload.freeze_encoder,
+                }
+            )
+        else:
+            config.update(
+                {
+                    "model_revision": payload.model_revision,
+                    "base_model_sha256": payload.base_model_sha256,
                 }
             )
         files = {

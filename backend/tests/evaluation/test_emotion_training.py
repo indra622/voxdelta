@@ -14,6 +14,8 @@ import pytest
 from pydantic import ValidationError
 
 LABELS = ("happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise")
+WAV2VEC_REVISION = "1a640f32ac3e39899438a2931f9924c02f080a54"
+WAV2VEC_WEIGHTS_SHA256 = "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
 
 
 def test_emotion2vec_input_is_one_float32_waveform() -> None:
@@ -424,8 +426,56 @@ def test_checkpoint_payload_rejects_incomplete_or_invalid_class_weights(
             weights=b"weights",
             metrics={"macro_f1": 0.7},
             validation_hash="a" * 64,
+            model_revision=WAV2VEC_REVISION,
+            base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
             **metadata,
         )
+
+
+def test_wav2vec_checkpoint_requires_exact_pinned_base_provenance() -> None:
+    from voxdelta.evaluation.emotion_training import CheckpointPayload
+
+    base = {
+        "architecture": "wav2vec-xls-r",
+        "model_id": "facebook/wav2vec2-xls-r-300m",
+        "weights": b"weights",
+        "metrics": {"macro_f1": 0.7},
+        "validation_hash": "a" * 64,
+        "class_weighting": "inverse-frequency",
+        "class_weights": (1.0,) * 7,
+    }
+    with pytest.raises(ValidationError):
+        CheckpointPayload(**base)
+    with pytest.raises(ValidationError):
+        CheckpointPayload(
+            **base,
+            model_revision="wrong",
+            base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
+        )
+
+
+def test_wav2vec_checkpoint_publishes_schema_three_provenance(tmp_path: Path) -> None:
+    from voxdelta.evaluation.emotion_training import CheckpointPayload, publish_checkpoint
+
+    output = tmp_path / "model"
+    payload = CheckpointPayload(
+        architecture="wav2vec-xls-r",
+        model_id="facebook/wav2vec2-xls-r-300m",
+        weights=b"weights",
+        metrics={"macro_f1": 0.7},
+        validation_hash="a" * 64,
+        model_revision=WAV2VEC_REVISION,
+        base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
+        class_weighting="inverse-frequency",
+        class_weights=(1.0,) * 7,
+    )
+
+    publish_checkpoint(output, payload)
+
+    config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    assert config["schema_version"] == "3"
+    assert config["model_revision"] == WAV2VEC_REVISION
+    assert config["base_model_sha256"] == WAV2VEC_WEIGHTS_SHA256
 
 
 def test_checkpoint_failure_leaves_no_partial_output(tmp_path: Path) -> None:
@@ -438,6 +488,10 @@ def test_checkpoint_failure_leaves_no_partial_output(tmp_path: Path) -> None:
         weights=b"weights",
         metrics={"macro_f1": 0.7},
         validation_hash="a" * 64,
+        model_revision=WAV2VEC_REVISION,
+        base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
+        class_weighting="inverse-frequency",
+        class_weights=(1.0,) * 7,
     )
 
     def fail(_path: Path, _data: bytes) -> None:
@@ -461,6 +515,10 @@ def test_checkpoint_publication_rejects_symlinked_parent(tmp_path: Path) -> None
         weights=b"weights",
         metrics={"macro_f1": 0.7},
         validation_hash="a" * 64,
+        model_revision=WAV2VEC_REVISION,
+        base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
+        class_weighting="inverse-frequency",
+        class_weights=(1.0,) * 7,
     )
 
     with pytest.raises(ValueError, match="checkpoint_publication_failed"):
@@ -535,6 +593,8 @@ def test_manifest_training_boundary_passes_audio_only_and_exact_profile(tmp_path
             weights=b"weights",
             metrics={"macro_f1": 1.0},
             validation_hash="a" * 64,
+            model_revision=WAV2VEC_REVISION,
+            base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
             class_weighting="inverse-frequency",
             class_weights=(1.0,) * 7,
         )

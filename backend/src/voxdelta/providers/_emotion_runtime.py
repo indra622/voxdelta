@@ -22,6 +22,10 @@ from voxdelta.evaluation.emotion_training import (
     load_audio,
 )
 from voxdelta.evaluation.manifest import read_trusted_regular_file
+from voxdelta.evaluation.wav2vec_base import (
+    WAV2VEC_MODEL_REVISION,
+    WAV2VEC_WEIGHTS_SHA256,
+)
 from voxdelta.providers.base import ProviderError, ProviderErrorCode
 from voxdelta.providers.checkpoints import checkpoint_tree_digest
 
@@ -44,6 +48,8 @@ class CheckpointInfo:
     encoder_revision: str | None
     encoder_hash: str | None
     freeze_encoder: bool | None
+    model_revision: str | None
+    base_model_sha256: str | None
     digest: str
 
 
@@ -149,10 +155,22 @@ def validate_checkpoint(
             expected_config_keys.update(
                 {"embedding_size", "encoder_hash", "encoder_revision", "freeze_encoder"}
             )
+        else:
+            expected_config_keys.update({"model_revision", "base_model_sha256"})
         if not isinstance(config, dict):
             raise ValueError
         schema_version = config.get("schema_version")
-        if schema_version == "1":
+        if architecture == "wav2vec-xls-r":
+            if (
+                schema_version != "3"
+                or set(config) != expected_config_keys | {"class_weighting", "class_weights"}
+                or config.get("model_revision") != WAV2VEC_MODEL_REVISION
+                or config.get("base_model_sha256") != WAV2VEC_WEIGHTS_SHA256
+                or config.get("class_weighting") != "inverse-frequency"
+                or not _valid_class_weights(config.get("class_weights"))
+            ):
+                raise ValueError
+        elif schema_version == "1":
             if set(config) != expected_config_keys:
                 raise ValueError
         elif schema_version == "2":
@@ -196,6 +214,8 @@ def validate_checkpoint(
         encoder_revision: str | None = None
         encoder_hash: str | None = None
         freeze_encoder: bool | None = None
+        model_revision: str | None = None
+        base_model_sha256: str | None = None
         if architecture == "emotion2vec-plus":
             embedding_size = config.get("embedding_size")
             if (
@@ -210,8 +230,9 @@ def validate_checkpoint(
             encoder_revision = cast(str, config["encoder_revision"])
             encoder_hash = cast(str, config["encoder_hash"])
             freeze_encoder = True
-        elif "encoder_hash" in config or "freeze_encoder" in config:
-            raise ValueError
+        else:
+            model_revision = cast(str, config["model_revision"])
+            base_model_sha256 = cast(str, config["base_model_sha256"])
         return CheckpointInfo(
             resolved,
             architecture,
@@ -219,6 +240,8 @@ def validate_checkpoint(
             encoder_revision,
             encoder_hash,
             freeze_encoder,
+            model_revision,
+            base_model_sha256,
             checkpoint_tree_digest(resolved),
         )
     except Exception:

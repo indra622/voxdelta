@@ -14,6 +14,8 @@ import pytest
 from voxdelta.providers.base import EmotionProvider, ProviderError
 
 LABELS = ("happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise")
+WAV2VEC_REVISION = "1a640f32ac3e39899438a2931f9924c02f080a54"
+WAV2VEC_WEIGHTS_SHA256 = "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
 
 
 def _wav(path: Path, seconds: float) -> Path:
@@ -31,10 +33,14 @@ def _checkpoint(path: Path) -> Path:
     (path / "config.json").write_text(
         json.dumps(
             {
-                "schema_version": "1",
+                "schema_version": "3",
                 "architecture": "wav2vec-xls-r",
                 "model_id": "facebook/wav2vec2-xls-r-300m",
                 "labels": list(LABELS),
+                "model_revision": WAV2VEC_REVISION,
+                "base_model_sha256": WAV2VEC_WEIGHTS_SHA256,
+                "class_weighting": "inverse-frequency",
+                "class_weights": [1.0] * 7,
             }
         ),
         encoding="utf-8",
@@ -246,7 +252,7 @@ def test_checkpoint_traversal_and_extra_metadata_are_rejected(tmp_path: Path) ->
     assert "secret" not in str(raised.value).lower()
 
 
-def test_weighted_schema_v2_checkpoint_loads_without_changing_inference(
+def test_weighted_schema_three_checkpoint_loads_without_changing_inference(
     tmp_path: Path,
 ) -> None:
     from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
@@ -254,13 +260,7 @@ def test_weighted_schema_v2_checkpoint_loads_without_changing_inference(
     checkpoint = _checkpoint(tmp_path / "checkpoint")
     config_path = checkpoint / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    config.update(
-        {
-            "schema_version": "2",
-            "class_weighting": "inverse-frequency",
-            "class_weights": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
-        }
-    )
+    config["class_weights"] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
     config_path.write_text(json.dumps(config), encoding="utf-8")
 
     provider = Wav2VecEmotionProvider(
@@ -285,7 +285,7 @@ def test_weighted_schema_v2_checkpoint_loads_without_changing_inference(
         ("provider_payload", "transcript-secret"),
     ],
 )
-def test_weighted_schema_v2_checkpoint_metadata_is_strict(
+def test_weighted_schema_three_checkpoint_metadata_is_strict(
     tmp_path: Path, field: str, value: object
 ) -> None:
     from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
@@ -295,7 +295,6 @@ def test_weighted_schema_v2_checkpoint_metadata_is_strict(
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config.update(
         {
-            "schema_version": "2",
             "class_weighting": "inverse-frequency",
             "class_weights": [1.0] * 7,
             field: value,
