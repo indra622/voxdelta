@@ -28,6 +28,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = _SafeArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--base-model-path", type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--architecture",
@@ -50,12 +51,15 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
+        if (arguments.architecture == "wav2vec-xls-r") != (arguments.base_model_path is not None):
+            raise ValueError("invalid arguments")
         report = evaluate_emotion_checkpoint(
             arguments.manifest,
             arguments.checkpoint,
             architecture=cast(Architecture, arguments.architecture),
             device=cast(Device, arguments.device),
             split=cast(EvaluationSplit, arguments.split),
+            base_model_path=arguments.base_model_path,
         )
         write_experiment_report(arguments.output, report)
     except Exception:

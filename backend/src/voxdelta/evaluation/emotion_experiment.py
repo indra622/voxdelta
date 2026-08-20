@@ -275,10 +275,17 @@ def _default_provider(
     checkpoint: Path,
     architecture: Literal["emotion2vec-plus", "wav2vec-xls-r"],
     device: Device,
+    base_model_path: Path | None,
 ) -> EmotionProvider:
     if architecture == "emotion2vec-plus":
         return Emotion2VecEmotionProvider(checkpoint, device=device)
-    return Wav2VecEmotionProvider(checkpoint, device=device)
+    if base_model_path is None:
+        raise ValueError("invalid_experiment_report")
+    return Wav2VecEmotionProvider(
+        checkpoint,
+        base_model_path=base_model_path,
+        device=device,
+    )
 
 
 def evaluate_emotion_checkpoint(
@@ -288,6 +295,7 @@ def evaluate_emotion_checkpoint(
     architecture: Literal["emotion2vec-plus", "wav2vec-xls-r"],
     device: Device = "auto",
     split: EvaluationSplit = "test",
+    base_model_path: Path | None = None,
     provider_factory: ProviderFactory | None = None,
 ) -> EmotionExperimentReport:
     """Evaluate a checkpoint on held-out items and retain aggregate metrics only."""
@@ -318,7 +326,7 @@ def evaluate_emotion_checkpoint(
         provider = (
             provider_factory(checkpoint, device)
             if provider_factory is not None
-            else _default_provider(checkpoint, architecture, device)
+            else _default_provider(checkpoint, architecture, device, base_model_path)
         )
     except Exception:
         raise ValueError("invalid_experiment_report") from None

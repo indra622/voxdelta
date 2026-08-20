@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Protocol, cast
 
 from voxdelta.domain.models import EmotionResult, ProviderProvenance
+from voxdelta.evaluation.wav2vec_base import (
+    WAV2VEC_MODEL_ID,
+    validate_wav2vec_base,
+)
 from voxdelta.providers._emotion_runtime import (
     LOCAL_EMOTION_INFERENCE_LOCK,
     Device,
@@ -25,23 +29,34 @@ from voxdelta.providers._emotion_runtime import (
 )
 from voxdelta.providers.base import ProviderError
 
-MODEL_ID = "facebook/wav2vec2-xls-r-300m"
+MODEL_ID = WAV2VEC_MODEL_ID
 
 
 class ModelFactory(Protocol):
-    def __call__(self, checkpoint: Path, *, model_id: str, device: str) -> Predictor: ...
+    def __call__(
+        self,
+        checkpoint: Path,
+        *,
+        base_model_path: Path | None,
+        device: str,
+    ) -> Predictor: ...
 
 
 class _TransformersPredictor:
-    def __init__(self, checkpoint: Path, model_id: str, device: str) -> None:
+    def __init__(self, checkpoint: Path, base_model_path: Path, device: str) -> None:
         torch = import_module("torch")
         transformers = import_module("transformers")
         safetensors = import_module("safetensors.torch")
         self._torch = torch
         self._device = device
-        self._extractor = transformers.AutoFeatureExtractor.from_pretrained(model_id)
+        source = str(base_model_path)
+        self._extractor = transformers.AutoFeatureExtractor.from_pretrained(
+            source,
+            local_files_only=True,
+        )
         self._model = transformers.AutoModelForAudioClassification.from_pretrained(
-            model_id,
+            source,
+            local_files_only=True,
             num_labels=7,
             id2label={
                 0: "happiness",
@@ -74,8 +89,15 @@ class _TransformersPredictor:
         return cast(list[float], output.logits[0].detach().float().cpu().tolist())
 
 
-def _default_factory(checkpoint: Path, *, model_id: str, device: str) -> Predictor:
-    return _TransformersPredictor(checkpoint, model_id, device)
+def _default_factory(
+    checkpoint: Path,
+    *,
+    base_model_path: Path | None,
+    device: str,
+) -> Predictor:
+    if base_model_path is None:
+        raise ProviderError("provider_unavailable")
+    return _TransformersPredictor(checkpoint, base_model_path, device)
 
 
 class Wav2VecEmotionProvider:
@@ -83,6 +105,7 @@ class Wav2VecEmotionProvider:
         self,
         checkpoint_path: str | Path,
         *,
+        base_model_path: str | Path | None = None,
         device: Device = "auto",
         model_factory: ModelFactory | None = None,
         hardware_probe: Callable[[], tuple[bool, bool]] | None = None,
@@ -95,6 +118,20 @@ class Wav2VecEmotionProvider:
         self._checkpoint = validate_checkpoint(
             checkpoint_path, architecture="wav2vec-xls-r", model_id=MODEL_ID
         )
+        self._base_model_path: Path | None = None
+        if base_model_path is not None:
+            try:
+                prepared = validate_wav2vec_base(base_model_path)
+                if (
+                    prepared.revision != self._checkpoint.model_revision
+                    or prepared.weights_sha256 != self._checkpoint.base_model_sha256
+                ):
+                    raise ValueError
+                self._base_model_path = prepared.path
+            except Exception:
+                raise ProviderError("invalid_local_checkpoint") from None
+        elif model_factory is None:
+            raise ProviderError("provider_unavailable")
         self.provenance = ProviderProvenance(
             name="wav2vec-xls-r",
             model="wav2vec2-xls-r-300m-seven-emotion",
@@ -115,7 +152,11 @@ class Wav2VecEmotionProvider:
         device = select_device(self._requested_device, self._hardware_probe)
         prepare_candidate_load(self)
         try:
-            self._predictor = self._factory(self._checkpoint.path, model_id=MODEL_ID, device=device)
+            self._predictor = self._factory(
+                self._checkpoint.path,
+                base_model_path=self._base_model_path,
+                device=device,
+            )
         except ProviderError:
             raise
         except Exception as error:

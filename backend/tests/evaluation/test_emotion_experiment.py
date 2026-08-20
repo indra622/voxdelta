@@ -327,6 +327,72 @@ def test_evaluation_cli_accepts_only_explicit_validation_or_test_split(
         )
 
 
+def test_default_xls_r_evaluation_forwards_explicit_base_model_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voxdelta.evaluation.emotion_experiment as module
+
+    manifest = _smoke_evaluation_manifest(tmp_path)
+    provider = FakeProvider()
+    base = tmp_path / "base"
+    observed: list[tuple[Path, Path, str]] = []
+
+    def wav2vec_provider(checkpoint: Path, *, base_model_path: Path, device: str) -> FakeProvider:
+        observed.append((checkpoint, base_model_path, device))
+        return provider
+
+    monkeypatch.setattr(module, "Wav2VecEmotionProvider", wav2vec_provider)
+
+    report = evaluate_emotion_checkpoint(
+        manifest,
+        tmp_path / "checkpoint",
+        architecture="wav2vec-xls-r",
+        base_model_path=base,
+        device="mps",
+        split="validation",
+    )
+
+    assert report.completed_count == 7
+    assert observed == [(tmp_path / "checkpoint", base, "mps")]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--architecture", "wav2vec-xls-r"],
+        ["--architecture", "emotion2vec-plus", "--base-model-path", "/base"],
+    ],
+)
+def test_evaluation_cli_rejects_missing_or_incompatible_base_path(
+    arguments: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.syspath_prepend(str(BACKEND))
+    import scripts.evaluate_emotion_checkpoint as cli
+
+    called = False
+
+    def reject_call(*_args: object, **_kwargs: object) -> EmotionExperimentReport:
+        nonlocal called
+        called = True
+        return _report_fixture()
+
+    monkeypatch.setattr(cli, "evaluate_emotion_checkpoint", reject_call)
+    result = cli.main(
+        [
+            "--manifest",
+            "/manifest.jsonl",
+            "--checkpoint",
+            "/checkpoint",
+            "--output",
+            "/report.json",
+            *arguments,
+        ]
+    )
+
+    assert result == 2
+    assert called is False
+
+
 def test_report_writer_is_atomic_private_and_refuses_existing_output(tmp_path: Path) -> None:
     output = tmp_path / "report.json"
     write_experiment_report(output, _report_fixture())

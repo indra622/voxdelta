@@ -71,10 +71,16 @@ class FakePredictor:
 class FakeFactory:
     def __init__(self, predictor: FakePredictor) -> None:
         self.predictor = predictor
-        self.calls: list[tuple[Path, str, str]] = []
+        self.calls: list[tuple[Path, Path | None, str]] = []
 
-    def __call__(self, checkpoint: Path, *, model_id: str, device: str) -> FakePredictor:
-        self.calls.append((checkpoint, model_id, device))
+    def __call__(
+        self,
+        checkpoint: Path,
+        *,
+        base_model_path: Path | None,
+        device: str,
+    ) -> FakePredictor:
+        self.calls.append((checkpoint, base_model_path, device))
         return self.predictor
 
 
@@ -123,7 +129,7 @@ def test_logits_are_meaned_before_softmax_and_use_canonical_mapping(tmp_path: Pa
     )
     result = provider.analyze("utt-1", audio, "transcript-secret must stay unused")
 
-    assert factory.calls == [(checkpoint.resolve(), "facebook/wav2vec2-xls-r-300m", "mps")]
+    assert factory.calls == [(checkpoint.resolve(), None, "mps")]
     assert predictor.calls == [(320_000, 16_000), (8_000, 16_000)]
     assert entered == [True]
     assert tuple(result.probabilities) == LABELS
@@ -427,11 +433,21 @@ def test_previous_candidate_is_evicted_before_factory_and_failed_load_leaves_non
             self.name = name
             self.fail = fail
 
-        def __call__(self, checkpoint: Path, *, model_id: str, device: str) -> FakePredictor:
+        def __call__(
+            self,
+            checkpoint: Path,
+            *,
+            base_model_path: Path | None,
+            device: str,
+        ) -> FakePredictor:
             events.append(f"construct:{self.name}")
             if self.fail:
                 raise RuntimeError("private transcript secret")
-            return super().__call__(checkpoint, model_id=model_id, device=device)
+            return super().__call__(
+                checkpoint,
+                base_model_path=base_model_path,
+                device=device,
+            )
 
     checkpoint = _checkpoint(tmp_path / "checkpoint")
     first = Wav2VecEmotionProvider(
@@ -542,3 +558,104 @@ def test_missing_rss_measurement_remains_none_in_provider_usage(tmp_path: Path) 
 
     assert result.usage is not None
     assert result.usage.peak_rss_mb is None
+
+
+def test_provider_validates_matching_base_and_passes_it_to_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voxdelta.providers.wav2vec_emotion as module
+    from voxdelta.evaluation.wav2vec_base import PreparedWav2VecBase
+
+    base = tmp_path / "base"
+    checkpoint = _checkpoint(tmp_path / "checkpoint")
+    audio = _wav(tmp_path / "audio.wav", 0.5)
+    factory = FakeFactory(FakePredictor([[1.0] + [0.0] * 6]))
+    monkeypatch.setattr(
+        module,
+        "validate_wav2vec_base",
+        lambda path: PreparedWav2VecBase(Path(path)),
+    )
+
+    provider = module.Wav2VecEmotionProvider(
+        checkpoint,
+        base_model_path=base,
+        model_factory=factory,
+        hardware_probe=lambda: (False, True),
+    )
+    provider.analyze("safe-id", audio, "")
+
+    assert factory.calls == [(checkpoint.resolve(), base, "mps")]
+
+
+def test_provider_rejects_base_hash_that_differs_from_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voxdelta.providers.wav2vec_emotion as module
+    from voxdelta.evaluation.wav2vec_base import PreparedWav2VecBase
+
+    monkeypatch.setattr(
+        module,
+        "validate_wav2vec_base",
+        lambda path: PreparedWav2VecBase(Path(path), weights_sha256="b" * 64),
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        module.Wav2VecEmotionProvider(
+            _checkpoint(tmp_path / "checkpoint"),
+            base_model_path=tmp_path / "base",
+            model_factory=FakeFactory(FakePredictor([[0.0] * 7])),
+        )
+
+    assert raised.value.code == "invalid_local_checkpoint"
+
+
+def test_transformers_predictor_loads_verified_base_local_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voxdelta.providers.wav2vec_emotion as module
+
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class Loader:
+        def __init__(self, kind: str, result: object) -> None:
+            self.kind = kind
+            self.result = result
+
+        def from_pretrained(self, source: str, **kwargs: object) -> object:
+            calls.append((self.kind, source, kwargs))
+            return self.result
+
+    class Model:
+        def load_state_dict(self, state: object) -> None:
+            assert state == {}
+
+        def to(self, device: str) -> None:
+            assert device == "cpu"
+
+        def eval(self) -> None:
+            pass
+
+    class Transformers:
+        AutoFeatureExtractor = Loader("extractor", object())
+        AutoModelForAudioClassification = Loader("model", Model())
+
+    class Safetensors:
+        @staticmethod
+        def load_file(path: str) -> dict[str, object]:
+            assert path.endswith("model.safetensors")
+            return {}
+
+    modules = {
+        "torch": object(),
+        "transformers": Transformers(),
+        "safetensors.torch": Safetensors(),
+    }
+    monkeypatch.setattr(module, "import_module", lambda name: modules[name])
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+
+    module._TransformersPredictor(checkpoint, tmp_path / "base", "cpu")
+
+    assert calls[0] == ("extractor", str(tmp_path / "base"), {"local_files_only": True})
+    assert calls[1][0:2] == ("model", str(tmp_path / "base"))
+    assert calls[1][2]["local_files_only"] is True
