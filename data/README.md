@@ -122,5 +122,48 @@ audio paths, raw probabilities, or per-item predictions.
 
 This smoke run proves model download, real-audio preprocessing, training, checkpoint publication,
 production-provider loading, and held-out inference. Its small-sample quality is not final model
-evidence. The later full comparison trains both frozen-encoder emotion2vec+ and the XLS-R 300M
-baseline on the fixed full splits, then evaluates each once on the full test split.
+evidence. The earlier emotion2vec smoke evaluated the 35 smoke-test members, so those items are
+already exposed members of the nominal 3,620-item test split. A future final-quality comparison must
+exclude those 35 or freeze a new untouched holdout from the remaining 3,585 items.
+
+## Prepare and run the controlled XLS-R smoke
+
+The XLS-R path never resolves a floating Hugging Face model ID during training or inference. From
+the implementation worktree's `backend/`, point every ignored artifact at the canonical NVMe data
+tree explicitly:
+
+```bash
+VOXDELTA_DATA=/Volumes/nvme1/codes/voxdelta/data
+
+uv run python scripts/prepare_wav2vec_base.py \
+  --output "$VOXDELTA_DATA/models/base/wav2vec2-xls-r-300m-1a640f3"
+
+uv run python scripts/train_emotion.py \
+  --manifest "$VOXDELTA_DATA/manifests/emotion-smoke.jsonl" \
+  --output "$VOXDELTA_DATA/models/wav2vec-xls-r-300m-smoke" \
+  --architecture wav2vec-xls-r \
+  --base-model facebook/wav2vec2-xls-r-300m \
+  --base-model-path "$VOXDELTA_DATA/models/base/wav2vec2-xls-r-300m-1a640f3" \
+  --micro-batch-size 4 \
+  --seed 622
+
+uv run python scripts/evaluate_emotion_checkpoint.py \
+  --manifest "$VOXDELTA_DATA/manifests/emotion-smoke.jsonl" \
+  --checkpoint "$VOXDELTA_DATA/models/wav2vec-xls-r-300m-smoke" \
+  --base-model-path "$VOXDELTA_DATA/models/base/wav2vec2-xls-r-300m-1a640f3" \
+  --output "$VOXDELTA_DATA/benchmarks/wav2vec-xls-r-300m-smoke-validation.json" \
+  --architecture wav2vec-xls-r \
+  --device mps \
+  --split validation
+```
+
+The base preparation accepts only revision
+`1a640f32ac3e39899438a2931f9924c02f080a54` and verifies the exact configuration,
+preprocessor, and 1,269,737,156-byte weight file before atomically publishing private local files.
+The initial micro-batch is 4 with gradient accumulation 4. Retry with micro-batch 2, then 1, only
+after an observed MPS out-of-memory failure and confirmation that no final checkpoint directory was
+published. Do not disable PyTorch's MPS high-watermark safety control.
+
+This controlled smoke trains on 140 items and selects on 35 validation items. Evaluation also uses
+those 35 validation items as readiness evidence; it does not evaluate any test-split item and is not
+an unbiased final quality estimate.
