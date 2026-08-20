@@ -30,6 +30,8 @@ from voxdelta.evaluation.manifest import (
 from voxdelta.evaluation.wav2vec_base import (
     WAV2VEC_MODEL_REVISION,
     WAV2VEC_WEIGHTS_SHA256,
+    PreparedWav2VecBase,
+    validate_wav2vec_base,
 )
 
 SAMPLE_RATE = 16_000
@@ -53,11 +55,16 @@ class Wav2VecTrainingProfile(BaseModel):
 
     architecture: Literal["wav2vec-xls-r"] = "wav2vec-xls-r"
     model_id: Literal["facebook/wav2vec2-xls-r-300m"] = "facebook/wav2vec2-xls-r-300m"
+    base_model_path: Path
+    model_revision: Literal["1a640f32ac3e39899438a2931f9924c02f080a54"] = WAV2VEC_MODEL_REVISION
+    base_model_sha256: Literal[
+        "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
+    ] = WAV2VEC_WEIGHTS_SHA256
     seed: Literal[622] = 622
     learning_rate: float = 2e-5
-    train_batch_size: Literal[8] = 8
-    eval_batch_size: Literal[8] = 8
-    gradient_accumulation_steps: Literal[2] = 2
+    train_batch_size: Literal[1, 2, 4, 8] = 8
+    eval_batch_size: Literal[1, 2, 4, 8] = 8
+    gradient_accumulation_steps: Literal[2, 4, 8, 16] = 2
     epochs: Literal[10] = 10
     warmup_ratio: float = 0.1
     evaluation_strategy: Literal["epoch"] = "epoch"
@@ -67,7 +74,14 @@ class Wav2VecTrainingProfile(BaseModel):
 
     @model_validator(mode="after")
     def exact_profile(self) -> Wav2VecTrainingProfile:
-        if self.learning_rate != 2e-5 or self.warmup_ratio != 0.1:
+        accumulation_by_batch = {8: 2, 4: 4, 2: 8, 1: 16}
+        if (
+            not self.base_model_path.is_absolute()
+            or self.eval_batch_size != self.train_batch_size
+            or self.gradient_accumulation_steps != accumulation_by_batch[self.train_batch_size]
+            or self.learning_rate != 2e-5
+            or self.warmup_ratio != 0.1
+        ):
             raise ValueError("wav2vec training profile is fixed")
         return self
 
@@ -806,16 +820,9 @@ def _train_wav2vec(
     train_items, validation_items = _training_splits(examples)
     class_weights = inverse_frequency_class_weights(train_items)
     device = _training_device(torch)
-    extractor = transformers.AutoFeatureExtractor.from_pretrained(profile.model_id)
     initial_torch_state = torch.random.get_rng_state()
     torch.manual_seed(profile.seed)
-    model = transformers.AutoModelForAudioClassification.from_pretrained(
-        profile.model_id,
-        num_labels=len(CANONICAL_LABELS),
-        id2label={index: label for index, label in enumerate(CANONICAL_LABELS)},
-        label2id={label: index for index, label in enumerate(CANONICAL_LABELS)},
-        ignore_mismatched_sizes=True,
-    )
+    extractor, model, prepared_base = load_wav2vec_components(transformers, profile.base_model_path)
     torch.random.set_rng_state(initial_torch_state)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=profile.learning_rate)
@@ -921,9 +928,34 @@ def _train_wav2vec(
         weights=weights,
         metrics={"macro_f1": best_score},
         validation_hash=validation_set_hash(validation_items),
+        model_revision=prepared_base.revision,
+        base_model_sha256=prepared_base.weights_sha256,
         class_weighting=profile.class_weighting,
         class_weights=class_weights,
     )
+
+
+def load_wav2vec_components(
+    transformers: Any,
+    base_model_path: str | Path,
+) -> tuple[Any, Any, PreparedWav2VecBase]:
+    """Load the pinned extractor and model from verified local files only."""
+
+    prepared = validate_wav2vec_base(base_model_path)
+    source = str(prepared.path)
+    extractor = transformers.AutoFeatureExtractor.from_pretrained(
+        source,
+        local_files_only=True,
+    )
+    model = transformers.AutoModelForAudioClassification.from_pretrained(
+        source,
+        local_files_only=True,
+        num_labels=len(CANONICAL_LABELS),
+        id2label={index: label for index, label in enumerate(CANONICAL_LABELS)},
+        label2id={label: index for index, label in enumerate(CANONICAL_LABELS)},
+        ignore_mismatched_sizes=True,
+    )
+    return extractor, model, prepared
 
 
 def _train_emotion2vec(

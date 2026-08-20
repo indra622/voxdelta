@@ -39,13 +39,13 @@ def _wav(path: Path, seconds: float, *, channels: int = 1, rate: int = 16_000) -
     return path
 
 
-def test_profiles_are_strict_and_exact() -> None:
+def test_profiles_are_strict_and_exact(tmp_path: Path) -> None:
     from voxdelta.evaluation.emotion_training import (
         Emotion2VecTrainingProfile,
         Wav2VecTrainingProfile,
     )
 
-    wav = Wav2VecTrainingProfile()
+    wav = Wav2VecTrainingProfile(base_model_path=tmp_path.resolve())
     assert wav.model_id == "facebook/wav2vec2-xls-r-300m"
     assert wav.seed == 622
     assert (wav.learning_rate, wav.train_batch_size, wav.eval_batch_size) == (2e-5, 8, 8)
@@ -56,6 +56,7 @@ def test_profiles_are_strict_and_exact() -> None:
         2,
     )
     assert wav.class_weighting == "inverse-frequency"
+    assert wav.base_model_path == tmp_path.resolve()
     modern = Emotion2VecTrainingProfile()
     assert modern.encoder_id == "iic/emotion2vec_plus_large"
     assert modern.encoder_revision == "v2.0.5"
@@ -78,6 +79,79 @@ def test_profiles_are_strict_and_exact() -> None:
     ]:
         with pytest.raises(ValidationError):
             model.model_validate({field: value})
+
+
+@pytest.mark.parametrize("micro_batch,accumulation", [(8, 2), (4, 4), (2, 8), (1, 16)])
+def test_wav2vec_profiles_preserve_effective_batch_sixteen(
+    tmp_path: Path, micro_batch: int, accumulation: int
+) -> None:
+    from voxdelta.evaluation.emotion_training import Wav2VecTrainingProfile
+
+    profile = Wav2VecTrainingProfile(
+        base_model_path=tmp_path.resolve(),
+        train_batch_size=micro_batch,
+        eval_batch_size=micro_batch,
+        gradient_accumulation_steps=accumulation,
+    )
+
+    assert profile.train_batch_size * profile.gradient_accumulation_steps == 16
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"base_model_path": Path("relative")},
+        {"train_batch_size": 4, "eval_batch_size": 8, "gradient_accumulation_steps": 4},
+        {"train_batch_size": 4, "eval_batch_size": 4, "gradient_accumulation_steps": 2},
+        {"train_batch_size": 3, "eval_batch_size": 3, "gradient_accumulation_steps": 5},
+    ],
+)
+def test_wav2vec_profiles_reject_unapproved_path_or_batch_combinations(
+    tmp_path: Path, metadata: dict[str, object]
+) -> None:
+    from voxdelta.evaluation.emotion_training import Wav2VecTrainingProfile
+
+    values: dict[str, object] = {"base_model_path": tmp_path.resolve(), **metadata}
+    with pytest.raises(ValidationError):
+        Wav2VecTrainingProfile.model_validate(values)
+
+
+def test_wav2vec_component_load_is_verified_local_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voxdelta.evaluation.emotion_training as training
+    from voxdelta.evaluation.emotion_training import load_wav2vec_components
+    from voxdelta.evaluation.wav2vec_base import PreparedWav2VecBase
+
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class Loader:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        def from_pretrained(self, source: str, **kwargs: object) -> object:
+            calls.append((self.kind, source, kwargs))
+            return object()
+
+    class Transformers:
+        AutoFeatureExtractor = Loader("extractor")
+        AutoModelForAudioClassification = Loader("model")
+
+    base = tmp_path.resolve()
+    monkeypatch.setattr(
+        training,
+        "validate_wav2vec_base",
+        lambda path: PreparedWav2VecBase(Path(path)),
+    )
+
+    extractor, model, prepared = load_wav2vec_components(Transformers(), base)
+
+    assert extractor is not None and model is not None
+    assert prepared.path == base
+    assert calls[0] == ("extractor", str(base), {"local_files_only": True})
+    assert calls[1][0:2] == ("model", str(base))
+    assert calls[1][2]["local_files_only"] is True
+    assert calls[1][2]["ignore_mismatched_sizes"] is True
 
 
 def test_inverse_frequency_weights_are_train_only_canonical_and_normalized() -> None:
@@ -603,7 +677,7 @@ def test_manifest_training_boundary_passes_audio_only_and_exact_profile(tmp_path
     train_from_manifest(
         manifest,
         output,
-        profile=Wav2VecTrainingProfile(),
+        profile=Wav2VecTrainingProfile(base_model_path=tmp_path.resolve()),
         backend=backend,
     )
 
@@ -669,7 +743,7 @@ def test_manifest_training_rejects_unweighted_backend_payload(tmp_path: Path) ->
         train_from_manifest(
             manifest,
             output,
-            profile=Wav2VecTrainingProfile(),
+            profile=Wav2VecTrainingProfile(base_model_path=tmp_path.resolve()),
             backend=unweighted_backend,
         )
 
@@ -724,6 +798,10 @@ def test_training_cli_errors_are_sanitized_and_imports_are_lazy(tmp_path: Path) 
             str(tmp_path / "out"),
             "--base-model",
             "facebook/wav2vec2-xls-r-300m",
+            "--base-model-path",
+            str(tmp_path.resolve()),
+            "--micro-batch-size",
+            "4",
             "--seed",
             "622",
         ],
@@ -739,6 +817,43 @@ def test_training_cli_errors_are_sanitized_and_imports_are_lazy(tmp_path: Path) 
     assert result.stderr.strip() == "training_error: invalid_training_manifest"
     assert "private" not in result.stderr.lower()
     assert os.environ == environment
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--micro-batch-size", "4"],
+        ["--base-model-path", "/base"],
+        ["--base-model-path", "/base", "--micro-batch-size", "3"],
+    ],
+)
+def test_training_cli_requires_both_approved_xls_r_local_flags(
+    tmp_path: Path, arguments: list[str]
+) -> None:
+    command = [
+        sys.executable,
+        "scripts/train_emotion.py",
+        "--manifest",
+        str(tmp_path / "manifest.jsonl"),
+        "--output",
+        str(tmp_path / "output"),
+        "--architecture",
+        "wav2vec-xls-r",
+        "--base-model",
+        "facebook/wav2vec2-xls-r-300m",
+        *arguments,
+    ]
+    result = subprocess.run(
+        command,
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.strip() == "training_error: invalid_training_profile"
 
 
 def test_evaluation_example_batches_use_exact_profile_batch_size() -> None:

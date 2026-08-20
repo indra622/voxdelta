@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
-from typing import Never
+from pathlib import Path
+from typing import Literal, Never, cast
 
 from voxdelta.evaluation.emotion_training import (
     Emotion2VecTrainingProfile,
@@ -33,6 +34,8 @@ def _parser() -> argparse.ArgumentParser:
         default="wav2vec-xls-r",
     )
     parser.add_argument("--base-model", required=True)
+    parser.add_argument("--base-model-path", type=Path)
+    parser.add_argument("--micro-batch-size", type=int, choices=(1, 2, 4, 8))
     parser.add_argument("--freeze-encoder", action="store_true")
     parser.add_argument("--seed", type=int, default=622)
     return parser
@@ -45,14 +48,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.architecture == "wav2vec-xls-r":
             if (
                 arguments.base_model != "facebook/wav2vec2-xls-r-300m"
+                or arguments.base_model_path is None
+                or arguments.micro_batch_size is None
                 or arguments.freeze_encoder
                 or arguments.seed != 622
             ):
                 raise TrainingError("invalid_training_profile")
-            profile = Wav2VecTrainingProfile(seed=arguments.seed)
+            accumulation_by_batch = {8: 2, 4: 4, 2: 8, 1: 16}
+            profile = Wav2VecTrainingProfile(
+                seed=arguments.seed,
+                base_model_path=arguments.base_model_path,
+                train_batch_size=arguments.micro_batch_size,
+                eval_batch_size=arguments.micro_batch_size,
+                gradient_accumulation_steps=cast(
+                    Literal[2, 4, 8, 16],
+                    accumulation_by_batch[arguments.micro_batch_size],
+                ),
+            )
         else:
             if (
                 arguments.base_model != "iic/emotion2vec_plus_large"
+                or arguments.base_model_path is not None
+                or arguments.micro_batch_size is not None
                 or not arguments.freeze_encoder
                 or arguments.seed != 622
             ):

@@ -11,10 +11,15 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 WAV2VEC_MODEL_ID = "facebook/wav2vec2-xls-r-300m"
-WAV2VEC_MODEL_REVISION = "1a640f32ac3e39899438a2931f9924c02f080a54"
-WAV2VEC_WEIGHTS_SHA256 = "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
+WAV2VEC_MODEL_REVISION: Literal["1a640f32ac3e39899438a2931f9924c02f080a54"] = (
+    "1a640f32ac3e39899438a2931f9924c02f080a54"
+)
+WAV2VEC_WEIGHTS_SHA256: Literal[
+    "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
+] = "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
 
 
 @dataclass(frozen=True, slots=True)
