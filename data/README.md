@@ -290,3 +290,21 @@ print("partial-last4 stage B passed")
 
 The expected output is `partial-last4 stage B passed`. Any command or assertion failure is a failed
 experiment. Stop without trying another profile and keep the test split sealed.
+
+### Observed Stage A evidence (2026-08-21)
+
+Stage A training completed with 50,649,095 trainable parameters out of 315,702,919 total
+parameters and published a schema-four `partial-last4` checkpoint after 218 seconds of observed
+wall-clock time. Production-provider validation completed 35 of 35 validation items in
+6.96501599997282 seconds with peak RSS 2,848.03125 MiB. Macro-F1 was
+`0.03571428571428571`; per-label F1 was anger `0.0`, disgust `0.0`, fear `0.0`, happiness `0.0`,
+neutral `0.0`, sadness `0.0`, and surprise `0.25`. The confusion matrix was
+`[[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5],[0,0,0,0,0,0,5]]`, with one predicted class.
+
+The exact Stage A gate failed: macro-F1 was not strictly greater than `0.0357143`, and the
+predicted-class count was below two. The checkpoint digest is
+`071d68100a50fe2e337c6a65086e4aa1719ae560d7c0cfae459257ef71be7e8a`; the validation-report
+SHA-256 is `3a5966aca59c2c50de603619c11dd1bd58d663c4ede0e12da3d58a68a265ea37`.
+The three immutable input fingerprints remained unchanged. Stage B was not run, no development
+artifact was created, and the test split remained sealed. This failure supports a separately
+designed LoRA or no-training baseline rather than another automatic profile change.
