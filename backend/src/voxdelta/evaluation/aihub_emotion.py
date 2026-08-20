@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import os
 import re
@@ -54,6 +53,8 @@ _EMOTION_MAP: dict[str, EmotionLabel] = {
 }
 _RELEASE_NAMES = ("4차년도", "5차년도", "5차년도_2차")
 _SAFE_ITEM_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_MAX_AUDIO_BYTES = 100 * 1024 * 1024
+_MAX_TOTAL_AUDIO_BYTES = 100 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class EmotionImportPlan:
     orphan_audio_ids: tuple[str, ...]
     csv_rows: int
     zip_entries: int
+    audio_bytes: int
 
 
 @dataclass(frozen=True)
@@ -126,10 +128,21 @@ def _load_rows(path: Path) -> list[dict[str, str]]:
         text = raw.decode("cp949")
     except UnicodeDecodeError as error:
         raise ValueError("invalid CP949 emotion metadata") from error
-    reader = csv.DictReader(StringIO(text, newline=""))
-    if tuple(reader.fieldnames or ()) != OFFICIAL_HEADERS:
-        raise ValueError("invalid AI Hub 263 metadata headers")
-    rows = list(reader)
+    try:
+        reader = csv.DictReader(StringIO(text, newline=""))
+        if tuple(reader.fieldnames or ()) != OFFICIAL_HEADERS:
+            raise ValueError("invalid AI Hub 263 metadata headers")
+        raw_rows = list(reader)
+    except csv.Error as error:
+        raise ValueError("malformed AI Hub 263 metadata row") from error
+    rows: list[dict[str, str]] = []
+    expected = set(OFFICIAL_HEADERS)
+    for raw_row in raw_rows:
+        if set(raw_row) != expected or any(
+            not isinstance(raw_row.get(header), str) for header in OFFICIAL_HEADERS
+        ):
+            raise ValueError("malformed AI Hub 263 metadata row")
+        rows.append({header: cast(str, raw_row[header]) for header in OFFICIAL_HEADERS})
     seen: set[str] = set()
     for row in rows:
         item_id = row["wav_id"].strip()
@@ -182,8 +195,9 @@ def _trusted_regular_file(path: Path) -> Iterator[BinaryIO]:
             os.close(descriptor)
 
 
-def _archive_members(path: Path) -> dict[str, str]:
+def _archive_members(path: Path) -> tuple[dict[str, str], int]:
     audio_members: dict[str, str] = {}
+    audio_bytes = 0
     with _trusted_regular_file(path) as stream, ZipFile(stream) as archive:
         for info in archive.infolist():
             if info.is_dir():
@@ -196,8 +210,15 @@ def _archive_members(path: Path) -> dict[str, str]:
                 raise ValueError("empty archive audio ID")
             if item_id in audio_members:
                 raise ValueError("duplicate archive audio ID")
+            if info.file_size <= 0:
+                raise ValueError("empty audio member")
+            if info.file_size > _MAX_AUDIO_BYTES:
+                raise ValueError("audio member exceeds size limit")
+            if info.flag_bits & 0x1:
+                raise ValueError("encrypted archive member")
             audio_members[item_id] = info.filename
-    return audio_members
+            audio_bytes += info.file_size
+    return audio_members, audio_bytes
 
 
 def _input_directory(path: Path) -> Path:
@@ -238,9 +259,8 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def _write_audio_member(archive: ZipFile, member: str, path: Path) -> str:
+def _write_audio_member(archive: ZipFile, member: str, path: Path) -> None:
     temporary_path: Path | None = None
-    digest = hashlib.sha256()
     try:
         with (
             archive.open(member, "r") as source,
@@ -251,13 +271,11 @@ def _write_audio_member(archive: ZipFile, member: str, path: Path) -> str:
             temporary_path = Path(target.name)
             os.fchmod(target.fileno(), 0o600)
             while chunk := source.read(1024 * 1024):
-                digest.update(chunk)
                 target.write(chunk)
             target.flush()
             os.fsync(target.fileno())
         os.replace(temporary_path, path)
         temporary_path = None
-        return digest.hexdigest()
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -275,7 +293,7 @@ def plan_emotion_import(
     if max_missing_audio < 0 or max_orphan_audio < 0:
         raise ValueError("mismatch allowances must be non-negative")
     rows = _load_rows(csv_path)
-    audio_members = _archive_members(zip_path)
+    audio_members, audio_bytes = _archive_members(zip_path)
 
     row_ids = {row["wav_id"].strip() for row in rows}
     missing = tuple(sorted(row_ids - audio_members.keys()))
@@ -314,6 +332,7 @@ def plan_emotion_import(
         orphan_audio_ids=orphan,
         csv_rows=len(rows),
         zip_entries=len(audio_members),
+        audio_bytes=audio_bytes,
     )
 
 
@@ -348,6 +367,8 @@ def import_emotion_dataset(
     total_orphan = sum(len(plan.orphan_audio_ids) for plan in plans)
     if total_missing > max_missing_audio or total_orphan > max_orphan_audio:
         raise ValueError("AI Hub 263 audio/metadata mismatch exceeds allowance")
+    if sum(plan.audio_bytes for plan in plans) > _MAX_TOTAL_AUDIO_BYTES:
+        raise ValueError("dataset audio exceeds size limit")
 
     accepted_ids = [row.item_id for plan in plans for row in plan.accepted]
     if len(accepted_ids) != len(set(accepted_ids)):
@@ -386,7 +407,7 @@ def import_emotion_dataset(
                             ).encode(),
                         )
                         label_counts[row.emotion] += 1
-            except BadZipFile:
+            except (BadZipFile, RuntimeError):
                 raise ValueError("archive read failed") from None
             release_reports.append(
                 EmotionReleaseReport(

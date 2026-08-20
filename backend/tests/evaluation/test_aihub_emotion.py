@@ -3,12 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import os
+import struct
 import subprocess
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 import pytest
 
+import voxdelta.evaluation.aihub_emotion as aihub_emotion
 from voxdelta.evaluation.aihub_emotion import import_emotion_dataset, plan_emotion_import
 from voxdelta.evaluation.manifest import load_manifest
 
@@ -213,6 +215,36 @@ def test_plan_rejects_wrong_official_headers(tmp_path: Path) -> None:
         plan_emotion_import(csv_path, zip_path, max_missing_audio=0, max_orphan_audio=0)
 
 
+def test_plan_rejects_malformed_row_without_echoing_values(tmp_path: Path) -> None:
+    csv_path, zip_path = _write_official_fixture(
+        tmp_path,
+        rows=[_row("item-a", ["neutral"] * 5)],
+    )
+    header = ",".join(HEADERS)
+    csv_path.write_text(
+        f"{header}\nitem-a,PRIVATE_TRANSCRIPT_SENTINEL\n",
+        encoding="cp949",
+    )
+
+    with pytest.raises(ValueError, match="malformed AI Hub 263 metadata row") as raised:
+        plan_emotion_import(csv_path, zip_path, max_missing_audio=0, max_orphan_audio=0)
+
+    assert "PRIVATE_TRANSCRIPT_SENTINEL" not in str(raised.value)
+
+
+def test_plan_rejects_audio_member_above_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    csv_path, zip_path = _write_official_fixture(
+        tmp_path,
+        rows=[_row("item-a", ["neutral"] * 5)],
+    )
+    monkeypatch.setattr(aihub_emotion, "_MAX_AUDIO_BYTES", 4)
+
+    with pytest.raises(ValueError, match="audio member exceeds size limit"):
+        plan_emotion_import(csv_path, zip_path, max_missing_audio=0, max_orphan_audio=0)
+
+
 def test_plan_reports_explicitly_allowed_unmatched_ids(tmp_path: Path) -> None:
     csv_path, zip_path = _write_official_fixture(
         tmp_path,
@@ -351,6 +383,21 @@ def test_import_rejects_incomplete_release_set(tmp_path: Path) -> None:
         )
 
 
+def test_import_rejects_total_audio_above_size_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = _write_three_release_fixture(tmp_path / "source")
+    monkeypatch.setattr(aihub_emotion, "_MAX_TOTAL_AUDIO_BYTES", 20)
+
+    with pytest.raises(ValueError, match="dataset audio exceeds size limit"):
+        import_emotion_dataset(
+            source,
+            tmp_path / "normalized",
+            max_missing_audio=0,
+            max_orphan_audio=0,
+        )
+
+
 def test_import_failure_leaves_no_published_or_staging_output(tmp_path: Path) -> None:
     source = _write_three_release_fixture(tmp_path / "source")
     corrupt = source / "5차년도.zip"
@@ -421,4 +468,22 @@ def test_cli_sanitizes_import_failures(tmp_path: Path) -> None:
     assert result.stderr == "emotion import failed\n"
     assert "PRIVATE_SOURCE_SENTINEL" not in result.stderr
     assert "PRIVATE_OUTPUT_SENTINEL" not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_cli_sanitizes_unsupported_zip_compression(tmp_path: Path) -> None:
+    source = _write_three_release_fixture(tmp_path / "source")
+    archive_path = source / "4차년도.zip"
+    payload = bytearray(archive_path.read_bytes())
+    local_header = payload.index(b"PK\x03\x04")
+    central_header = payload.index(b"PK\x01\x02")
+    struct.pack_into("<H", payload, local_header + 8, 99)
+    struct.pack_into("<H", payload, central_header + 10, 99)
+    archive_path.write_bytes(payload)
+
+    result = _run_preparer(source, tmp_path / "normalized")
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr == "emotion import failed\n"
     assert "Traceback" not in result.stderr
