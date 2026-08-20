@@ -59,6 +59,7 @@ class Wav2VecTrainingProfile(BaseModel):
     evaluation_strategy: Literal["epoch"] = "epoch"
     selection_metric: Literal["macro_f1"] = "macro_f1"
     early_stopping_patience: Literal[2] = 2
+    class_weighting: Literal["inverse-frequency"] = "inverse-frequency"
 
     @model_validator(mode="after")
     def exact_profile(self) -> Wav2VecTrainingProfile:
@@ -83,6 +84,7 @@ class Emotion2VecTrainingProfile(BaseModel):
     selection_metric: Literal["macro_f1"] = "macro_f1"
     seed: Literal[622] = 622
     trainable_components: tuple[Literal["classifier_head"], ...] = ("classifier_head",)
+    class_weighting: Literal["inverse-frequency"] = "inverse-frequency"
 
     @field_validator("freeze_encoder", mode="before")
     @classmethod
@@ -628,6 +630,22 @@ class TrainingError(RuntimeError):
     ) -> None:
         self.code = code
         super().__init__(code)
+
+
+def inverse_frequency_class_weights(
+    examples: Sequence[TrainingExample],
+) -> tuple[float, ...]:
+    training = tuple(item for item in examples if item.split == "train")
+    counts = {label: 0 for label in CANONICAL_LABELS}
+    try:
+        for item in training:
+            counts[item.label] += 1
+    except KeyError:
+        raise TrainingError("invalid_training_manifest") from None
+    if not training or any(count == 0 for count in counts.values()):
+        raise TrainingError("invalid_training_manifest")
+    total = len(training)
+    return tuple(total / (len(CANONICAL_LABELS) * counts[label]) for label in CANONICAL_LABELS)
 
 
 def load_training_examples(manifest_path: str | Path) -> tuple[TrainingExample, ...]:

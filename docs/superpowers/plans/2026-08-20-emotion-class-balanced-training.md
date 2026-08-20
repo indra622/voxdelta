@@ -30,7 +30,7 @@
 - Consumes: `TrainingExample`, `CANONICAL_LABELS`, and the fixed training profiles.
 - Produces: `inverse_frequency_class_weights(examples: Sequence[TrainingExample]) -> tuple[float, ...]` and `class_weighting: Literal["inverse-frequency"]` on both profiles.
 
-- [ ] **Step 1: Write failing profile and formula tests**
+- [x] **Step 1: Write failing profile and formula tests**
 
 Add assertions that both profiles expose the fixed strategy and that callers cannot substitute another value:
 
@@ -44,7 +44,7 @@ for profile in (Wav2VecTrainingProfile, Emotion2VecTrainingProfile):
 
 Add a helper test with one train item for six labels, two sadness train items, and 100 validation sadness items. Assert canonical-order weights are `(8/7, 8/7, 8/7, 8/7, 8/7, 4/7, 8/7)` and that the sample-weighted mean is one. Add missing-label and no-train cases that expect `TrainingError("invalid_training_manifest")`.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run:
 
@@ -55,7 +55,7 @@ uv run pytest tests/evaluation/test_emotion_training.py::test_profiles_are_stric
 
 Expected: failure because the profile field and helper do not exist.
 
-- [ ] **Step 3: Add the fixed profile field and pure helper**
+- [x] **Step 3: Add the fixed profile field and pure helper**
 
 Add to both profile models:
 
@@ -82,11 +82,11 @@ def inverse_frequency_class_weights(
     return tuple(total / (len(CANONICAL_LABELS) * counts[label]) for label in CANONICAL_LABELS)
 ```
 
-- [ ] **Step 4: Run the focused tests and verify GREEN**
+- [x] **Step 4: Run the focused tests and verify GREEN**
 
 Run the Step 2 command. Expected: pass.
 
-- [ ] **Step 5: Commit the weight contract**
+- [x] **Step 5: Commit the weight contract**
 
 ```bash
 git add backend/src/voxdelta/evaluation/emotion_training.py backend/tests/evaluation/test_emotion_training.py

@@ -53,6 +53,7 @@ def test_profiles_are_strict_and_exact() -> None:
         "macro_f1",
         2,
     )
+    assert wav.class_weighting == "inverse-frequency"
     modern = Emotion2VecTrainingProfile()
     assert modern.encoder_id == "iic/emotion2vec_plus_large"
     assert modern.encoder_revision == "v2.0.5"
@@ -60,6 +61,7 @@ def test_profiles_are_strict_and_exact() -> None:
     assert (modern.hidden_size, modern.dropout, modern.learning_rate) == (256, 0.1, 1e-3)
     assert (modern.batch_size, modern.epochs, modern.early_stopping_patience) == (64, 20, 3)
     assert modern.trainable_components == ("classifier_head",)
+    assert modern.class_weighting == "inverse-frequency"
 
     for model, field, value in [
         (Wav2VecTrainingProfile, "seed", "622"),
@@ -69,9 +71,60 @@ def test_profiles_are_strict_and_exact() -> None:
         (Emotion2VecTrainingProfile, "freeze_encoder", 1),
         (Emotion2VecTrainingProfile, "hidden_size", 128),
         (Emotion2VecTrainingProfile, "epochs", 19),
+        (Wav2VecTrainingProfile, "class_weighting", "none"),
+        (Emotion2VecTrainingProfile, "class_weighting", "none"),
     ]:
         with pytest.raises(ValidationError):
             model.model_validate({field: value})
+
+
+def test_inverse_frequency_weights_are_train_only_canonical_and_normalized() -> None:
+    from voxdelta.evaluation.emotion_training import (
+        TrainingError,
+        TrainingExample,
+        inverse_frequency_class_weights,
+    )
+
+    training = tuple(
+        TrainingExample(
+            id=f"train-{label}",
+            audio_path=Path(f"/{label}.wav"),
+            audio_sha256="a" * 64,
+            label=label,
+            split="train",
+        )
+        for label in LABELS
+    ) + (
+        TrainingExample(
+            id="train-sadness-extra",
+            audio_path=Path("/sadness-extra.wav"),
+            audio_sha256="b" * 64,
+            label="sadness",
+            split="train",
+        ),
+    )
+    validation = tuple(
+        TrainingExample(
+            id=f"validation-sadness-{index}",
+            audio_path=Path(f"/validation-{index}.wav"),
+            audio_sha256=f"{index:064x}",
+            label="sadness",
+            split="validation",
+        )
+        for index in range(100)
+    )
+
+    weights = inverse_frequency_class_weights(training + validation)
+
+    assert weights == pytest.approx((8 / 7, 8 / 7, 8 / 7, 8 / 7, 8 / 7, 4 / 7, 8 / 7))
+    weighted_mean = sum(weights[LABELS.index(item.label)] for item in training) / len(training)
+    assert weighted_mean == pytest.approx(1.0)
+    with pytest.raises(TrainingError, match="invalid_training_manifest"):
+        inverse_frequency_class_weights(
+            tuple(item for item in training if item.label != "surprise")
+        )
+    with pytest.raises(TrainingError, match="invalid_training_manifest"):
+        inverse_frequency_class_weights(validation)
 
 
 def test_audio_preprocessing_rejects_wrong_format_and_short_clips(tmp_path: Path) -> None:
