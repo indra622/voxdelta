@@ -18,6 +18,8 @@ from voxdelta.analysis.emotions import map_operational_state
 from voxdelta.domain.models import EmotionLabel, EmotionResult, ProviderProvenance, ProviderUsage
 from voxdelta.evaluation.emotion_training import (
     CANONICAL_LABELS,
+    PARTIAL_LAST4_ENCODER_LAYERS,
+    PARTIAL_LAST4_PREFIXES,
     evaluation_windows,
     load_audio,
 )
@@ -50,6 +52,11 @@ class CheckpointInfo:
     freeze_encoder: bool | None
     model_revision: str | None
     base_model_sha256: str | None
+    adaptation_strategy: Literal["partial-last4"] | None
+    trainable_encoder_layers: tuple[int, ...] | None
+    trainable_module_prefixes: tuple[str, ...] | None
+    trainable_parameter_count: int | None
+    total_parameter_count: int | None
     digest: str
 
 
@@ -161,14 +168,39 @@ def validate_checkpoint(
             raise ValueError
         schema_version = config.get("schema_version")
         if architecture == "wav2vec-xls-r":
-            if (
-                schema_version != "3"
-                or set(config) != expected_config_keys | {"class_weighting", "class_weights"}
-                or config.get("model_revision") != WAV2VEC_MODEL_REVISION
-                or config.get("base_model_sha256") != WAV2VEC_WEIGHTS_SHA256
-                or config.get("class_weighting") != "inverse-frequency"
-                or not _valid_class_weights(config.get("class_weights"))
-            ):
+            partial_keys = {
+                "adaptation_strategy",
+                "trainable_encoder_layers",
+                "trainable_module_prefixes",
+                "trainable_parameter_count",
+                "total_parameter_count",
+            }
+            if schema_version == "3":
+                if (
+                    set(config) != expected_config_keys | {"class_weighting", "class_weights"}
+                    or config.get("model_revision") != WAV2VEC_MODEL_REVISION
+                    or config.get("base_model_sha256") != WAV2VEC_WEIGHTS_SHA256
+                    or config.get("class_weighting") != "inverse-frequency"
+                    or not _valid_class_weights(config.get("class_weights"))
+                ):
+                    raise ValueError
+            elif schema_version == "4":
+                if (
+                    set(config)
+                    != expected_config_keys | {"class_weighting", "class_weights"} | partial_keys
+                    or config.get("model_revision") != WAV2VEC_MODEL_REVISION
+                    or config.get("base_model_sha256") != WAV2VEC_WEIGHTS_SHA256
+                    or config.get("class_weighting") != "inverse-frequency"
+                    or not _valid_class_weights(config.get("class_weights"))
+                    or config.get("adaptation_strategy") != "partial-last4"
+                    or config.get("trainable_encoder_layers") != list(PARTIAL_LAST4_ENCODER_LAYERS)
+                    or config.get("trainable_module_prefixes") != list(PARTIAL_LAST4_PREFIXES)
+                    or type(config.get("trainable_parameter_count")) is not int
+                    or type(config.get("total_parameter_count")) is not int
+                    or not 0 < config["trainable_parameter_count"] < config["total_parameter_count"]
+                ):
+                    raise ValueError
+            else:
                 raise ValueError
         elif schema_version == "1":
             if set(config) != expected_config_keys:
@@ -216,6 +248,11 @@ def validate_checkpoint(
         freeze_encoder: bool | None = None
         model_revision: str | None = None
         base_model_sha256: str | None = None
+        adaptation_strategy: Literal["partial-last4"] | None = None
+        trainable_encoder_layers: tuple[int, ...] | None = None
+        trainable_module_prefixes: tuple[str, ...] | None = None
+        trainable_parameter_count: int | None = None
+        total_parameter_count: int | None = None
         if architecture == "emotion2vec-plus":
             embedding_size = config.get("embedding_size")
             if (
@@ -233,6 +270,16 @@ def validate_checkpoint(
         else:
             model_revision = cast(str, config["model_revision"])
             base_model_sha256 = cast(str, config["base_model_sha256"])
+            if schema_version == "4":
+                adaptation_strategy = "partial-last4"
+                trainable_encoder_layers = tuple(
+                    cast(list[int], config["trainable_encoder_layers"])
+                )
+                trainable_module_prefixes = tuple(
+                    cast(list[str], config["trainable_module_prefixes"])
+                )
+                trainable_parameter_count = cast(int, config["trainable_parameter_count"])
+                total_parameter_count = cast(int, config["total_parameter_count"])
         return CheckpointInfo(
             resolved,
             architecture,
@@ -242,6 +289,11 @@ def validate_checkpoint(
             freeze_encoder,
             model_revision,
             base_model_sha256,
+            adaptation_strategy,
+            trainable_encoder_layers,
+            trainable_module_prefixes,
+            trainable_parameter_count,
+            total_parameter_count,
             checkpoint_tree_digest(resolved),
         )
     except Exception:

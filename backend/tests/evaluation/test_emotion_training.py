@@ -8,10 +8,14 @@ import subprocess
 import sys
 import wave
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from voxdelta.evaluation.emotion_training import CheckpointPayload
 
 LABELS = ("happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise")
 WAV2VEC_REVISION = "1a640f32ac3e39899438a2931f9924c02f080a54"
@@ -684,6 +688,69 @@ def test_wav2vec_checkpoint_publishes_schema_three_provenance(tmp_path: Path) ->
     assert config["base_model_sha256"] == WAV2VEC_WEIGHTS_SHA256
 
 
+def _partial_payload() -> CheckpointPayload:
+    from voxdelta.evaluation.emotion_training import CheckpointPayload
+
+    return CheckpointPayload(
+        architecture="wav2vec-xls-r",
+        model_id="facebook/wav2vec2-xls-r-300m",
+        weights=b"complete-state",
+        metrics={"macro_f1": 0.2},
+        validation_hash="a" * 64,
+        model_revision=WAV2VEC_REVISION,
+        base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
+        class_weighting="inverse-frequency",
+        class_weights=(1.0,) * 7,
+        adaptation_strategy="partial-last4",
+        trainable_encoder_layers=(20, 21, 22, 23),
+        trainable_module_prefixes=(
+            "wav2vec2.encoder.layers.20.",
+            "wav2vec2.encoder.layers.21.",
+            "wav2vec2.encoder.layers.22.",
+            "wav2vec2.encoder.layers.23.",
+            "projector.",
+            "classifier.",
+        ),
+        trainable_parameter_count=10,
+        total_parameter_count=100,
+    )
+
+
+def test_partial_checkpoint_publishes_strict_schema_four(tmp_path: Path) -> None:
+    from voxdelta.evaluation.emotion_training import publish_checkpoint
+
+    output = tmp_path / "partial"
+    publish_checkpoint(output, _partial_payload())
+    config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+
+    assert config["schema_version"] == "4"
+    assert config["adaptation_strategy"] == "partial-last4"
+    assert config["trainable_encoder_layers"] == [20, 21, 22, 23]
+    assert config["trainable_parameter_count"] == 10
+    assert config["total_parameter_count"] == 100
+    assert (output / "model.safetensors").read_bytes() == b"complete-state"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"trainable_encoder_layers": (19, 20, 21, 22)},
+        {"trainable_module_prefixes": ("classifier.",)},
+        {"trainable_parameter_count": 0},
+        {"total_parameter_count": 10, "trainable_parameter_count": 10},
+    ],
+)
+def test_partial_checkpoint_rejects_altered_provenance(
+    changes: dict[str, object],
+) -> None:
+    from voxdelta.evaluation.emotion_training import CheckpointPayload
+
+    values = _partial_payload().model_dump()
+    values.update(changes)
+    with pytest.raises(ValidationError):
+        CheckpointPayload.model_validate(values)
+
+
 def test_checkpoint_failure_leaves_no_partial_output(tmp_path: Path) -> None:
     from voxdelta.evaluation.emotion_training import CheckpointPayload, publish_checkpoint
 
@@ -827,6 +894,67 @@ def test_manifest_training_boundary_passes_audio_only_and_exact_profile(tmp_path
         ),
     )
     assert "transcript" not in repr(examples).lower()
+
+
+def test_manifest_training_rejects_full_payload_for_partial_profile(tmp_path: Path) -> None:
+    from voxdelta.evaluation.emotion_training import (
+        CheckpointPayload,
+        TrainingError,
+        TrainingExample,
+        Wav2VecTrainingProfile,
+        train_from_manifest,
+    )
+
+    audio = _wav(tmp_path / "audio.wav", 0.5)
+    audio_hash = hashlib.sha256(audio.read_bytes()).hexdigest()
+    manifest = tmp_path / "emotion.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "id": "item-1",
+                "call_id": "call-1",
+                "speaker_id": "speaker-1",
+                "audio_path": str(audio.resolve()),
+                "transcript": "transcript-secret",
+                "split": "train",
+                "source": "emotion",
+                "emotion": "happiness",
+                "sha256": audio_hash,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def full_backend(_examples: tuple[TrainingExample, ...], _profile: object) -> CheckpointPayload:
+        return CheckpointPayload(
+            architecture="wav2vec-xls-r",
+            model_id="facebook/wav2vec2-xls-r-300m",
+            weights=b"complete-state",
+            metrics={"macro_f1": 1.0},
+            validation_hash="a" * 64,
+            model_revision=WAV2VEC_REVISION,
+            base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
+            class_weighting="inverse-frequency",
+            class_weights=(1.0,) * 7,
+        )
+
+    output = tmp_path / "output"
+    with pytest.raises(TrainingError, match="training_failed"):
+        train_from_manifest(
+            manifest,
+            output,
+            profile=Wav2VecTrainingProfile(
+                base_model_path=tmp_path.resolve(),
+                adaptation_strategy="partial-last4",
+                train_batch_size=2,
+                eval_batch_size=2,
+                gradient_accumulation_steps=8,
+            ),
+            backend=full_backend,
+        )
+
+    assert not output.exists()
 
 
 def test_manifest_training_rejects_unweighted_backend_payload(tmp_path: Path) -> None:

@@ -491,6 +491,11 @@ class CheckpointPayload(BaseModel):
     base_model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     class_weighting: Literal["inverse-frequency"] | None = None
     class_weights: tuple[float, ...] | None = None
+    adaptation_strategy: Literal["partial-last4"] | None = None
+    trainable_encoder_layers: tuple[int, ...] | None = None
+    trainable_module_prefixes: tuple[str, ...] | None = None
+    trainable_parameter_count: int | None = Field(default=None, gt=0)
+    total_parameter_count: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def valid_metadata(self) -> CheckpointPayload:
@@ -514,6 +519,11 @@ class CheckpointPayload(BaseModel):
                 or self.embedding_size is None
                 or self.model_revision is not None
                 or self.base_model_sha256 is not None
+                or self.adaptation_strategy is not None
+                or self.trainable_encoder_layers is not None
+                or self.trainable_module_prefixes is not None
+                or self.trainable_parameter_count is not None
+                or self.total_parameter_count is not None
             ):
                 raise ValueError("emotion2vec metadata is incomplete")
         elif (
@@ -527,6 +537,25 @@ class CheckpointPayload(BaseModel):
             or self.embedding_size is not None
         ):
             raise ValueError("wav2vec metadata is incomplete")
+        partial_values = (
+            self.trainable_encoder_layers,
+            self.trainable_module_prefixes,
+            self.trainable_parameter_count,
+            self.total_parameter_count,
+        )
+        if self.architecture == "wav2vec-xls-r":
+            if self.adaptation_strategy is None:
+                if any(value is not None for value in partial_values):
+                    raise ValueError("wav2vec metadata is incomplete")
+            elif (
+                self.adaptation_strategy != "partial-last4"
+                or self.trainable_encoder_layers != PARTIAL_LAST4_ENCODER_LAYERS
+                or self.trainable_module_prefixes != PARTIAL_LAST4_PREFIXES
+                or self.trainable_parameter_count is None
+                or self.total_parameter_count is None
+                or self.trainable_parameter_count >= self.total_parameter_count
+            ):
+                raise ValueError("wav2vec metadata is incomplete")
         return self
 
 
@@ -564,7 +593,10 @@ def publish_checkpoint(
         staging = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=parent))
         config: dict[str, object] = {
             "schema_version": (
-                "3"
+                "4"
+                if payload.architecture == "wav2vec-xls-r"
+                and payload.adaptation_strategy is not None
+                else "3"
                 if payload.architecture == "wav2vec-xls-r"
                 else "2"
                 if payload.class_weighting is not None
@@ -597,6 +629,16 @@ def publish_checkpoint(
                     "base_model_sha256": payload.base_model_sha256,
                 }
             )
+            if payload.adaptation_strategy is not None:
+                config.update(
+                    {
+                        "adaptation_strategy": payload.adaptation_strategy,
+                        "trainable_encoder_layers": payload.trainable_encoder_layers,
+                        "trainable_module_prefixes": payload.trainable_module_prefixes,
+                        "trainable_parameter_count": payload.trainable_parameter_count,
+                        "total_parameter_count": payload.total_parameter_count,
+                    }
+                )
         files = {
             "config.json": json.dumps(config, sort_keys=True, separators=(",", ":")).encode(),
             "label_mapping.json": json.dumps(
@@ -871,6 +913,12 @@ def train_from_manifest(
             raise ValueError
         if payload.class_weighting != profile.class_weighting or payload.class_weights is None:
             raise ValueError
+        if isinstance(profile, Wav2VecTrainingProfile):
+            expected_strategy = (
+                "partial-last4" if profile.adaptation_strategy == "partial-last4" else None
+            )
+            if payload.adaptation_strategy != expected_strategy:
+                raise ValueError
         publish_checkpoint(output_path, payload)
     except TrainingError:
         raise
@@ -1020,6 +1068,29 @@ def _train_wav2vec(
         base_model_sha256=prepared_base.weights_sha256,
         class_weighting=profile.class_weighting,
         class_weights=class_weights,
+        adaptation_strategy=(
+            "partial-last4" if profile.adaptation_strategy == "partial-last4" else None
+        ),
+        trainable_encoder_layers=(
+            trainable_summary.encoder_layers
+            if profile.adaptation_strategy == "partial-last4"
+            else None
+        ),
+        trainable_module_prefixes=(
+            trainable_summary.module_prefixes
+            if profile.adaptation_strategy == "partial-last4"
+            else None
+        ),
+        trainable_parameter_count=(
+            trainable_summary.trainable_parameter_count
+            if profile.adaptation_strategy == "partial-last4"
+            else None
+        ),
+        total_parameter_count=(
+            trainable_summary.total_parameter_count
+            if profile.adaptation_strategy == "partial-last4"
+            else None
+        ),
     )
 
 

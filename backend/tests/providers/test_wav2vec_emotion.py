@@ -28,23 +28,37 @@ def _wav(path: Path, seconds: float) -> Path:
     return path
 
 
-def _checkpoint(path: Path) -> Path:
+def _checkpoint(path: Path, *, adaptation_strategy: str | None = None) -> Path:
     path.mkdir()
-    (path / "config.json").write_text(
-        json.dumps(
+    config: dict[str, object] = {
+        "schema_version": "3",
+        "architecture": "wav2vec-xls-r",
+        "model_id": "facebook/wav2vec2-xls-r-300m",
+        "labels": list(LABELS),
+        "model_revision": WAV2VEC_REVISION,
+        "base_model_sha256": WAV2VEC_WEIGHTS_SHA256,
+        "class_weighting": "inverse-frequency",
+        "class_weights": [1.0] * 7,
+    }
+    if adaptation_strategy == "partial-last4":
+        config.update(
             {
-                "schema_version": "3",
-                "architecture": "wav2vec-xls-r",
-                "model_id": "facebook/wav2vec2-xls-r-300m",
-                "labels": list(LABELS),
-                "model_revision": WAV2VEC_REVISION,
-                "base_model_sha256": WAV2VEC_WEIGHTS_SHA256,
-                "class_weighting": "inverse-frequency",
-                "class_weights": [1.0] * 7,
+                "schema_version": "4",
+                "adaptation_strategy": "partial-last4",
+                "trainable_encoder_layers": [20, 21, 22, 23],
+                "trainable_module_prefixes": [
+                    "wav2vec2.encoder.layers.20.",
+                    "wav2vec2.encoder.layers.21.",
+                    "wav2vec2.encoder.layers.22.",
+                    "wav2vec2.encoder.layers.23.",
+                    "projector.",
+                    "classifier.",
+                ],
+                "trainable_parameter_count": 10,
+                "total_parameter_count": 100,
             }
-        ),
-        encoding="utf-8",
-    )
+        )
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (path / "label_mapping.json").write_text(
         json.dumps({str(index): label for index, label in enumerate(LABELS)}),
         encoding="utf-8",
@@ -54,6 +68,59 @@ def _checkpoint(path: Path) -> Path:
     )
     (path / "model.safetensors").write_bytes(b"fake-weights")
     return path
+
+
+def test_runtime_accepts_exact_partial_checkpoint(tmp_path: Path) -> None:
+    from voxdelta.providers._emotion_runtime import validate_checkpoint
+
+    checkpoint = _checkpoint(
+        tmp_path / "checkpoint",
+        adaptation_strategy="partial-last4",
+    )
+    info = validate_checkpoint(
+        checkpoint,
+        architecture="wav2vec-xls-r",
+        model_id="facebook/wav2vec2-xls-r-300m",
+    )
+
+    assert info.adaptation_strategy == "partial-last4"
+    assert info.trainable_encoder_layers == (20, 21, 22, 23)
+    assert info.trainable_parameter_count > 0
+    assert info.total_parameter_count > info.trainable_parameter_count
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("adaptation_strategy", "full"),
+        ("trainable_encoder_layers", [19, 20, 21, 22]),
+        ("trainable_module_prefixes", ["classifier."]),
+        ("trainable_parameter_count", 0),
+        ("total_parameter_count", 10),
+        ("model_revision", "wrong"),
+        ("base_model_sha256", "b" * 64),
+    ],
+)
+def test_runtime_rejects_altered_partial_provenance(
+    tmp_path: Path, key: str, value: object
+) -> None:
+    from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
+
+    checkpoint = _checkpoint(
+        tmp_path / "checkpoint",
+        adaptation_strategy="partial-last4",
+    )
+    config_path = checkpoint / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config[key] = value
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ProviderError) as raised:
+        Wav2VecEmotionProvider(
+            checkpoint,
+            model_factory=FakeFactory(FakePredictor([[0.0] * 7])),
+        )
+    assert raised.value.code == "invalid_local_checkpoint"
 
 
 class FakePredictor:
