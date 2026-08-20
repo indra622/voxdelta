@@ -126,6 +126,61 @@ def test_pretrained_nine_class_logits_are_never_remapped(tmp_path: Path) -> None
     assert raised.value.code == "invalid_provider_output"
 
 
+def test_predictor_requests_the_same_embedding_contract_as_training() -> None:
+    from voxdelta.providers.emotion2vec_emotion import _Emotion2VecPredictor
+
+    class RecordingEncoder:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate(self, **kwargs: object) -> list[dict[str, list[float]]]:
+            self.calls.append(kwargs)
+            return [{"feats": [1.0, 2.0, 3.0, 4.0]}]
+
+    class FakeTensor:
+        def __init__(self, values: list[float]) -> None:
+            self.values = values
+
+        def reshape(self, _size: int) -> FakeTensor:
+            return self
+
+        def detach(self) -> FakeTensor:
+            return self
+
+        def float(self) -> FakeTensor:
+            return self
+
+        def cpu(self) -> FakeTensor:
+            return self
+
+        def tolist(self) -> list[float]:
+            return self.values
+
+    class FakeTorch:
+        float32 = "float32"
+
+        @staticmethod
+        def as_tensor(values: list[float], **_kwargs: object) -> FakeTensor:
+            return FakeTensor(values)
+
+    encoder = RecordingEncoder()
+    predictor = object.__new__(_Emotion2VecPredictor)
+    predictor._encoder = encoder
+    predictor._device = "cpu"
+    predictor._torch = FakeTorch()
+    predictor._head = lambda _tensor: FakeTensor([0.0] * 7)
+
+    predictor.predict((0.0,) * 16_000, 16_000)
+
+    assert encoder.calls == [
+        {
+            "input": [0.0] * 16_000,
+            "granularity": "utterance",
+            "extract_embedding": True,
+        }
+    ]
+
+
 def test_emotion2vec_uses_shared_seven_label_result_mapping(tmp_path: Path) -> None:
     from voxdelta.providers.emotion2vec_emotion import Emotion2VecEmotionProvider
 

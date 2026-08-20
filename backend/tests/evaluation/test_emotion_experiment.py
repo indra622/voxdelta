@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import cast
@@ -33,6 +35,7 @@ LABELS: tuple[EmotionLabel, ...] = (
     "sadness",
     "surprise",
 )
+BACKEND = Path(__file__).resolve().parents[2]
 
 
 def _write_source_manifest(
@@ -301,3 +304,66 @@ def test_evaluation_rejects_zero_completed_items_and_unloads(tmp_path: Path) -> 
         )
 
     assert provider.unloaded is True
+
+
+def test_build_cli_writes_summary_without_private_content(tmp_path: Path) -> None:
+    source = _write_source_manifest(tmp_path / "source")
+    output = tmp_path / "smoke.jsonl"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/build_emotion_smoke_manifest.py",
+            "--manifest",
+            str(source),
+            "--output",
+            str(output),
+            "--train-per-label",
+            "2",
+            "--validation-per-label",
+            "1",
+            "--test-per-label",
+            "1",
+            "--seed",
+            "622",
+        ],
+        cwd=BACKEND,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert completed.stdout == "smoke manifest: 28 items\n"
+    assert output.is_file()
+    assert str(source) not in completed.stdout
+
+
+def test_evaluation_cli_failure_is_sanitized(tmp_path: Path) -> None:
+    private_manifest = tmp_path / "private-item-id.jsonl"
+    private_checkpoint = tmp_path / "private-checkpoint"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/evaluate_emotion_checkpoint.py",
+            "--manifest",
+            str(private_manifest),
+            "--checkpoint",
+            str(private_checkpoint),
+            "--output",
+            str(tmp_path / "report.json"),
+            "--architecture",
+            "emotion2vec-plus",
+        ],
+        cwd=BACKEND,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "emotion evaluation failed\n"
+    assert "private" not in completed.stderr

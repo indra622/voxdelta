@@ -95,7 +95,11 @@ class _Emotion2VecPredictor:
     def predict(self, samples: tuple[float, ...], sample_rate: int) -> list[float]:
         del sample_rate
         try:
-            output = self._encoder.generate(input=list(samples), granularity="utterance")
+            output = self._encoder.generate(
+                input=list(samples),
+                granularity="utterance",
+                extract_embedding=True,
+            )
             if not isinstance(output, list) or len(output) != 1 or not isinstance(output[0], dict):
                 raise ValueError
             embedding = output[0].get("feats")
