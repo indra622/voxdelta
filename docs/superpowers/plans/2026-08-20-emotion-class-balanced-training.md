@@ -105,7 +105,7 @@ git commit -m "feat: define inverse-frequency emotion weights"
 - Consumes: `inverse_frequency_class_weights(...)` from Task 1.
 - Produces: `weighted_cross_entropy(torch: Any, logits: Any, labels: Any, class_weights: Sequence[float], device: str) -> Any`; both `_train_wav2vec` and `_train_emotion2vec` use it.
 
-- [ ] **Step 1: Write a failing weighted-loss boundary test**
+- [x] **Step 1: Write a failing weighted-loss boundary test**
 
 Use a fake torch object whose `tensor` and `nn.functional.cross_entropy` record arguments. Assert the helper constructs a float32 tensor on `mps`, passes it as the `weight=` keyword, and returns the cross-entropy sentinel:
 
@@ -122,7 +122,7 @@ assert fake_torch.tensor_calls == [((1.0, 2.0), "float32", "mps")]
 assert fake_torch.loss_calls == [("logits", "labels", "weight-tensor")]
 ```
 
-- [ ] **Step 2: Run the test and verify RED**
+- [x] **Step 2: Run the test and verify RED**
 
 Run:
 
@@ -133,7 +133,7 @@ uv run pytest tests/evaluation/test_emotion_training.py::test_weighted_cross_ent
 
 Expected: failure because `weighted_cross_entropy` does not exist.
 
-- [ ] **Step 3: Implement the shared boundary**
+- [x] **Step 3: Implement the shared boundary**
 
 ```python
 def weighted_cross_entropy(
@@ -161,7 +161,7 @@ loss = weighted_cross_entropy(torch, head(features), labels, class_weights, devi
 loss.backward()
 ```
 
-- [ ] **Step 4: Run focused and full training-contract tests**
+- [x] **Step 4: Run focused and full training-contract tests**
 
 Run:
 
@@ -172,7 +172,7 @@ uv run pytest tests/evaluation/test_emotion_training.py -q
 
 Expected: pass with the existing platform-specific skip only if applicable.
 
-- [ ] **Step 5: Commit the loss integration**
+- [x] **Step 5: Commit the loss integration**
 
 ```bash
 git add backend/src/voxdelta/evaluation/emotion_training.py backend/tests/evaluation/test_emotion_training.py

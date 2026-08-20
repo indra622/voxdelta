@@ -127,6 +127,48 @@ def test_inverse_frequency_weights_are_train_only_canonical_and_normalized() -> 
         inverse_frequency_class_weights(validation)
 
 
+def test_weighted_cross_entropy_passes_canonical_weights_to_torch() -> None:
+    from voxdelta.evaluation.emotion_training import weighted_cross_entropy
+
+    class FakeFunctional:
+        def __init__(self, owner: FakeTorch) -> None:
+            self.owner = owner
+
+        def cross_entropy(self, logits: object, labels: object, *, weight: object) -> str:
+            self.owner.loss_calls.append((logits, labels, weight))
+            return "loss"
+
+    class FakeNN:
+        def __init__(self, owner: FakeTorch) -> None:
+            self.functional = FakeFunctional(owner)
+
+    class FakeTorch:
+        float32 = "float32"
+
+        def __init__(self) -> None:
+            self.tensor_calls: list[tuple[tuple[float, ...], object, str]] = []
+            self.loss_calls: list[tuple[object, object, object]] = []
+            self.nn = FakeNN(self)
+
+        def tensor(self, values: tuple[float, ...], *, dtype: object, device: str) -> str:
+            self.tensor_calls.append((values, dtype, device))
+            return "weight-tensor"
+
+    fake_torch = FakeTorch()
+
+    result = weighted_cross_entropy(
+        fake_torch,
+        logits="logits",
+        labels="labels",
+        class_weights=(1.0, 2.0),
+        device="mps",
+    )
+
+    assert result == "loss"
+    assert fake_torch.tensor_calls == [((1.0, 2.0), "float32", "mps")]
+    assert fake_torch.loss_calls == [("logits", "labels", "weight-tensor")]
+
+
 def test_audio_preprocessing_rejects_wrong_format_and_short_clips(tmp_path: Path) -> None:
     from voxdelta.evaluation.emotion_training import load_audio
 

@@ -648,6 +648,17 @@ def inverse_frequency_class_weights(
     return tuple(total / (len(CANONICAL_LABELS) * counts[label]) for label in CANONICAL_LABELS)
 
 
+def weighted_cross_entropy(
+    torch: Any,
+    logits: Any,
+    labels: Any,
+    class_weights: Sequence[float],
+    device: str,
+) -> Any:
+    weights = torch.tensor(tuple(class_weights), dtype=torch.float32, device=device)
+    return torch.nn.functional.cross_entropy(logits, labels, weight=weights)
+
+
 def load_training_examples(manifest_path: str | Path) -> tuple[TrainingExample, ...]:
     """Load emotion-only examples without retaining transcripts in the training boundary."""
 
@@ -747,6 +758,7 @@ def _train_wav2vec(
         raise TrainingError("training_runtime_unavailable") from None
 
     train_items, validation_items = _training_splits(examples)
+    class_weights = inverse_frequency_class_weights(train_items)
     device = _training_device(torch)
     extractor = transformers.AutoFeatureExtractor.from_pretrained(profile.model_id)
     initial_torch_state = torch.random.get_rng_state()
@@ -830,7 +842,10 @@ def _train_wav2vec(
                         dtype=torch.long,
                         device=device,
                     )
-                    loss = model(**inputs_for(clips), labels=labels).loss
+                    logits = model(**inputs_for(clips)).logits
+                    loss = weighted_cross_entropy(
+                        torch, logits, labels, class_weights, device
+                    )
                     (loss / profile.gradient_accumulation_steps).backward()
                     if (
                         batch_index % profile.gradient_accumulation_steps == 0
@@ -878,6 +893,7 @@ def _train_emotion2vec(
         raise TrainingError("training_runtime_unavailable") from None
 
     train_items, validation_items = _training_splits(examples)
+    class_weights = inverse_frequency_class_weights(train_items)
     device = _training_device(torch)
     encoder = funasr.AutoModel(
         model=profile.encoder_id,
@@ -995,7 +1011,10 @@ def _train_emotion2vec(
                 ):
                     features, labels = batch_tensors(batch)
                     optimizer.zero_grad(set_to_none=True)
-                    torch.nn.functional.cross_entropy(head(features), labels).backward()
+                    loss = weighted_cross_entropy(
+                        torch, head(features), labels, class_weights, device
+                    )
+                    loss.backward()
                     optimizer.step()
                 score = evaluate()
                 if score > best_score + 1e-12:
