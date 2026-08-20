@@ -742,6 +742,8 @@ def train_from_manifest(
         )
         if payload.model_id != expected_model:
             raise ValueError
+        if payload.class_weighting != profile.class_weighting or payload.class_weights is None:
+            raise ValueError
         publish_checkpoint(output_path, payload)
     except TrainingError:
         raise

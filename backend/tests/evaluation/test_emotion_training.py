@@ -535,6 +535,8 @@ def test_manifest_training_boundary_passes_audio_only_and_exact_profile(tmp_path
             weights=b"weights",
             metrics={"macro_f1": 1.0},
             validation_hash="a" * 64,
+            class_weighting="inverse-frequency",
+            class_weights=(1.0,) * 7,
         )
 
     output = tmp_path / "output"
@@ -559,6 +561,59 @@ def test_manifest_training_boundary_passes_audio_only_and_exact_profile(tmp_path
         ),
     )
     assert "transcript" not in repr(examples).lower()
+
+
+def test_manifest_training_rejects_unweighted_backend_payload(tmp_path: Path) -> None:
+    from voxdelta.evaluation.emotion_training import (
+        CheckpointPayload,
+        TrainingError,
+        TrainingExample,
+        Wav2VecTrainingProfile,
+        train_from_manifest,
+    )
+
+    audio = _wav(tmp_path / "audio.wav", 0.5)
+    audio_hash = hashlib.sha256(audio.read_bytes()).hexdigest()
+    manifest = tmp_path / "emotion.jsonl"
+    manifest.write_text(
+        json.dumps(
+            {
+                "id": "item-1",
+                "call_id": "call-1",
+                "speaker_id": "speaker-1",
+                "audio_path": str(audio.resolve()),
+                "transcript": "transcript-secret",
+                "split": "train",
+                "source": "emotion",
+                "emotion": "happiness",
+                "sha256": audio_hash,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def unweighted_backend(
+        _examples: tuple[TrainingExample, ...], _profile: object
+    ) -> CheckpointPayload:
+        return CheckpointPayload(
+            architecture="wav2vec-xls-r",
+            model_id="facebook/wav2vec2-xls-r-300m",
+            weights=b"weights",
+            metrics={"macro_f1": 1.0},
+            validation_hash="a" * 64,
+        )
+
+    output = tmp_path / "output"
+    with pytest.raises(TrainingError, match="training_failed"):
+        train_from_manifest(
+            manifest,
+            output,
+            profile=Wav2VecTrainingProfile(),
+            backend=unweighted_backend,
+        )
+
+    assert not output.exists()
 
 
 def test_manifest_training_rejects_wrong_source_hash_and_symlink(tmp_path: Path) -> None:
