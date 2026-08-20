@@ -34,10 +34,12 @@ uv run python scripts/prepare_aihub_emotion.py \
 
 The two mismatch allowances are explicit for the verified 4차년도 release, which contains 16 CSV
 IDs without matching WAV basenames and 16 WAV basenames without CSV rows. The importer reads ZIP64
-with Python instead of macOS `unzip`, requires at least three matching votes among the five emotion
-annotators, and writes only high-consensus items under `emotion/pairs/`. It never copies transcripts:
-the normalized JSON uses an empty transcript, and `import-report.json` contains only opaque IDs and
-counts. Source archives are opened read-only and the completed output is published atomically.
+with Python instead of macOS `unzip`, verifies the official 48 kHz mono PCM16 input contract, and
+resamples accepted audio to the training boundary's 16 kHz mono PCM16 format with SoXR HQ. It
+requires at least three matching votes among the five emotion annotators and writes only
+high-consensus items under `emotion/pairs/`. It never copies transcripts: the normalized JSON uses
+an empty transcript, and `import-report.json` contains only opaque IDs and counts. Source archives
+are opened read-only and the completed output is published atomically.
 
 Dataset 263 does not expose real call or speaker identities. The normalized metadata therefore uses
 an item-scoped synthetic grouping key for both fields. Hash-based train/validation/test assignment is

@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import tempfile
+import wave
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,6 +18,9 @@ from io import StringIO
 from pathlib import Path
 from typing import BinaryIO, cast
 from zipfile import BadZipFile, ZipFile
+
+import numpy as np
+import soxr  # type: ignore[import-untyped]
 
 from voxdelta.domain.models import EmotionLabel
 from voxdelta.evaluation.manifest import read_trusted_regular_file
@@ -55,6 +59,8 @@ _RELEASE_NAMES = ("4차년도", "5차년도", "5차년도_2차")
 _SAFE_ITEM_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _MAX_AUDIO_BYTES = 100 * 1024 * 1024
 _MAX_TOTAL_AUDIO_BYTES = 100 * 1024 * 1024 * 1024
+_SOURCE_SAMPLE_RATE = 48_000
+_TARGET_SAMPLE_RATE = 16_000
 
 
 @dataclass(frozen=True)
@@ -259,19 +265,48 @@ def _write_bytes_atomic(path: Path, payload: bytes) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def _normalized_pcm16(archive: ZipFile, member: str) -> bytes:
+    try:
+        with archive.open(member, "r") as source, wave.open(source, "rb") as audio:
+            if (
+                audio.getnchannels() != 1
+                or audio.getframerate() != _SOURCE_SAMPLE_RATE
+                or audio.getsampwidth() != 2
+                or audio.getcomptype() != "NONE"
+            ):
+                raise ValueError("invalid source audio")
+            frame_count = audio.getnframes()
+            frames = audio.readframes(frame_count)
+        if len(frames) != frame_count * 2:
+            raise ValueError("invalid source audio")
+        samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+        normalized = soxr.resample(
+            samples,
+            _SOURCE_SAMPLE_RATE,
+            _TARGET_SAMPLE_RATE,
+            quality="HQ",
+        )
+        clipped = np.clip(np.rint(normalized * 32768.0), -32768, 32767).astype("<i2")
+        return cast(bytes, clipped.tobytes())
+    except (EOFError, MemoryError, OSError, RuntimeError, ValueError, wave.Error):
+        raise ValueError("invalid source audio") from None
+
+
 def _write_audio_member(archive: ZipFile, member: str, path: Path) -> None:
     temporary_path: Path | None = None
     try:
-        with (
-            archive.open(member, "r") as source,
-            tempfile.NamedTemporaryFile(
-                dir=path.parent, prefix=f".{path.name}.", delete=False
-            ) as target,
-        ):
+        pcm = _normalized_pcm16(archive, member)
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as target:
             temporary_path = Path(target.name)
             os.fchmod(target.fileno(), 0o600)
-            while chunk := source.read(1024 * 1024):
-                target.write(chunk)
+            with wave.open(target, "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(_TARGET_SAMPLE_RATE)
+                audio.setcomptype("NONE", "not compressed")
+                audio.writeframes(pcm)
             target.flush()
             os.fsync(target.fileno())
         os.replace(temporary_path, path)

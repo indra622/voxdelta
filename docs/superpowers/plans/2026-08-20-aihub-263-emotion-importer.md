@@ -6,13 +6,14 @@
 
 **Architecture:** Add a focused importer module and CLI that read each annual CSV/ZIP pair without mutating the source archives, accept only rows with at least three matching emotion votes, and write sharded local pairs through a staging directory. The importer records ambiguous votes and unmatched IDs in a transcript-free report; generated metadata uses per-item synthetic grouping identifiers because AI Hub 263 does not provide call or speaker identity.
 
-**Tech Stack:** Python 3.12 standard library (`csv`, `zipfile`, `tempfile`, `hashlib`, `json`), Pydantic manifest contracts, pytest, Ruff, strict mypy, uv.
+**Tech Stack:** Python 3.12 standard library (`csv`, `zipfile`, `tempfile`, `wave`, `json`), NumPy, SoXR HQ resampling, Pydantic manifest contracts, pytest, Ruff, strict mypy, uv.
 
 ## Global Constraints
 
 - Preserve all source ZIP and CSV bytes exactly; never call `ZipFile.extract` or `extractall`.
 - Decode official metadata as CP949 and reject malformed headers, duplicate IDs, unsupported labels, duplicate archive stems, symlinks, and unsafe output paths.
 - Require at least three of five annotators to agree; do not manufacture a hard label for lower-consensus rows.
+- Require official 48 kHz mono PCM16 source WAVs and normalize accepted items to 16 kHz mono PCM16 before publication.
 - Permit the observed 4차년도 mismatch only through an explicit CLI allowance of 16 missing and 16 orphan IDs; report every skipped opaque ID without transcripts.
 - Never copy transcripts into normalized metadata, reports, stdout, stderr, Git, or tests; emit an empty transcript because emotion training consumes audio and labels only.
 - Synthetic `call_id` and `speaker_id` values are per-item grouping keys, not real identities; document that dataset-263 splits cannot claim speaker-disjointness.
@@ -101,8 +102,8 @@ git commit -m "feat: parse AI Hub 263 emotion data"
 - Modify: `backend/tests/evaluation/test_aihub_emotion.py`
 
 **Interfaces:**
-- Consumes: `EmotionImportPlan` objects from Task 1 and a destination directory that does not exist.
-- Produces: `import_emotion_dataset(source_root: Path, output_root: Path, *, max_missing_audio: int, max_orphan_audio: int) -> EmotionImportReport`, sharded pairs under `output_root/pairs/<id-prefix>/`, and `output_root/import-report.json`.
+- Consumes: `EmotionImportPlan` objects from Task 1, official 48 kHz mono PCM16 WAV members, and a destination directory that does not exist.
+- Produces: `import_emotion_dataset(source_root: Path, output_root: Path, *, max_missing_audio: int, max_orphan_audio: int) -> EmotionImportReport`, 16 kHz mono PCM16 sharded pairs under `output_root/pairs/<id-prefix>/`, and `output_root/import-report.json`.
 
 - [ ] **Step 1: Write failing atomic-import tests**
 
@@ -137,7 +138,7 @@ with archive.open(member, "r") as source, temporary_audio.open("wb") as target:
 os.replace(temporary_audio, audio_path)
 ```
 
-Create a same-filesystem staging directory, write mode-0600 WAV and JSON files, fsync files, publish the completed directory with `os.replace`, and remove only the importer-owned staging directory after a failure. Hash every accepted audio and include annual counts, label counts, ambiguous IDs, missing IDs, orphan IDs, and source file sizes in the report without transcripts.
+Create a same-filesystem staging directory, decode and validate the official mono PCM16 WAV headers, resample 48 kHz samples to 16 kHz with SoXR HQ, write mode-0600 WAV and JSON files, fsync files, publish the completed directory with `os.replace`, and remove only the importer-owned staging directory after a failure. Include annual counts, label counts, ambiguous IDs, missing IDs, orphan IDs, and source file sizes in the report without transcripts.
 
 - [ ] **Step 4: Add failure-boundary tests**
 

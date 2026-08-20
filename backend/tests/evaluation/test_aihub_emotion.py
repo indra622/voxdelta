@@ -5,6 +5,8 @@ import json
 import os
 import struct
 import subprocess
+import wave
+from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
@@ -12,6 +14,7 @@ import pytest
 
 import voxdelta.evaluation.aihub_emotion as aihub_emotion
 from voxdelta.evaluation.aihub_emotion import import_emotion_dataset, plan_emotion_import
+from voxdelta.evaluation.emotion_training import load_audio
 from voxdelta.evaluation.manifest import load_manifest
 
 BACKEND = Path(__file__).resolve().parents[2]
@@ -51,6 +54,16 @@ def _row(item_id: str, votes: list[str]) -> dict[str, str]:
     return row
 
 
+def _source_wav() -> bytes:
+    buffer = BytesIO()
+    with wave.open(buffer, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(48_000)
+        target.writeframes(struct.pack("<48000h", *([1000] * 48_000)))
+    return buffer.getvalue()
+
+
 def _write_official_fixture(
     root: Path,
     *,
@@ -75,9 +88,9 @@ def _write_official_fixture(
                 info = ZipInfo(member_name)
                 info.compress_type = ZIP_STORED
                 with archive.open(info, "w", force_zip64=True) as member:
-                    member.write(b"fixture-wave")
+                    member.write(_source_wav())
             else:
-                archive.writestr(member_name, b"fixture-wave")
+                archive.writestr(member_name, _source_wav())
         for member, payload in (extra_members or {}).items():
             archive.writestr(member, payload)
     return csv_path, zip_path
@@ -308,7 +321,9 @@ def test_import_writes_sharded_pairs_and_transcript_free_report(tmp_path: Path) 
     audio_path = output / "pairs" / "it" / "item-0.wav"
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     report_text = (output / "import-report.json").read_text(encoding="utf-8")
-    assert audio_path.read_bytes() == b"fixture-wave"
+    clip = load_audio(audio_path)
+    assert clip.sample_rate == 16_000
+    assert len(clip.samples) == 16_000
     assert metadata["transcript"] == ""
     assert metadata["emotion"] == "anger"
     assert metadata["call_id"] == "aihub-263-item:item-0"
@@ -402,8 +417,9 @@ def test_import_failure_leaves_no_published_or_staging_output(tmp_path: Path) ->
     source = _write_three_release_fixture(tmp_path / "source")
     corrupt = source / "5차년도.zip"
     payload = bytearray(corrupt.read_bytes())
-    marker = payload.index(b"fixture-wave")
-    payload[marker] ^= 0x01
+    central_header = payload.index(b"PK\x01\x02")
+    original_crc = struct.unpack_from("<I", payload, central_header + 16)[0]
+    struct.pack_into("<I", payload, central_header + 16, original_crc ^ 0x1)
     corrupt.write_bytes(payload)
     output = tmp_path / "normalized"
 
