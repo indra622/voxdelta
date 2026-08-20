@@ -15,6 +15,7 @@ from voxdelta.evaluation.emotion_experiment import (
 from voxdelta.providers._emotion_runtime import Device
 
 Architecture = Literal["emotion2vec-plus", "wav2vec-xls-r"]
+EvaluationSplit = Literal["validation", "test"]
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -38,6 +39,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=("auto", "cpu", "mps", "cuda"),
         default="auto",
     )
+    parser.add_argument(
+        "--split",
+        choices=("validation", "test"),
+        default="test",
+    )
     return parser
 
 
@@ -49,12 +55,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.checkpoint,
             architecture=cast(Architecture, arguments.architecture),
             device=cast(Device, arguments.device),
+            split=cast(EvaluationSplit, arguments.split),
         )
         write_experiment_report(arguments.output, report)
     except Exception:
         print("emotion evaluation failed", file=sys.stderr)
         return 2
-    print(f"emotion evaluation: {report.completed_count}/{report.test_count} completed")
+    print(f"emotion evaluation: {report.completed_count}/{report.item_count} completed")
     return 0
 
 

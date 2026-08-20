@@ -178,9 +178,11 @@ class FakeProvider:
         )
         self.fail_all = fail_all
         self.unloaded = False
+        self.calls: list[str] = []
 
     def analyze(self, utterance_id: str, audio_path: Path, transcript: str) -> EmotionResult:
         del audio_path, transcript
+        self.calls.append(utterance_id)
         if self.fail_all:
             raise ProviderError("provider_unavailable")
         expected = cast(EmotionLabel, utterance_id.split("-")[1])
@@ -221,7 +223,8 @@ def _report_fixture() -> EmotionExperimentReport:
         model_id="emotion2vec-plus-large-seven-emotion@v2.0.5",
         checkpoint_digest="a" * 64,
         manifest_digest="b" * 64,
-        test_count=7,
+        split="test",
+        item_count=7,
         completed_count=7,
         completion_rate=1.0,
         macro_f1=1.0,
@@ -249,7 +252,8 @@ def test_evaluation_report_has_aggregate_metrics_without_item_content(tmp_path: 
     )
 
     assert provider.unloaded is True
-    assert report.test_count == 7
+    assert report.split == "test"
+    assert report.item_count == 7
     assert report.completed_count == 7
     assert report.completion_rate == 1.0
     assert report.macro_f1 == 1.0
@@ -263,6 +267,64 @@ def test_evaluation_report_has_aggregate_metrics_without_item_content(tmp_path: 
     serialized = report.model_dump_json()
     for forbidden in ("transcript", "audio_path", "train-happiness-", "test-surprise-"):
         assert forbidden not in serialized
+
+
+def test_evaluation_can_select_validation_without_opening_test(tmp_path: Path) -> None:
+    manifest = _smoke_evaluation_manifest(tmp_path)
+    provider = FakeProvider()
+
+    report = evaluate_emotion_checkpoint(
+        manifest,
+        tmp_path / "checkpoint",
+        architecture="emotion2vec-plus",
+        split="validation",
+        provider_factory=lambda _checkpoint, _device: provider,
+    )
+
+    assert report.split == "validation"
+    assert report.item_count == 7
+    assert provider.calls
+    assert all(identifier.startswith("validation-") for identifier in provider.calls)
+    assert not any(identifier.startswith("test-") for identifier in provider.calls)
+
+
+def test_evaluation_cli_accepts_only_explicit_validation_or_test_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(BACKEND))
+    from scripts.evaluate_emotion_checkpoint import _parser
+
+    arguments = _parser().parse_args(
+        [
+            "--manifest",
+            "/manifest.jsonl",
+            "--checkpoint",
+            "/checkpoint",
+            "--output",
+            "/report.json",
+            "--architecture",
+            "emotion2vec-plus",
+            "--split",
+            "validation",
+        ]
+    )
+
+    assert arguments.split == "validation"
+    with pytest.raises(ValueError, match="invalid arguments"):
+        _parser().parse_args(
+            [
+                "--manifest",
+                "/manifest.jsonl",
+                "--checkpoint",
+                "/checkpoint",
+                "--output",
+                "/report.json",
+                "--architecture",
+                "emotion2vec-plus",
+                "--split",
+                "private-secret",
+            ]
+        )
 
 
 def test_report_writer_is_atomic_private_and_refuses_existing_output(tmp_path: Path) -> None:

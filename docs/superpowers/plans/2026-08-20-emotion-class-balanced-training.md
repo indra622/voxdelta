@@ -264,11 +264,11 @@ git commit -m "feat: record balanced emotion checkpoint provenance"
 - Consumes: the existing production-provider aggregate evaluator.
 - Produces: `evaluate_emotion_checkpoint(..., split: Literal["validation", "test"] = "test")`; report schema v2 fields `split` and `item_count`; CLI `--split` with default `test`.
 
-- [ ] **Step 1: Write failing validation-split tests**
+- [x] **Step 1: Write failing validation-split tests**
 
 Call the evaluator with `split="validation"` and assert only validation IDs reach `FakeProvider`, `report.split == "validation"`, and `report.item_count == 7`. Update report fixtures to schema v2 and replace `test_count` assertions with `item_count`. Add a CLI parser test proving `--split validation` is accepted and invalid values fail with the existing sanitized error.
 
-- [ ] **Step 2: Run evaluator tests and verify RED**
+- [x] **Step 2: Run evaluator tests and verify RED**
 
 Run:
 
@@ -279,7 +279,7 @@ uv run pytest tests/evaluation/test_emotion_experiment.py -q
 
 Expected: failure because the split argument and generic count fields do not exist.
 
-- [ ] **Step 3: Generalize the aggregate report and evaluator**
+- [x] **Step 3: Generalize the aggregate report and evaluator**
 
 Change the report contract to:
 
@@ -299,11 +299,11 @@ parser.add_argument("--split", choices=("validation", "test"), default="test")
 
 Pass the cast split into the evaluator and print `completed_count/item_count`.
 
-- [ ] **Step 4: Run evaluator tests and verify GREEN**
+- [x] **Step 4: Run evaluator tests and verify GREEN**
 
 Run the Step 2 command. Expected: pass.
 
-- [ ] **Step 5: Commit split-explicit evaluation**
+- [x] **Step 5: Commit split-explicit evaluation**
 
 ```bash
 git add backend/src/voxdelta/evaluation/emotion_experiment.py backend/scripts/evaluate_emotion_checkpoint.py backend/tests/evaluation/test_emotion_experiment.py

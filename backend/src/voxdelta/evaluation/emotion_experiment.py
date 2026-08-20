@@ -38,6 +38,7 @@ CANONICAL_LABELS: tuple[EmotionLabel, ...] = (
     "sadness",
     "surprise",
 )
+EvaluationSplit = Literal["validation", "test"]
 
 
 class SmokeManifestSummary(BaseModel):
@@ -56,12 +57,13 @@ class EmotionExperimentReport(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     architecture: Literal["emotion2vec-plus", "wav2vec-xls-r"]
     model_id: str = Field(min_length=1)
     checkpoint_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     manifest_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
-    test_count: int = Field(gt=0)
+    split: EvaluationSplit
+    item_count: int = Field(gt=0)
     completed_count: int = Field(gt=0)
     completion_rate: float = Field(ge=0, le=1)
     macro_f1: float = Field(ge=0, le=1)
@@ -76,8 +78,8 @@ class EmotionExperimentReport(BaseModel):
     @model_validator(mode="after")
     def valid_aggregate_contract(self) -> EmotionExperimentReport:
         if (
-            self.completed_count > self.test_count
-            or abs(self.completion_rate - self.completed_count / self.test_count) > 1e-12
+            self.completed_count > self.item_count
+            or abs(self.completion_rate - self.completed_count / self.item_count) > 1e-12
             or set(self.per_label_f1) != set(CANONICAL_LABELS)
             or any(not math.isfinite(value) for value in self.per_label_f1.values())
             or any(not 0 <= value <= 1 for value in self.per_label_f1.values())
@@ -285,11 +287,16 @@ def evaluate_emotion_checkpoint(
     *,
     architecture: Literal["emotion2vec-plus", "wav2vec-xls-r"],
     device: Device = "auto",
+    split: EvaluationSplit = "test",
     provider_factory: ProviderFactory | None = None,
 ) -> EmotionExperimentReport:
     """Evaluate a checkpoint on held-out items and retain aggregate metrics only."""
 
-    if not manifest.is_absolute() or not checkpoint.is_absolute():
+    if (
+        not manifest.is_absolute()
+        or not checkpoint.is_absolute()
+        or split not in ("validation", "test")
+    ):
         raise ValueError("invalid_experiment_manifest")
     try:
         manifest_payload = read_trusted_regular_file(manifest)
@@ -297,10 +304,10 @@ def evaluate_emotion_checkpoint(
         validate_disjoint_splits(items)
         if any(item.source != "emotion" or item.emotion is None for item in items):
             raise ValueError
-        test_items = tuple(item for item in items if item.split == "test")
-        if not test_items:
+        selected_items = tuple(item for item in items if item.split == split)
+        if not selected_items:
             raise ValueError
-        for item in test_items:
+        for item in selected_items:
             audio = read_trusted_regular_file(item.audio_path)
             if hashlib.sha256(audio).hexdigest() != item.sha256:
                 raise ValueError
@@ -323,7 +330,7 @@ def evaluate_emotion_checkpoint(
     rss: list[float] = []
     started = time.perf_counter()
     try:
-        for item in test_items:
+        for item in selected_items:
             try:
                 result = provider.analyze(item.id, Path(item.audio_path), "")
                 if result.usage is None:
@@ -353,9 +360,10 @@ def evaluate_emotion_checkpoint(
         model_id=provider.provenance.model,
         checkpoint_digest=revision,
         manifest_digest=hashlib.sha256(manifest_payload).hexdigest(),
-        test_count=len(test_items),
+        split=split,
+        item_count=len(selected_items),
         completed_count=len(expected),
-        completion_rate=len(expected) / len(test_items),
+        completion_rate=len(expected) / len(selected_items),
         macro_f1=macro_f1,
         per_label_f1=per_label_f1,
         confusion_matrix=matrix,
