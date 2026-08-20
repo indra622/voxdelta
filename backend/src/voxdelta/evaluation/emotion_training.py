@@ -857,6 +857,8 @@ def load_training_examples(manifest_path: str | Path) -> tuple[TrainingExample, 
         for item in items:
             if item.source != "emotion" or item.emotion is None:
                 raise ValueError
+            if item.split == "test":
+                continue
             audio_path = Path(item.audio_path)
             if not audio_path.is_absolute():
                 raise ValueError

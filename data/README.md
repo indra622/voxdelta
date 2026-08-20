@@ -291,7 +291,14 @@ print("partial-last4 stage B passed")
 The expected output is `partial-last4 stage B passed`. Any command or assertion failure is a failed
 experiment. Stop without trying another profile and keep the test split sealed.
 
-### Observed Stage A evidence (2026-08-21)
+### Observed Stage A evidence (2026-08-21; tainted historical quality evidence)
+
+The existing Stage A checkpoint and validation report are tainted historical quality evidence.
+Before the training-manifest boundary was fixed, it hashed, opened, and decoded all 210 smoke
+manifest audio records, including the 35 test records, before the XLS-R backend selected the 140
+train and 35 validation examples. The test records were not optimized or evaluated in this Stage A
+run, but their audio crossed the sealed-test boundary. Preserve these immutable artifacts as
+historical diagnostics only; they are not evidence of a contract-compliant sealed-test run.
 
 Stage A training completed with 50,649,095 trainable parameters out of 315,702,919 total
 parameters and published a schema-four `partial-last4` checkpoint after 218 seconds of observed
@@ -306,5 +313,6 @@ predicted-class count was below two. The checkpoint digest is
 `071d68100a50fe2e337c6a65086e4aa1719ae560d7c0cfae459257ef71be7e8a`; the validation-report
 SHA-256 is `3a5966aca59c2c50de603619c11dd1bd58d663c4ede0e12da3d58a68a265ea37`.
 The three immutable input fingerprints remained unchanged. Stage B was not run, no development
-artifact was created, and the test split remained sealed. This failure supports a separately
-designed LoRA or no-training baseline rather than another automatic profile change.
+artifact was created, and the test split did not remain sealed because the pre-fix loader decoded
+its 35 smoke records. This tainted failure supports a separately designed LoRA or no-training
+baseline rather than another automatic profile change.

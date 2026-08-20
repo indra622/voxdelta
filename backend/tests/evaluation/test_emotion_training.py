@@ -896,6 +896,112 @@ def test_manifest_training_boundary_passes_audio_only_and_exact_profile(tmp_path
     assert "transcript" not in repr(examples).lower()
 
 
+@pytest.mark.parametrize("architecture", ["wav2vec-xls-r", "emotion2vec-plus"])
+def test_manifest_training_never_loads_or_passes_test_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str
+) -> None:
+    import voxdelta.evaluation.emotion_training as training
+    from voxdelta.evaluation.emotion_training import (
+        CheckpointPayload,
+        Emotion2VecTrainingProfile,
+        TrainingExample,
+        Wav2VecTrainingProfile,
+        train_from_manifest,
+    )
+
+    rows = []
+    audio_paths: dict[str, Path] = {}
+    for split, label in [
+        ("train", "happiness"),
+        ("validation", "anger"),
+        ("test", "surprise"),
+    ]:
+        audio = _wav(tmp_path / f"{split}.wav", 0.5)
+        audio_paths[split] = audio.resolve()
+        rows.append(
+            {
+                "id": f"{split}-item",
+                "call_id": f"{split}-call",
+                "speaker_id": f"{split}-speaker",
+                "audio_path": str(audio.resolve()),
+                "transcript": f"{split}-transcript-secret",
+                "split": split,
+                "source": "emotion",
+                "emotion": label,
+                "sha256": hashlib.sha256(audio.read_bytes()).hexdigest(),
+            }
+        )
+    manifest = tmp_path / "emotion.jsonl"
+    manifest.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    opened_paths: list[Path] = []
+    decoded_paths: list[Path] = []
+    real_read = training.read_trusted_regular_file
+    real_load_audio = training.load_audio
+
+    def observed_read(path: str | Path) -> bytes:
+        opened_paths.append(Path(path).resolve())
+        return real_read(path)
+
+    def observed_load_audio(path: str | Path) -> training.AudioClip:
+        decoded_paths.append(Path(path).resolve())
+        return real_load_audio(path)
+
+    monkeypatch.setattr(training, "read_trusted_regular_file", observed_read)
+    monkeypatch.setattr(training, "load_audio", observed_load_audio)
+    observed_examples: list[tuple[TrainingExample, ...]] = []
+
+    def backend(examples: tuple[TrainingExample, ...], _profile: object) -> CheckpointPayload:
+        observed_examples.append(examples)
+        common = {
+            "architecture": architecture,
+            "model_id": (
+                "facebook/wav2vec2-xls-r-300m"
+                if architecture == "wav2vec-xls-r"
+                else "iic/emotion2vec_plus_large"
+            ),
+            "weights": b"weights",
+            "metrics": {"macro_f1": 1.0},
+            "validation_hash": "a" * 64,
+            "class_weighting": "inverse-frequency",
+            "class_weights": (1.0,) * 7,
+        }
+        if architecture == "wav2vec-xls-r":
+            return CheckpointPayload(
+                **common,
+                model_revision=WAV2VEC_REVISION,
+                base_model_sha256=WAV2VEC_WEIGHTS_SHA256,
+            )
+        return CheckpointPayload(
+            **common,
+            encoder_hash="b" * 64,
+            encoder_revision="v2.0.5",
+            freeze_encoder=True,
+            embedding_size=256,
+        )
+
+    profile = (
+        Wav2VecTrainingProfile(base_model_path=tmp_path.resolve())
+        if architecture == "wav2vec-xls-r"
+        else Emotion2VecTrainingProfile()
+    )
+    train_from_manifest(
+        manifest,
+        tmp_path / f"{architecture}-output",
+        profile=profile,
+        backend=backend,
+    )
+
+    assert audio_paths["test"] not in opened_paths
+    assert audio_paths["test"] not in decoded_paths
+    assert len(observed_examples) == 1
+    assert [item.split for item in observed_examples[0]] == ["train", "validation"]
+    assert all(item.id != "test-item" for item in observed_examples[0])
+
+
 def test_manifest_training_rejects_full_payload_for_partial_profile(tmp_path: Path) -> None:
     from voxdelta.evaluation.emotion_training import (
         CheckpointPayload,
