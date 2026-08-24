@@ -28,7 +28,7 @@ def _json(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
 
 
-def _oci_archive(path: Path, *, unsafe_history: bool = False) -> Path:
+def _oci_archive(path: Path, *, unsafe_history: bool = False, nested_index: bool = False) -> Path:
     blobs: dict[str, bytes] = {}
 
     def blob(payload: bytes) -> str:
@@ -77,12 +77,14 @@ def _oci_archive(path: Path, *, unsafe_history: bool = False) -> Path:
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {"digest": blob(b"{}")},
             "layers": [{"digest": sbom_digest}],
+            "subject": {"digest": image_digest},
         }
     )
     attestation_digest = blob(attestation_manifest)
     index = _json(
         {
             "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
             "manifests": [
                 {
                     "digest": image_digest,
@@ -91,11 +93,28 @@ def _oci_archive(path: Path, *, unsafe_history: bool = False) -> Path:
                 {
                     "digest": attestation_digest,
                     "platform": {"os": "unknown", "architecture": "unknown"},
-                    "annotations": {"vnd.docker.reference.type": "attestation-manifest"},
+                    "annotations": {
+                        "vnd.docker.reference.type": "attestation-manifest",
+                        "vnd.docker.reference.digest": image_digest,
+                    },
                 },
             ],
         }
     )
+    if nested_index:
+        nested_digest = blob(index)
+        index = _json(
+            {
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [
+                    {
+                        "mediaType": "application/vnd.oci.image.index.v1+json",
+                        "digest": nested_digest,
+                    }
+                ],
+            }
+        )
 
     def add(stream: tarfile.TarFile, name: str, payload: bytes) -> None:
         info = tarfile.TarInfo(name)
@@ -123,6 +142,15 @@ def test_inspect_oci_archive_verifies_manifest_labels_and_spdx(tmp_path: Path) -
     assert evidence.git_commit == GIT_COMMIT
     assert evidence.lock_sha256 == LOCK_SHA256
     assert evidence.sbom == {"spdxVersion": "SPDX-2.3", "name": "voxdelta-runpod"}
+
+    nested = _oci_archive(tmp_path / "nested.tar", nested_index=True).resolve()
+    nested_evidence = inspect_oci_archive(
+        nested,
+        expected_git_commit=GIT_COMMIT,
+        expected_lock_sha256=LOCK_SHA256,
+    )
+    index = json.loads(tarfile.open(nested).extractfile("index.json").read())
+    assert nested_evidence.manifest_digest == index["manifests"][0]["digest"]
 
 
 def test_inspect_oci_archive_rejects_sensitive_build_history(tmp_path: Path) -> None:

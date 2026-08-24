@@ -79,11 +79,20 @@ class _OciReader:
         except (OSError, tarfile.TarError):
             raise ImageHandoffError("invalid_oci_archive") from None
         members = self._tar.getmembers()
-        if any(not _safe_member(member.name) or not member.isfile() for member in members):
-            self._tar.close()
-            raise ImageHandoffError("invalid_oci_archive")
-        self._members = {member.name: member for member in members}
-        if len(self._members) != len(members):
+        files: list[tarfile.TarInfo] = []
+        for member in members:
+            normalized = member.name.rstrip("/")
+            if not _safe_member(member.name):
+                self._tar.close()
+                raise ImageHandoffError("invalid_oci_archive")
+            if member.isdir() and normalized in {"blobs", "blobs/sha256"}:
+                continue
+            if not member.isfile():
+                self._tar.close()
+                raise ImageHandoffError("invalid_oci_archive")
+            files.append(member)
+        self._members = {member.name: member for member in files}
+        if len(self._members) != len(files):
             self._tar.close()
             raise ImageHandoffError("invalid_oci_archive")
         return self
@@ -141,7 +150,28 @@ def _image_descriptor(manifests: object) -> dict[str, Any]:
     return candidates[0]
 
 
-def _extract_sbom(reader: _OciReader, manifests: object) -> Mapping[str, Any]:
+def _manifest_set(reader: _OciReader, index: Mapping[str, Any]) -> tuple[str, object]:
+    manifests = index.get("manifests")
+    if not isinstance(manifests, list) or not manifests:
+        raise ImageHandoffError("invalid_oci_archive")
+    if len(manifests) == 1 and isinstance(manifests[0], dict):
+        descriptor = manifests[0]
+        if descriptor.get("mediaType") == "application/vnd.oci.image.index.v1+json":
+            root_digest = _descriptor_digest(descriptor)
+            nested = _json_object(reader.blob(root_digest))
+            if nested.get("mediaType") != "application/vnd.oci.image.index.v1+json":
+                raise ImageHandoffError("invalid_oci_archive")
+            return root_digest, nested.get("manifests")
+    image = _image_descriptor(manifests)
+    return _descriptor_digest(image), manifests
+
+
+def _extract_sbom(
+    reader: _OciReader,
+    manifests: object,
+    *,
+    image_manifest_digest: str,
+) -> Mapping[str, Any]:
     if not isinstance(manifests, list):
         raise ImageHandoffError("invalid_image_sbom")
     predicates: list[Mapping[str, Any]] = []
@@ -153,7 +183,12 @@ def _extract_sbom(reader: _OciReader, manifests: object) -> Mapping[str, Any]:
             continue
         if annotations.get("vnd.docker.reference.type") != _ATTESTATION_TYPE:
             continue
+        if annotations.get("vnd.docker.reference.digest") != image_manifest_digest:
+            raise ImageHandoffError("invalid_image_sbom")
         attestation = _json_object(reader.blob(_descriptor_digest(descriptor)))
+        subject = attestation.get("subject")
+        if not isinstance(subject, dict) or subject.get("digest") != image_manifest_digest:
+            raise ImageHandoffError("invalid_image_sbom")
         layers = attestation.get("layers")
         if not isinstance(layers, list):
             raise ImageHandoffError("invalid_image_sbom")
@@ -181,10 +216,10 @@ def inspect_oci_archive(
         raise ImageHandoffError("invalid_build_identity")
     with _OciReader(archive) as reader:
         index = _json_object(reader.read("index.json"))
-        manifests = index.get("manifests")
+        root_digest, manifests = _manifest_set(reader, index)
         image_descriptor = _image_descriptor(manifests)
-        manifest_digest = _descriptor_digest(image_descriptor)
-        manifest = _json_object(reader.blob(manifest_digest))
+        image_manifest_digest = _descriptor_digest(image_descriptor)
+        manifest = _json_object(reader.blob(image_manifest_digest))
         config_digest = _descriptor_digest(manifest.get("config"))
         config = _json_object(reader.blob(config_digest))
         labels = config.get("config", {}).get("Labels", {})
@@ -202,9 +237,13 @@ def inspect_oci_archive(
         history_text = json.dumps(history, sort_keys=True, separators=(",", ":"))
         if _FORBIDDEN_HISTORY.search(history_text):
             raise ImageHandoffError("unsafe_image_history")
-        sbom = _extract_sbom(reader, manifests)
+        sbom = _extract_sbom(
+            reader,
+            manifests,
+            image_manifest_digest=image_manifest_digest,
+        )
     return OciImageEvidence(
-        manifest_digest=manifest_digest,
+        manifest_digest=root_digest,
         config_digest=config_digest,
         git_commit=expected_git_commit,
         lock_sha256=expected_lock_sha256,

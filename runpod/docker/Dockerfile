@@ -36,14 +36,18 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 
 WORKDIR /opt/voxdelta
 COPY backend/pyproject.toml backend/uv.lock ./backend/
-COPY backend/src ./backend/src
 COPY runpod/pyproject.toml runpod/uv.lock ./runpod/
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --project runpod --frozen --no-dev --no-editable --no-install-project
+
+COPY backend/src ./backend/src
 COPY runpod/src ./runpod/src
 COPY runpod/config ./runpod/config
 COPY runpod/scripts ./runpod/scripts
 
-RUN uv sync --project runpod --frozen --no-dev --no-editable \
-    && uv cache clean \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --project runpod --frozen --no-dev --no-editable \
     && find /opt/voxdelta -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 WORKDIR /workspace/voxdelta
