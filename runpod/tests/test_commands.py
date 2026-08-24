@@ -20,6 +20,7 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     root.mkdir(mode=0o700)
     (root / "train-validation.tar.zst").write_bytes(b"archive")
     (root / "train-validation.sidecar.json").write_text("{}")
+    (root / "image-digest.txt").write_text(f"sha256:{'a' * 64}\n")
     scripts = render_operator_commands(root, run_id="run-622")
     update_checksums(
         root,
@@ -27,6 +28,7 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
             *scripts,
             root / "train-validation.tar.zst",
             root / "train-validation.sidecar.json",
+            root / "image-digest.txt",
         ),
     )
 

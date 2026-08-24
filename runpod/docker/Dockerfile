@@ -8,6 +8,7 @@ FROM ${BASE_IMAGE}
 
 ARG VOXDELTA_GIT_COMMIT
 ARG VOXDELTA_RUNPOD_LOCK_SHA256
+ARG VOXDELTA_CODE_SHA256
 
 LABEL org.opencontainers.image.title="VoxDelta RunPod XLS-R trainer" \
       org.opencontainers.image.revision="${VOXDELTA_GIT_COMMIT}" \
@@ -19,7 +20,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    PATH="/opt/voxdelta/runpod/.venv/bin:${PATH}"
+    PATH="/opt/voxdelta/runpod/.venv/bin:${PATH}" \
+    VOXDELTA_CODE_SHA256="${VOXDELTA_CODE_SHA256}" \
+    VOXDELTA_GIT_COMMIT="${VOXDELTA_GIT_COMMIT}"
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

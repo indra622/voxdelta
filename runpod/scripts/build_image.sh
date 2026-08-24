@@ -18,6 +18,7 @@ if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=all)" ]]; then
 fi
 
 git_commit="$(git -C "$repo" rev-parse HEAD)"
+code_sha="$(git -C "$repo" archive --format=tar HEAD | shasum -a 256 | awk '{print $1}')"
 lock_sha="$(shasum -a 256 "$runpod/uv.lock" | awk '{print $1}')"
 temporary="$(mktemp -d "${TMPDIR:-/tmp}/voxdelta-build.XXXXXX")"
 trap 'rm -rf -- "$temporary"' EXIT
@@ -27,6 +28,7 @@ docker buildx build \
   --file "$runpod/docker/Dockerfile" \
   --platform linux/amd64 \
   --build-arg "VOXDELTA_GIT_COMMIT=$git_commit" \
+  --build-arg "VOXDELTA_CODE_SHA256=$code_sha" \
   --build-arg "VOXDELTA_RUNPOD_LOCK_SHA256=$lock_sha" \
   --provenance=mode=max \
   --sbom=true \

@@ -4,6 +4,10 @@
 형식과 전달물 경계를 고정한다. 실제 구현이 완료되면 에이전트가 이 형식으로
 `runpod/dist/<run-id>/` 아래에 값이 채워진 단계별 명령 파일을 만든다.
 
+이미지와 학습 데이터는 각각 비공개 임시 sub-packet으로 만든 뒤
+`scripts/assemble_handoff.py`가 허용된 파일만 hard-link(불가능하면 private copy)하여
+`runpod/dist/<run-id>/`에 원자적으로 조립하고 `SHA256SUMS`를 새로 계산한다.
+
 여기 있는 `<...>` 표시는 설명용이다. 플레이스홀더가 남아 있는 예시를 실행하지
 말고, 에이전트가 생성하고 checksum을 검증한 명령 패킷만 실행한다. SSH 주소,
 registry token, private key, 허가 증빙은 Discord에 올리지 않는다.

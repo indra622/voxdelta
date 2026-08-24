@@ -111,3 +111,32 @@ There are five explicit manual handoffs:
 
 Command packets are stage-specific. A retry or resume packet never authorizes a later
 stage, and the final holdout never appears in the training packet.
+
+## Local Build Order
+
+Run these from the repository root. Use private absolute paths outside Git for the source
+manifest, authorization marker, and generated packets.
+
+```bash
+run_id='xlsr-622-v1'
+uv run --project runpod python runpod/scripts/preflight_local.py \
+  --config "$(pwd)/runpod/config/experiment.toml" \
+  --manifest '<absolute-source-manifest>' \
+  --exposed-manifest '<absolute-exposed-manifest>' \
+  --authorization-marker '<absolute-private-marker>' \
+  --repository "$(pwd)"
+bash runpod/scripts/build_image.sh "$run_id-image"
+uv run --project runpod python runpod/scripts/package_data.py training \
+  --config "$(pwd)/runpod/config/experiment.toml" \
+  --manifest '<absolute-source-manifest>' \
+  --output "$(pwd)/runpod/packages/$run_id-training"
+uv run --project runpod python runpod/scripts/assemble_handoff.py \
+  --image-root "$(pwd)/runpod/dist/$run_id-image" \
+  --training-root "$(pwd)/runpod/packages/$run_id-training" \
+  --output "$(pwd)/runpod/dist/$run_id" \
+  --run-id "$run_id"
+```
+
+The resulting `runpod/dist/<run-id>/` is the only training handoff. Candidate freeze and
+final packaging use `freeze_candidate.py` and `package_final_holdout.py`; final retrieval
+is accepted only after `verify_retrieved_results.py final` emits `deletion_ready`.

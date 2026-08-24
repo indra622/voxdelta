@@ -37,6 +37,9 @@ def _scripts() -> dict[str, str]:
         "01-preflight-and-pilot.sh": _header()
         + """
 cd "$root"; shasum -a 256 -c SHA256SUMS
+image_digest="$(tr -d '\n' < image-digest.txt)"
+[[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo image_digest_error >&2; exit 65; }
+container_sha256="${image_digest#sha256:}"
 ssh "${ssh_args[@]}" "$user@$host" "install -d -m 700 '$remote/incoming' '$remote/results'"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   train-validation.tar.zst train-validation.sidecar.json "$user@$host:$remote/incoming/"
@@ -44,7 +47,8 @@ ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/preflight_remote.py \
   --config /opt/voxdelta/runpod/config/experiment.toml \
   --archive '$remote/incoming/train-validation.tar.zst' \
-  --sidecar '$remote/incoming/train-validation.sidecar.json' --data-root '$remote/data'"
+  --sidecar '$remote/incoming/train-validation.sidecar.json' --data-root '$remote/data' \
+  --container-sha256 '$container_sha256'"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_experiment.py \
   pilot --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote'"
@@ -60,15 +64,21 @@ ssh "${ssh_args[@]}" "$user@$host" \
         "03-download-results.sh": _header()
         + """
 install -d -m 700 "$root/results/full"
+install -d -m 700 "$root/evidence/full"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/full/" "$root/results/full/"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/ledger/" "$root/evidence/full/ledger/"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/state/run-identity.json" "$root/evidence/full/run-identity.json"
 """,
         "04-final-once.sh": _header()
         + """
 cd "$root"; shasum -a 256 -c SHA256SUMS
 ssh "${ssh_args[@]}" "$user@$host" "install -d -m 700 '$remote/incoming/final'"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
-  final-holdout.tar.zst final-holdout.sidecar.json "$user@$host:$remote/incoming/final/"
+  final-holdout.tar.zst final-holdout.sidecar.json frozen-candidate.json \
+  "$user@$host:$remote/incoming/final/"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/evaluate_final.py \
   --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote'"
@@ -76,8 +86,13 @@ ssh "${ssh_args[@]}" "$user@$host" \
         "05-download-final.sh": _header()
         + """
 install -d -m 700 "$root/results/final"
+install -d -m 700 "$root/evidence/final"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/final/" "$root/results/final/"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/ledger/" "$root/evidence/final/ledger/"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/state/run-identity.json" "$root/evidence/final/run-identity.json"
 """,
     }
 

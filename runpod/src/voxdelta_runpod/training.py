@@ -24,6 +24,7 @@ from voxdelta.evaluation.emotion_training import (
     load_audio,
     load_wav2vec_components,
 )
+from voxdelta.providers.wav2vec_emotion import Wav2VecEmotionProvider
 
 from voxdelta_runpod.checkpoint import (
     CheckpointStage,
@@ -306,7 +307,9 @@ def _load_runtime(
         return _Runtime(torch, transformers, safetensors, extractor, model, optimizer, scheduler)
     except TrainingRuntimeError:
         raise
-    except Exception:
+    except Exception as error:
+        if "torch" in locals() and isinstance(error, torch.cuda.OutOfMemoryError):
+            raise
         raise TrainingRuntimeError("training_runtime_unavailable") from None
 
 
@@ -441,6 +444,176 @@ def publish_provider_checkpoint(
     return output
 
 
+def _memory_probe_plan(plan: RecipePlan) -> RecipePlan:
+    train = tuple(
+        item
+        for label in CANONICAL_LABELS
+        for item in tuple(record for record in plan.train if record.emotion == label)[:2]
+    )
+    validation = tuple(
+        next(record for record in plan.validation if record.emotion == label)
+        for label in CANONICAL_LABELS
+    )
+    if len(train) != 14 or len(validation) != 7:
+        raise TrainingRuntimeError("invalid_memory_probe_slice")
+    return RecipePlan(
+        name=plan.name,
+        scope="pilot",
+        sampler=plan.sampler,
+        epoch_draws=len(train),
+        loss_weights=plan.loss_weights,
+        train=train,
+        validation=validation,
+        train_manifest_sha256=hashlib.sha256(
+            b"".join(record.model_dump_json().encode() for record in train)
+        ).hexdigest(),
+        validation_manifest_sha256=hashlib.sha256(
+            b"".join(record.model_dump_json().encode() for record in validation)
+        ).hexdigest(),
+    )
+
+
+def run_memory_probe_attempt(
+    plan: RecipePlan,
+    audio_root: Path,
+    base_model_path: Path,
+    output_root: Path,
+    identity: RunIdentity,
+    config: ExperimentConfig,
+    batch_profile: BatchProfile,
+) -> None:
+    """Exercise synthetic and actual data, checkpoint publication, and provider reload."""
+
+    if output_root.exists() or not all(
+        path.is_absolute() for path in (audio_root, base_model_path, output_root)
+    ):
+        raise TrainingRuntimeError("invalid_memory_probe_paths")
+    probe = _memory_probe_plan(plan)
+    runtime = _load_runtime(base_model_path, config, batch_profile, total_steps=2)
+    torch = runtime.torch
+    torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+    random.seed(config.seed)
+    output_root.mkdir(mode=0o700, parents=True)
+
+    synthetic = AudioClip(
+        samples=(0.0,) * (config.training.sample_rate * config.training.window_seconds)
+    )
+    labels = torch.tensor(
+        [index % len(CANONICAL_LABELS) for index in range(batch_profile.micro_batch_size)],
+        dtype=torch.long,
+        device="cuda",
+    )
+    runtime.model.train()
+    runtime.optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        synthetic_batch = [synthetic] * batch_profile.micro_batch_size
+        logits = runtime.model(**_inputs(runtime, synthetic_batch)).logits
+        loss = torch.nn.functional.cross_entropy(logits.float(), labels)
+    if not bool(torch.isfinite(logits).all()) or not bool(torch.isfinite(loss)):
+        raise TrainingRuntimeError("nonfinite_training_state")
+    loss.backward()
+    runtime.optimizer.zero_grad(set_to_none=True)
+
+    ordered = deterministic_epoch_records(probe, seed=config.seed, epoch=0)
+    batches = _batches(ordered, batch_profile.micro_batch_size)
+    for batch_index, batch in enumerate(batches, start=1):
+        clips = [_clip_for_record(audio_root, record, config, 0) for record in batch]
+        actual_labels = torch.tensor(
+            [CANONICAL_LABELS.index(record.emotion) for record in batch],
+            dtype=torch.long,
+            device="cuda",
+        )
+        weights = torch.tensor(probe.loss_weights, dtype=torch.float32, device="cuda")
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            actual_logits = runtime.model(**_inputs(runtime, clips)).logits
+            actual_loss = torch.nn.functional.cross_entropy(
+                actual_logits.float(), actual_labels, weight=weights
+            )
+        if not bool(torch.isfinite(actual_logits).all()) or not bool(torch.isfinite(actual_loss)):
+            raise TrainingRuntimeError("nonfinite_training_state")
+        (actual_loss / batch_profile.gradient_accumulation_steps).backward()
+        if batch_index % batch_profile.gradient_accumulation_steps == 0 or batch_index == len(
+            batches
+        ):
+            torch.nn.utils.clip_grad_norm_(
+                runtime.model.parameters(), config.training.gradient_clip_norm
+            )
+            runtime.optimizer.step()
+            runtime.scheduler.step()
+            runtime.optimizer.zero_grad(set_to_none=True)
+
+    metrics = _evaluate(runtime, probe, audio_root, batch_profile.micro_batch_size)
+    weights_payload = _serialize_model(runtime)
+    payloads = {
+        "model.safetensors": weights_payload,
+        "best-model.safetensors": weights_payload,
+        "optimizer.pt": _torch_bytes(torch, runtime.optimizer.state_dict()),
+        "scheduler.pt": _torch_bytes(torch, runtime.scheduler.state_dict()),
+        "rng-python.json": json.dumps(random.getstate(), separators=(",", ":")).encode(),
+        "rng-torch-cpu.pt": _torch_bytes(torch, torch.random.get_rng_state()),
+        "rng-torch-cuda.pt": _torch_bytes(torch, torch.cuda.get_rng_state_all()),
+    }
+    state = CheckpointState(
+        stage=probe.name,
+        epoch=0,
+        optimizer_step=1,
+        best_metric=metrics.macro_f1,
+        best_epoch=0,
+        patience_used=0,
+        micro_batch_size=batch_profile.micro_batch_size,
+        gradient_accumulation_steps=batch_profile.gradient_accumulation_steps,
+        identity=identity,
+        files={name: hashlib.sha256(payload).hexdigest() for name, payload in payloads.items()},
+    )
+    publish_epoch_checkpoint(output_root / "checkpoint", state, payloads)
+    provider_root = publish_provider_checkpoint(
+        output_root / "provider", weights_payload, probe, metrics, config
+    )
+    del runtime
+    torch.cuda.empty_cache()
+    provider = Wav2VecEmotionProvider(
+        provider_root,
+        base_model_path=base_model_path,
+        device="cuda",
+    )
+    provider_digest: str | None = None
+    try:
+        for record in probe.validation:
+            provider.analyze(record.item_key, audio_root / record.audio_path, "")
+        provider_digest = provider.provenance.revision
+    finally:
+        provider.unload()
+    if provider_digest is None:
+        raise TrainingRuntimeError("memory_probe_provider_reload_failed")
+    shutil.rmtree(output_root / "checkpoint")
+    shutil.rmtree(output_root / "provider")
+    evidence = {
+        "schema_version": "1",
+        "micro_batch_size": batch_profile.micro_batch_size,
+        "gradient_accumulation_steps": batch_profile.gradient_accumulation_steps,
+        "validation_count": metrics.completed_count,
+        "macro_f1": metrics.macro_f1,
+        "provider_checkpoint_sha256": provider_digest,
+    }
+    with (output_root / "probe-evidence.json").open("xb") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(
+            (
+                json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+            ).encode()
+        )
+
+
+def _prune_superseded_checkpoints(root: Path, current: Path) -> None:
+    for path in root.iterdir():
+        if path == current:
+            continue
+        if path.is_symlink() or not path.is_dir() or not path.name.startswith("epoch-"):
+            raise TrainingRuntimeError("invalid_checkpoint_prune_target")
+        shutil.rmtree(path)
+
+
 def run_cuda_training(
     plan: RecipePlan,
     audio_root: Path,
@@ -476,6 +649,8 @@ def run_cuda_training(
     best_epoch = 0
     best_model = b""
     stale_epochs = 0
+    last_metrics: EpochMetrics | None = None
+    last_checkpoint: Path | None = None
     expected_stage: CheckpointStage = plan.name if plan.scope == "pilot" else "full"
     if resume:
         selection = select_resume_checkpoint(
@@ -526,10 +701,23 @@ def run_cuda_training(
             best_metric = state.best_metric
             best_epoch = state.best_epoch
             stale_epochs = state.patience_used
+            last_checkpoint = selection.checkpoint
         if selection.incomplete_checkpoint is not None:
             shutil.rmtree(selection.incomplete_checkpoint)
-    last_metrics: EpochMetrics | None = None
-    last_checkpoint: Path | None = None
+    if last_checkpoint is not None and (
+        start_epoch >= max_epochs or stale_epochs >= config.training.early_stopping_patience
+    ):
+        runtime.model.load_state_dict(runtime.safetensors.load(best_model))
+        recovered_metrics = _evaluate(runtime, plan, audio_root, batch_profile.micro_batch_size)
+        if abs(recovered_metrics.macro_f1 - best_metric) > 1e-12:
+            raise TrainingRuntimeError("best_checkpoint_mismatch")
+        return TrainingResult(
+            best_epoch=best_epoch,
+            epochs_completed=start_epoch,
+            optimizer_steps=optimizer_steps,
+            metrics=recovered_metrics,
+            checkpoint_path=last_checkpoint,
+        )
     for epoch in range(start_epoch, max_epochs):
         runtime.model.train()
         ordered = deterministic_epoch_records(plan, seed=config.seed, epoch=epoch)
@@ -603,6 +791,7 @@ def run_cuda_training(
             files={name: hashlib.sha256(payload).hexdigest() for name, payload in payloads.items()},
         )
         last_checkpoint = publish_epoch_checkpoint(checkpoint_root, state, payloads)
+        _prune_superseded_checkpoints(checkpoint_root, last_checkpoint)
         last_metrics = metrics
         if stale_epochs >= config.training.early_stopping_patience:
             break
@@ -636,5 +825,6 @@ __all__ = [
     "publish_provider_checkpoint",
     "run_cuda_training",
     "run_isolated_memory_probe",
+    "run_memory_probe_attempt",
     "validate_cuda_runtime",
 ]

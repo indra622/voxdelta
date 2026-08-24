@@ -11,7 +11,7 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from voxdelta.domain.models import EmotionLabel
-from voxdelta.evaluation.manifest import DatasetItem, load_manifest
+from voxdelta.evaluation.manifest import DatasetItem, load_manifest, read_trusted_regular_file
 
 from voxdelta_runpod.config import CANONICAL_LABELS
 from voxdelta_runpod.package import SanitizedRecord, opaque_item_key
@@ -146,6 +146,151 @@ def _source_items(source_manifest: Path) -> list[DatasetItem]:
     return items
 
 
+def _packaged_records(source_manifest: Path) -> list[SanitizedRecord]:
+    if not source_manifest.is_absolute():
+        raise RecipeError("invalid_recipe_manifest")
+    try:
+        records = [
+            SanitizedRecord.model_validate_json(line)
+            for line in read_trusted_regular_file(source_manifest).splitlines()
+            if line.strip()
+        ]
+    except Exception:
+        raise RecipeError("invalid_recipe_manifest") from None
+    if (
+        not records
+        or len({record.item_key for record in records}) != len(records)
+        or len({record.audio_sha256 for record in records}) != len(records)
+    ):
+        raise RecipeError("duplicate_recipe_item")
+    return records
+
+
+def _record_rank(record: SanitizedRecord, seed: int, purpose: str) -> tuple[str, str]:
+    payload = f"{seed}\0{purpose}\0{record.audio_sha256}".encode()
+    return hashlib.sha256(payload).hexdigest(), record.audio_sha256
+
+
+def _record_digest(records: tuple[SanitizedRecord, ...]) -> str:
+    return hashlib.sha256(
+        b"".join(
+            (
+                json.dumps(
+                    record.model_dump(mode="json"),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode()
+            for record in records
+        )
+    ).hexdigest()
+
+
+def build_pilot_plans_from_package(source_manifest: Path, *, seed: int = 622) -> PilotPlans:
+    """Build the frozen pilots from the privacy-minimized remote manifest."""
+
+    if isinstance(seed, bool) or seed <= 0:
+        raise RecipeError("invalid_recipe_seed")
+    records = _packaged_records(source_manifest)
+    validation: list[SanitizedRecord] = []
+    pilot_a_train: list[SanitizedRecord] = []
+    pilot_b_train: list[SanitizedRecord] = []
+    for label in CANONICAL_LABELS:
+        train = [
+            record for record in records if record.split == "train" and record.emotion == label
+        ]
+        label_validation = [
+            record for record in records if record.split == "validation" and record.emotion == label
+        ]
+        label_validation.sort(key=lambda record: _record_rank(record, seed, "shared-validation"))
+        train_a = sorted(train, key=lambda record: _record_rank(record, seed, "pilot-a"))
+        train_b = sorted(train, key=lambda record: _record_rank(record, seed, "pilot-b"))
+        if len(label_validation) < 50 or len(train_a) < 500 or len(train_b) < PILOT_B_COUNTS[label]:
+            raise RecipeError("invalid_recipe_counts")
+        validation.extend(label_validation[:50])
+        pilot_a_train.extend(train_a[:500])
+        pilot_b_train.extend(train_b[: PILOT_B_COUNTS[label]])
+    validation_records = tuple(validation)
+    a_records = tuple(pilot_a_train)
+    b_records = tuple(pilot_b_train)
+    validation_digest = _record_digest(validation_records)
+    pilot_b_counts = Counter(record.emotion for record in b_records)
+    return PilotPlans(
+        pilot_a=RecipePlan(
+            name="pilot-a",
+            scope="pilot",
+            sampler="class-balanced-with-replacement",
+            epoch_draws=3_500,
+            loss_weights=(1.0,) * len(CANONICAL_LABELS),
+            train=a_records,
+            validation=validation_records,
+            train_manifest_sha256=_record_digest(a_records),
+            validation_manifest_sha256=validation_digest,
+        ),
+        pilot_b=RecipePlan(
+            name="pilot-b",
+            scope="pilot",
+            sampler="uniform-without-replacement",
+            epoch_draws=3_500,
+            loss_weights=square_root_class_weights(
+                {label: pilot_b_counts[label] for label in CANONICAL_LABELS}
+            ),
+            train=b_records,
+            validation=validation_records,
+            train_manifest_sha256=_record_digest(b_records),
+            validation_manifest_sha256=validation_digest,
+        ),
+    )
+
+
+def expand_full_recipe_from_package(
+    source_manifest: Path,
+    winner: RecipeName,
+    *,
+    seed: int = 622,
+) -> RecipePlan:
+    """Expand the selected recipe without recovering any original identifiers."""
+
+    records = _packaged_records(source_manifest)
+    train = tuple(
+        sorted(
+            (record for record in records if record.split == "train"),
+            key=lambda record: _record_rank(record, seed, f"{winner}-full"),
+        )
+    )
+    validation = tuple(
+        sorted(
+            (record for record in records if record.split == "validation"),
+            key=lambda record: _record_rank(record, seed, "full-validation"),
+        )
+    )
+    if len(train) != 29_476 or len(validation) != 3_569:
+        raise RecipeError("invalid_full_recipe_counts")
+    counts = Counter(record.emotion for record in train)
+    if winner == "pilot-a":
+        sampler: SamplerKind = "class-balanced-with-replacement"
+        loss_weights = (1.0,) * len(CANONICAL_LABELS)
+    elif winner == "pilot-b":
+        sampler = "uniform-without-replacement"
+        loss_weights = square_root_class_weights(
+            {label: counts[label] for label in CANONICAL_LABELS}
+        )
+    else:
+        raise RecipeError("invalid_recipe_winner")
+    return RecipePlan(
+        name=winner,
+        scope="full",
+        sampler=sampler,
+        epoch_draws=len(train),
+        loss_weights=loss_weights,
+        train=train,
+        validation=validation,
+        train_manifest_sha256=_record_digest(train),
+        validation_manifest_sha256=_record_digest(validation),
+    )
+
+
 def build_pilot_plans(source_manifest: Path, *, seed: int = 622) -> PilotPlans:
     if isinstance(seed, bool) or seed <= 0:
         raise RecipeError("invalid_recipe_seed")
@@ -249,6 +394,8 @@ __all__ = [
     "RecipePlan",
     "SamplerKind",
     "build_pilot_plans",
+    "build_pilot_plans_from_package",
     "expand_full_recipe",
+    "expand_full_recipe_from_package",
     "square_root_class_weights",
 ]
