@@ -12,6 +12,7 @@ data/
 checkpoints/
 results/
 logs/
+dist/
 
 # Downloaded models, caches, and Python tooling.
 models/

@@ -7,6 +7,11 @@ the approved AI Hub train/validation corpus, select one of two frozen pilot reci
 fine-tune the pinned XLS-R 300M model, enforce the validation gate, and perform one sealed
 3,585-item final comparison only after an explicit user handoff.
 
+All live registry, SSH, `rsync`, RunPod, and deletion commands are executed manually by
+the user. The agent produces the Docker image definition and verified handoff packets,
+generates exact commands, and evaluates returned aggregate evidence; it does not log in to
+or operate the user's RunPod account.
+
 The scientific constants and gates come from the approved design. This plan is an
 execution work order, not a mandatory Superpowers procedure. Implementation should use
 small reviewable commits and normal tests; debugging and completion verification use the
@@ -42,7 +47,22 @@ tag-only image identities in tracked configuration.
 Tests prove exact defaults, unknown-field rejection, digest stability, and secret/path
 rejection.
 
-### 2. Local audit and privacy-minimized packaging
+### 2. Docker image and manual command handoff
+
+Create `runpod/docker/Dockerfile`, `.dockerignore`, build/inspect/smoke scripts, and the
+generator for `runpod/dist/<run-id>/push-image.sh`. The image is linux/amd64 CUDA, starts
+from an approved digest rather than a mutable tag, installs only the frozen RunPod/backend
+environment, and records the Git and lock identities. BuildKit secrets may be mounted for
+private registry operations but may never appear in an image layer or build metadata.
+
+The agent builds and smoke-tests a portable OCI archive, emits an SBOM and immutable
+expected manifest digest, and creates the user's digest-preserving registry
+push/digest-check command. The user authenticates, pushes, and selects the verified digest
+in RunPod. Tests inspect the image history/context allowlist and prove that audio,
+manifests, `.env`, keys, checkpoints, results, and local paths cannot enter the build
+context.
+
+### 3. Local audit and privacy-minimized packaging
 
 Implement `src/voxdelta_runpod/package.py` and a local `scripts/package_data.py` CLI.
 Reuse canonical backend manifest/audio validation while keeping all RunPod-specific
@@ -55,7 +75,7 @@ holdout audio. Tests cover exact counts, five exposed fingerprints per label, fi
 allowlisting, deterministic digests, private modes, non-overwrite, symlink/path-traversal
 rejection, and absence of transcripts or original identifiers.
 
-### 3. Immutable ledger and recovery checkpoints
+### 4. Immutable ledger and recovery checkpoints
 
 Implement `src/voxdelta_runpod/ledger.py` and `checkpoint.py`. Record configuration, code,
 container, base-model, archive, manifest, sampler, and report digests with legal stage
@@ -66,7 +86,7 @@ epoch, optimizer step, best metric, patience state, and batch profile.
 Tests cover interrupted publication, highest-complete-epoch selection, digest mismatch,
 wrong-stage recovery, existing-target refusal, and at-most-one-incomplete-epoch replay.
 
-### 4. Deterministic pilot manifests and recipes
+### 5. Deterministic pilot manifests and recipes
 
 Implement `src/voxdelta_runpod/recipes.py`. Freeze the shared balanced 350-item validation
 subset. Pilot A uses 500 train items per label, a class-balanced sampler, and unweighted
@@ -78,7 +98,7 @@ Tests prove sample counts, no train/validation overlap, stable ordering/digests,
 weights, train-only weight derivation, and the invariant that balanced sampling and
 non-uniform loss weights never coexist.
 
-### 5. CUDA full-training runtime
+### 6. CUDA full-training runtime
 
 Implement `src/voxdelta_runpod/training.py` on top of the backend checkpoint/provider
 contracts. Use full XLS-R parameter training, BF16 autocast, gradient checkpointing,
@@ -93,7 +113,7 @@ evaluation. Tests use fake CUDA/training backends and assert exact parameter gro
 precision, process isolation, OOM fallback, finite-state checks, and ordinary PEFT-free
 provider reload.
 
-### 6. Mechanical gates and sealed final comparison
+### 7. Mechanical gates and sealed final comparison
 
 Implement `src/voxdelta_runpod/gates.py`. Encode pilot eligibility, deterministic winner
 selection, the full validation threshold, and the frozen final comparison without operator
@@ -105,12 +125,13 @@ Tests cover every threshold boundary and tie-breaker, all failed-gate stop paths
 tampering, one-time final use, exact 3,585 completion for both providers, and promotion
 only when the frozen rule passes.
 
-### 7. Local/remote orchestration CLIs
+### 8. Local/remote orchestration CLIs
 
 Add narrowly scoped scripts:
 
 - `scripts/preflight_local.py`: audit/package/config/code checks with aggregate summary;
-- `scripts/render_operator_commands.py`: exact Pod requirements and SSH/rsync commands;
+- `scripts/render_operator_commands.py`: stage-specific registry, SSH, `rsync`, remote
+  execution, resume, and result-download command packets matching `OPERATOR.md`;
 - `scripts/preflight_remote.py`: image/GPU/storage/base/code/archive verification;
 - `scripts/run_experiment.py`: `pilot`, `full`, and safe `resume` stages;
 - `scripts/freeze_candidate.py`: publish validation decision and holdout capability;
@@ -119,10 +140,11 @@ Add narrowly scoped scripts:
 - `scripts/verify_retrieved_results.py`: local digest, ledger, privacy, and provider checks.
 
 CLIs return stable non-sensitive error codes, refuse overwrite, and never print private
-paths, item identities, credentials, raw predictions, or evidence contents. Live transfer,
-training, holdout, and deletion are never hidden inside one all-powerful command.
+paths, item identities, credentials, raw predictions, or evidence contents. The user runs
+all generated live commands manually. Training, full/resume, final holdout, and result
+download remain separate packets rather than one all-powerful command.
 
-### 8. Synthetic end-to-end and repository integration
+### 9. Synthetic end-to-end and repository integration
 
 Add a synthetic seven-label fixture and fake transfer/GPU/checkpoint backends under
 `runpod/tests/`. Exercise package through pilot selection, full training, candidate freeze,
@@ -134,29 +156,31 @@ Run the RunPod suite and the existing backend suite together. The production bac
 expose small reusable primitives when necessary, but it must not gain live RunPod state or
 depend on `voxdelta_runpod`.
 
-### 9. Operator documentation and live dry run
+### 10. Operator documentation and live dry run
 
-Document one command per handoff in `runpod/OPERATOR.md`, including expected aggregate
-output, safe retry, incident log location, and which confirmation is required next. Run a
-no-data local dry run and a synthetic remote dry run before actual-data packaging. Record
-the exact image digest, environment versions, GPU profile, and disk check in the ledger.
+Keep the Korean command contract in `runpod/OPERATOR.md` synchronized with generated
+packets, including expected aggregate output, safe retry, incident log location, and which
+manual action is required next. Run a no-data local dry run, a linux/amd64 Docker build and
+smoke check, and a synthetic remote dry run before actual-data packaging. Record the exact
+image digest, environment versions, GPU profile, and disk check in the ledger.
 
-The actual experiment starts only after all implementation gates pass and the user creates
-the Pod. The agent then performs the technical steps between the five handoffs defined in
-`README.md` and reports concise status without exposing private logs.
+The actual experiment starts only after all implementation gates pass. The user performs
+the registry and RunPod actions with generated command packets; the agent prepares each
+packet, verifies returned artifacts, applies gates, and reports the next safe packet.
 
 ## Commit Boundaries
 
 Keep implementation reviewable in this order:
 
 1. workspace/configuration;
-2. packaging/holdout identity;
-3. ledger/checkpoint recovery;
-4. recipes;
-5. CUDA training/preflight;
-6. gates/final sealing;
-7. CLIs;
-8. end-to-end tests/operator docs.
+2. Docker image/manual handoff;
+3. packaging/holdout identity;
+4. ledger/checkpoint recovery;
+5. recipes;
+6. CUDA training/preflight;
+7. gates/final sealing;
+8. CLIs;
+9. end-to-end tests/operator docs.
 
 Each commit must pass its focused tests and static checks. No live RunPod call, data
 transfer, full training, holdout opening, model promotion, push, or destructive cleanup is
@@ -167,6 +191,8 @@ part of these implementation commits.
 Implementation is complete only when all of the following pass from a clean worktree:
 
 - RunPod unit, contract, and synthetic integration tests;
+- reproducible linux/amd64 Docker build, context allowlist, image-history scan, SBOM, and
+  container smoke check with immutable base/final digests;
 - full backend pytest suite;
 - Ruff lint and formatting for both projects;
 - strict mypy for RunPod source/scripts and backend source/scripts;
@@ -174,8 +200,11 @@ Implementation is complete only when all of the following pass from a clean work
 - tracked-change scans for secrets, private absolute paths, transcript fields, raw
   item-level output, credentials, and SSH material;
 - a no-data local dry run and synthetic remote dry run;
+- generated command-packet shell syntax checks and a fake-SSH/rsync rehearsal proving the
+  user can perform each stage without editing generated scripts;
 - independent confirmation that the backend does not import `voxdelta_runpod` and the
   final holdout cannot be opened before freeze or more than once.
 
-Passing these gates authorizes only the first user handoff: Pod creation. It does not
-authorize billable infrastructure, actual-data transfer, holdout use, or deletion.
+Passing these gates produces the first Docker/manual command packet. It does not authorize
+billable infrastructure, registry login/push, actual-data transfer, holdout use, or
+deletion; the user performs each action deliberately.

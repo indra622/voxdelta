@@ -347,6 +347,12 @@ hyperparameter changes, reruns, label remapping, or a second holdout evaluation.
 9. Aggregate artifacts return to local storage; their digests and provider reload are
    verified before Pod and volume deletion.
 
+Registry login, image push, Pod creation, SSH/`rsync`, remote command execution, result
+download, and Pod/volume deletion are manual user actions. The agent builds and verifies
+the Docker image and data packets, renders exact stage-specific commands, and evaluates
+the aggregate artifacts returned by the user. Docker image layers never contain licensed
+audio, transfer manifests, credentials, checkpoints, or experiment results.
+
 ## Interfaces and File Boundaries
 
 RunPod-specific implementation has one top-level boundary: `runpod/`. Its executable work
@@ -366,6 +372,8 @@ The implementation should preserve focused responsibilities beneath that boundar
   promotion, and final comparison decisions;
 - `runpod/scripts/`: separate local packaging, remote preflight/runner, sealed final
   evaluation, and retrieval-verification CLIs;
+- `runpod/docker/`: pinned linux/amd64 CUDA image, build-context allowlist, and image
+  verification tooling;
 - `runpod/tests/`: focused and synthetic end-to-end tests without a live account;
 - `runpod/OPERATOR.md`: transfer sequence, recovery, result retrieval, handoffs, and
   deletion-readiness instructions.
