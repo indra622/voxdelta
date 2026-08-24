@@ -7,11 +7,15 @@ from typing import Any
 import pytest
 
 from voxdelta_runpod.config import CANONICAL_LABELS, load_experiment_config
+from voxdelta_runpod.ledger import RunIdentity
 from voxdelta_runpod.package import SanitizedRecord
 from voxdelta_runpod.recipes import RecipePlan
 from voxdelta_runpod.training import (
     BATCH_PROFILES,
+    EpochMetrics,
+    TrainingHistoryRecord,
     TrainingRuntimeError,
+    append_training_history,
     configure_full_model,
     deterministic_crop_start,
     deterministic_epoch_records,
@@ -175,10 +179,46 @@ def test_cuda_contract_requires_one_bf16_gpu() -> None:
         validate_cuda_runtime(bad)
 
 
+def test_training_history_is_private_append_only_and_accepts_exact_replay(tmp_path: Path) -> None:
+    identity = RunIdentity(
+        config_sha256="a" * 64,
+        code_sha256="b" * 64,
+        container_sha256="c" * 64,
+        base_model_sha256="d" * 64,
+        archive_sha256="e" * 64,
+        manifest_sha256="f" * 64,
+        sampler_sha256="0" * 64,
+    )
+    metrics = EpochMetrics(
+        completed_count=7,
+        macro_f1=0.5,
+        per_label_f1={label: 0.5 for label in CANONICAL_LABELS},
+        predicted_class_count=7,
+    )
+    first = TrainingHistoryRecord(
+        stage="full",
+        epoch=0,
+        optimizer_steps=100,
+        metrics=metrics,
+        best_metric=0.5,
+        best_epoch=0,
+        patience_used=0,
+        batch_profile=BATCH_PROFILES[1],
+        run_identity_sha256=identity.digest(),
+    )
+    history = (tmp_path / "state" / "checkpoints" / "full-history.jsonl").resolve()
+    append_training_history(history, first)
+    append_training_history(history, first)
+    assert len(history.read_text().splitlines()) == 1
+    assert history.stat().st_mode & 0o077 == 0
+
+    changed = first.model_copy(update={"optimizer_steps": 101})
+    with pytest.raises(TrainingRuntimeError, match="^invalid_training_history$"):
+        append_training_history(history, changed)
+
+
 def test_published_runpod_checkpoint_reloads_through_production_contract(tmp_path: Path) -> None:
     from voxdelta.providers._emotion_runtime import validate_checkpoint
-
-    from voxdelta_runpod.training import EpochMetrics
 
     plan = _plan("uniform-without-replacement")
     output = publish_provider_checkpoint(

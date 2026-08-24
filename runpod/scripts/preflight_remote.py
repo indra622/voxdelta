@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import os
+import platform
 import shutil
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from voxdelta.evaluation.manifest import read_trusted_regular_file
 from voxdelta.evaluation.wav2vec_base import validate_wav2vec_base
@@ -17,11 +21,56 @@ from voxdelta_runpod.package import PackageSidecar, extract_verified_package
 from voxdelta_runpod.recipes import build_pilot_plans_from_package
 from voxdelta_runpod.training import validate_cuda_runtime
 from voxdelta_runpod.workflow import (
+    RuntimeEnvironment,
     build_run_identity,
+    canonical_sha256,
     digest_file,
     load_run_identity,
+    load_runtime_environment,
     publish_model,
 )
+
+
+def _driver_version() -> str:
+    completed = subprocess.run(
+        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    versions = {line.strip() for line in completed.stdout.splitlines() if line.strip()}
+    if len(versions) != 1:
+        raise ValueError
+    return versions.pop()
+
+
+def _runtime_environment(
+    torch: Any, remote_root: Path, identity_sha256: str
+) -> RuntimeEnvironment:
+    cuda = torch.cuda
+    cudnn = torch.backends.cudnn.version()
+    cuda_version = torch.version.cuda
+    if not isinstance(cudnn, int) or not isinstance(cuda_version, str):
+        raise ValueError
+    disk = shutil.disk_usage(remote_root)
+    properties = cuda.get_device_properties(0)
+    return RuntimeEnvironment(
+        python_version=platform.python_version(),
+        torch_version=str(torch.__version__),
+        transformers_version=importlib.metadata.version("transformers"),
+        cuda_version=cuda_version,
+        cudnn_version=cudnn,
+        driver_version=_driver_version(),
+        gpu_name=str(cuda.get_device_name(0)),
+        gpu_count=int(cuda.device_count()),
+        gpu_total_memory_bytes=int(properties.total_memory),
+        gpu_capability=tuple(cuda.get_device_capability(0)),
+        bf16_supported=bool(cuda.is_bf16_supported()),
+        disk_total_bytes=disk.total,
+        disk_free_bytes=disk.free,
+        run_identity_sha256=identity_sha256,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -51,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         state_root = remote_root / "state"
         ledger_root = remote_root / "ledger"
         completion_marker = state_root / "preflight-complete.json"
+        environment_path = state_root / "environment.json"
         if completion_marker.exists():
             marker_identity = load_run_identity(completion_marker)
             sidecar = PackageSidecar.model_validate_json(
@@ -65,6 +115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or marker_identity.manifest_sha256 != sidecar.manifest_sha256
                 or digest_file(arguments.data_root.resolve() / "manifest.jsonl")
                 != sidecar.manifest_sha256
+                or load_runtime_environment(environment_path).run_identity_sha256
+                != canonical_sha256(marker_identity.model_dump(mode="json"))
             ):
                 raise ValueError
             print("remote_preflight_ok")
@@ -96,6 +148,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             container_sha256=arguments.container_sha256,
         )
         publish_model(state_root / "run-identity.json", identity)
+        publish_model(
+            environment_path,
+            _runtime_environment(
+                torch,
+                remote_root,
+                canonical_sha256(identity.model_dump(mode="json")),
+            ),
+        )
         initialize_ledger(ledger_root, identity)
         append_transition(ledger_root, "preflight", identity)
         publish_model(completion_marker, identity)

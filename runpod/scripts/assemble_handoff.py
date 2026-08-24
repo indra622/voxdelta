@@ -1,4 +1,4 @@
-"""Atomically assemble verified image and training sub-packets into one operator handoff."""
+"""Atomically assemble verified image, model, and training packets into one handoff."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ IMAGE_FILES = frozenset(
     }
 )
 TRAINING_FILES = frozenset({"train-validation.tar.zst", "train-validation.sidecar.json"})
+BASE_MODEL_FILES = frozenset({"xls-r-base.tar.zst", "xls-r-base.sidecar.json"})
 
 
 def _trusted_files(root: Path, expected: frozenset[str]) -> dict[str, Path]:
@@ -43,6 +44,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image-root", required=True, type=Path)
     parser.add_argument("--training-root", required=True, type=Path)
+    parser.add_argument("--base-model-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     arguments = parser.parse_args(argv)
@@ -51,10 +53,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         image = _trusted_files(arguments.image_root.resolve(), IMAGE_FILES)
         training = _trusted_files(arguments.training_root.resolve(), TRAINING_FILES)
+        base_model = _trusted_files(arguments.base_model_root.resolve(), BASE_MODEL_FILES)
         if output.exists() or output.is_symlink() or staging.exists() or staging.is_symlink():
             raise ValueError
         staging.mkdir(mode=0o700, parents=True)
-        for name, source in sorted({**image, **training}.items()):
+        for name, source in sorted({**image, **training, **base_model}.items()):
             destination = staging / name
             try:
                 os.link(source, destination)

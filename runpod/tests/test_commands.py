@@ -20,6 +20,8 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     root.mkdir(mode=0o700)
     (root / "train-validation.tar.zst").write_bytes(b"archive")
     (root / "train-validation.sidecar.json").write_text("{}")
+    (root / "xls-r-base.tar.zst").write_bytes(b"base")
+    (root / "xls-r-base.sidecar.json").write_text("{}")
     (root / "image-digest.txt").write_text(f"sha256:{'a' * 64}\n")
     scripts = render_operator_commands(root, run_id="run-622")
     update_checksums(
@@ -28,6 +30,8 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
             *scripts,
             root / "train-validation.tar.zst",
             root / "train-validation.sidecar.json",
+            root / "xls-r-base.tar.zst",
+            root / "xls-r-base.sidecar.json",
             root / "image-digest.txt",
         ),
     )
@@ -46,6 +50,10 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     assert "final-holdout" not in combined
     assert "pilot" in (root / "01-preflight-and-pilot.sh").read_text()
     assert "full-or-resume" not in (root / "01-preflight-and-pilot.sh").read_text()
+    assert "extract_model_bundle.py" in (root / "01-preflight-and-pilot.sh").read_text()
+    assert "state/checkpoints" in (root / "03-download-results.sh").read_text()
+    assert "full-retrieval.tar.zst" in (root / "03-download-results.sh").read_text()
+    assert "run_remote_stage.py" in combined
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -64,9 +72,19 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     assert completed.returncode == 0, completed.stderr
 
     final_root = (root / "final").resolve()
+    final_root.mkdir(mode=0o700)
+    (final_root / "final-holdout.tar.zst").write_bytes(b"final")
+    (final_root / "final-holdout.sidecar.json").write_text("{}")
+    (final_root / "frozen-candidate.json").write_text("{}")
+    (final_root / "emotion2vec-baseline.tar.zst").write_bytes(b"baseline")
+    (final_root / "emotion2vec-baseline.sidecar.json").write_text("{}")
     final_scripts = render_operator_commands(final_root, run_id="run-622", final=True)
     assert {path.name for path in final_scripts} == {"04-final-once.sh", "05-download-final.sh"}
     assert all(
         "pilot" not in path.read_text() and "full-or-resume" not in path.read_text()
         for path in final_scripts
     )
+    final_combined = "\n".join(path.read_text() for path in final_scripts)
+    assert "emotion2vec-baseline" in final_combined
+    assert "final-consumed.json" in final_combined
+    assert "final-retrieval.tar.zst" in final_combined

@@ -40,9 +40,17 @@ cd "$root"; shasum -a 256 -c SHA256SUMS
 image_digest="$(tr -d '\n' < image-digest.txt)"
 [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo image_digest_error >&2; exit 65; }
 container_sha256="${image_digest#sha256:}"
-ssh "${ssh_args[@]}" "$user@$host" "install -d -m 700 '$remote/incoming' '$remote/results'"
+ssh "${ssh_args[@]}" "$user@$host" \
+  "install -d -m 700 '$remote/incoming' '$remote/incoming/models' '$remote/results'"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   train-validation.tar.zst train-validation.sidecar.json "$user@$host:$remote/incoming/"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  xls-r-base.tar.zst xls-r-base.sidecar.json "$user@$host:$remote/incoming/models/"
+ssh "${ssh_args[@]}" "$user@$host" \
+  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/extract_model_bundle.py \
+  xls-r-base --archive '$remote/incoming/models/xls-r-base.tar.zst' \
+  --sidecar '$remote/incoming/models/xls-r-base.sidecar.json' \
+  --target /workspace/models/xls-r-300m"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/preflight_remote.py \
   --config /opt/voxdelta/runpod/config/experiment.toml \
@@ -50,35 +58,76 @@ ssh "${ssh_args[@]}" "$user@$host" \
   --sidecar '$remote/incoming/train-validation.sidecar.json' --data-root '$remote/data' \
   --container-sha256 '$container_sha256'"
 ssh "${ssh_args[@]}" "$user@$host" \
-  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_experiment.py \
-  pilot --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote'"
+  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_remote_stage.py \
+  launch pilot --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote' && \
+  /opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_remote_stage.py \
+  wait pilot --root '$remote'"
 rsync --archive --partial -e "$rsync_ssh" \
   "$user@$host:$remote/results/pilots/" "$root/results/pilots/"
 """,
         "02-full-or-resume.sh": _header()
         + """
 ssh "${ssh_args[@]}" "$user@$host" \
-  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_experiment.py \
-  full-or-resume --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote'"
+  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_remote_stage.py \
+  launch full-or-resume --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote' && \
+  /opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_remote_stage.py \
+  wait full-or-resume --root '$remote'"
 """,
         "03-download-results.sh": _header()
         + """
 install -d -m 700 "$root/results/full"
 install -d -m 700 "$root/evidence/full"
+install -d -m 700 "$root/evidence/full/results/pilots"
+install -d -m 700 "$root/evidence/full/state/checkpoints"
+install -d -m 700 "$root/evidence/full/logs"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/full/" "$root/results/full/"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
-  "$user@$host:$remote/ledger/" "$root/evidence/full/ledger/"
+  "$user@$host:$remote/results/pilots/" "$root/evidence/full/results/pilots/"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
-  "$user@$host:$remote/state/run-identity.json" "$root/evidence/full/run-identity.json"
+  "$user@$host:$remote/state/checkpoints/" "$root/evidence/full/state/checkpoints/"
+for artifact in batch-profile.json environment.json preflight-complete.json run-identity.json; do
+  rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+    "$user@$host:$remote/state/$artifact" "$root/evidence/full/state/$artifact"
+done
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/logs/" "$root/evidence/full/logs/"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/ledger/" "$root/evidence/full/ledger/"
+install -d -m 700 "$root/archive"
+(
+  cd "$root"
+  while IFS= read -r file; do shasum -a 256 "$file"; done \
+    < <(find results/full evidence/full -type f ! -name SHA256SUMS.local | LC_ALL=C sort) \
+    > evidence/full/SHA256SUMS.local
+  chmod 600 evidence/full/SHA256SUMS.local
+  tar -cf - results/full evidence/full | zstd -3 --threads=1 --quiet \
+    -o archive/full-retrieval.tar.zst
+  chmod 600 archive/full-retrieval.tar.zst
+  shasum -a 256 archive/full-retrieval.tar.zst \
+    > archive/full-retrieval.tar.zst.sha256
+  chmod 600 archive/full-retrieval.tar.zst.sha256
+  zstd --test --quiet archive/full-retrieval.tar.zst
+  shasum -a 256 -c archive/full-retrieval.tar.zst.sha256
+)
 """,
         "04-final-once.sh": _header()
         + """
 cd "$root"; shasum -a 256 -c SHA256SUMS
-ssh "${ssh_args[@]}" "$user@$host" "install -d -m 700 '$remote/incoming/final'"
+ssh "${ssh_args[@]}" "$user@$host" \
+  "install -d -m 700 '$remote/incoming/final' '$remote/incoming/models'"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   final-holdout.tar.zst final-holdout.sidecar.json frozen-candidate.json \
   "$user@$host:$remote/incoming/final/"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  emotion2vec-baseline.tar.zst emotion2vec-baseline.sidecar.json \
+  "$user@$host:$remote/incoming/models/"
+ssh "${ssh_args[@]}" "$user@$host" \
+  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/extract_model_bundle.py \
+  emotion2vec-baseline \
+  --archive '$remote/incoming/models/emotion2vec-baseline.tar.zst' \
+  --sidecar '$remote/incoming/models/emotion2vec-baseline.sidecar.json' \
+  --target /workspace/models/emotion2vec-plus"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/evaluate_final.py \
   --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote'"
@@ -87,12 +136,34 @@ ssh "${ssh_args[@]}" "$user@$host" \
         + """
 install -d -m 700 "$root/results/final"
 install -d -m 700 "$root/evidence/final"
+install -d -m 700 "$root/evidence/final/state"
+install -d -m 700 "$root/evidence/final/logs"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/final/" "$root/results/final/"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/ledger/" "$root/evidence/final/ledger/"
 rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
-  "$user@$host:$remote/state/run-identity.json" "$root/evidence/final/run-identity.json"
+  "$user@$host:$remote/state/run-identity.json" "$root/evidence/final/state/run-identity.json"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/state/final-consumed.json" "$root/evidence/final/state/final-consumed.json"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  "$user@$host:$remote/logs/" "$root/evidence/final/logs/"
+install -d -m 700 "$root/archive"
+(
+  cd "$root"
+  while IFS= read -r file; do shasum -a 256 "$file"; done \
+    < <(find results/final evidence/final -type f ! -name SHA256SUMS.local | LC_ALL=C sort) \
+    > evidence/final/SHA256SUMS.local
+  chmod 600 evidence/final/SHA256SUMS.local
+  tar -cf - results/final evidence/final | zstd -3 --threads=1 --quiet \
+    -o archive/final-retrieval.tar.zst
+  chmod 600 archive/final-retrieval.tar.zst
+  shasum -a 256 archive/final-retrieval.tar.zst \
+    > archive/final-retrieval.tar.zst.sha256
+  chmod 600 archive/final-retrieval.tar.zst.sha256
+  zstd --test --quiet archive/final-retrieval.tar.zst
+  shasum -a 256 -c archive/final-retrieval.tar.zst.sha256
+)
 """,
     }
 

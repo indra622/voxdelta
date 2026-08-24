@@ -232,6 +232,54 @@ class TrainingResult(_FrozenModel):
     checkpoint_path: Path
 
 
+class TrainingHistoryRecord(_FrozenModel):
+    schema_version: Literal["1"] = "1"
+    stage: CheckpointStage
+    epoch: int = Field(ge=0)
+    optimizer_steps: int = Field(gt=0)
+    metrics: EpochMetrics
+    best_metric: float = Field(ge=0, le=1)
+    best_epoch: int = Field(ge=0)
+    patience_used: int = Field(ge=0)
+    batch_profile: BatchProfile
+    run_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def append_training_history(path: Path, record: TrainingHistoryRecord) -> None:
+    """Append one deterministic epoch metric record, accepting an exact crash replay."""
+
+    if not path.is_absolute() or path.is_symlink():
+        raise TrainingRuntimeError("invalid_training_history")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        records = (
+            tuple(
+                TrainingHistoryRecord.model_validate_json(line)
+                for line in path.read_bytes().splitlines()
+                if line.strip()
+            )
+            if path.exists()
+            else ()
+        )
+        if any(existing.epoch != index for index, existing in enumerate(records)):
+            raise ValueError
+        if record.epoch < len(records):
+            if records[record.epoch] != record:
+                raise ValueError
+            return
+        if record.epoch != len(records):
+            raise ValueError
+        with path.open("ab") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write((record.model_dump_json() + "\n").encode())
+            stream.flush()
+            os.fsync(stream.fileno())
+    except TrainingRuntimeError:
+        raise
+    except Exception:
+        raise TrainingRuntimeError("invalid_training_history") from None
+
+
 def _metric_report(expected: Sequence[int], predicted: Sequence[int]) -> EpochMetrics:
     if not expected or len(expected) != len(predicted):
         raise TrainingRuntimeError("invalid_validation_metrics")
@@ -790,6 +838,20 @@ def run_cuda_training(
             identity=identity,
             files={name: hashlib.sha256(payload).hexdigest() for name, payload in payloads.items()},
         )
+        append_training_history(
+            checkpoint_root.parent / f"{checkpoint_root.name}-history.jsonl",
+            TrainingHistoryRecord(
+                stage=expected_stage,
+                epoch=epoch,
+                optimizer_steps=optimizer_steps,
+                metrics=metrics,
+                best_metric=best_metric,
+                best_epoch=best_epoch,
+                patience_used=stale_epochs,
+                batch_profile=batch_profile,
+                run_identity_sha256=identity.digest(),
+            ),
+        )
         last_checkpoint = publish_epoch_checkpoint(checkpoint_root, state, payloads)
         _prune_superseded_checkpoints(checkpoint_root, last_checkpoint)
         last_metrics = metrics
@@ -817,7 +879,9 @@ __all__ = [
     "MemoryProbeAttempt",
     "MemoryProbeResult",
     "TrainingResult",
+    "TrainingHistoryRecord",
     "TrainingRuntimeError",
+    "append_training_history",
     "configure_full_model",
     "deterministic_crop_start",
     "deterministic_epoch_records",

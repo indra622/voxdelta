@@ -131,13 +131,26 @@ uv run --project runpod python runpod/scripts/package_data.py training \
   --config "$(pwd)/runpod/config/experiment.toml" \
   --manifest '<absolute-source-manifest>' \
   --output "$(pwd)/runpod/packages/$run_id-training"
+uv run --project runpod python runpod/scripts/package_model_bundle.py xls-r-base \
+  --source '<absolute-local-xls-r-300m-directory>' \
+  --output "$(pwd)/runpod/packages/$run_id-xls-r-base"
 uv run --project runpod python runpod/scripts/assemble_handoff.py \
   --image-root "$(pwd)/runpod/dist/$run_id-image" \
   --training-root "$(pwd)/runpod/packages/$run_id-training" \
+  --base-model-root "$(pwd)/runpod/packages/$run_id-xls-r-base" \
   --output "$(pwd)/runpod/dist/$run_id" \
   --run-id "$run_id"
 ```
 
 The resulting `runpod/dist/<run-id>/` is the only training handoff. Candidate freeze and
-final packaging use `freeze_candidate.py` and `package_final_holdout.py`; final retrieval
+final packaging use `freeze_candidate.py` and `package_final_holdout.py`. Build the pinned
+emotion2vec baseline with `package_model_bundle.py emotion2vec-baseline` and pass its output
+as `--baseline-bundle-root` when making the final package.
+
+Pilot and full stages are launched by `run_remote_stage.py`, so a local SSH disconnect does
+not terminate training. Each epoch's validation metrics are retained in
+`state/checkpoints/<stage>-history.jsonl`; the latest exact-resume checkpoint, runtime
+environment, selected batch profile, stage status, and persistent logs are recovered by
+`03-download-results.sh`. The download script also creates and immediately verifies
+`archive/full-retrieval.tar.zst`. Final retrieval creates the equivalent final archive and
 is accepted only after `verify_retrieved_results.py final` emits `deletion_ready`.

@@ -17,8 +17,10 @@ from voxdelta_runpod.recipes import (
     expand_full_recipe_from_package,
 )
 from voxdelta_runpod.workflow import (
+    RuntimeEnvironment,
     build_run_identity,
     load_run_identity,
+    load_runtime_environment,
     publish_model,
     verify_result_checksums,
     write_result_checksums,
@@ -92,6 +94,26 @@ def test_remote_package_recipes_and_identity_are_deterministic(tmp_path: Path) -
     publish_model(identity_path, identity)
     assert load_run_identity(identity_path) == identity
 
+    environment = RuntimeEnvironment(
+        python_version="3.12.11",
+        torch_version="2.8.0+cu128",
+        transformers_version="4.55.0",
+        cuda_version="12.8",
+        cudnn_version=91002,
+        driver_version="570.169",
+        gpu_name="NVIDIA A40",
+        gpu_count=1,
+        gpu_total_memory_bytes=48 * 1024**3,
+        gpu_capability=(8, 6),
+        bf16_supported=True,
+        disk_total_bytes=200 * 1024**3,
+        disk_free_bytes=120 * 1024**3,
+        run_identity_sha256="e" * 64,
+    )
+    environment_path = (tmp_path / "state" / "environment.json").resolve()
+    publish_model(environment_path, environment)
+    assert load_runtime_environment(environment_path) == environment
+
 
 def test_result_checksums_and_handoff_assembly_are_private(tmp_path: Path) -> None:
     result = (tmp_path / "result").resolve()
@@ -104,8 +126,10 @@ def test_result_checksums_and_handoff_assembly_are_private(tmp_path: Path) -> No
 
     image = (tmp_path / "image").resolve()
     training = (tmp_path / "training").resolve()
+    base_model = (tmp_path / "base-model").resolve()
     image.mkdir(mode=0o700)
     training.mkdir(mode=0o700)
+    base_model.mkdir(mode=0o700)
     image_files = {
         "voxdelta-runpod.oci.tar.zst": b"image",
         "image-digest.txt": f"sha256:{'a' * 64}\n".encode(),
@@ -124,6 +148,13 @@ def test_result_checksums_and_handoff_assembly_are_private(tmp_path: Path) -> No
         path = training / name
         path.write_bytes(content)
         path.chmod(0o600)
+    for name, content in {
+        "xls-r-base.tar.zst": b"base-model",
+        "xls-r-base.sidecar.json": b"{}\n",
+    }.items():
+        path = base_model / name
+        path.write_bytes(content)
+        path.chmod(0o600)
 
     spec = importlib.util.spec_from_file_location("assemble_handoff", ASSEMBLER)
     assert spec is not None and spec.loader is not None
@@ -137,6 +168,8 @@ def test_result_checksums_and_handoff_assembly_are_private(tmp_path: Path) -> No
                 str(image),
                 "--training-root",
                 str(training),
+                "--base-model-root",
+                str(base_model),
                 "--output",
                 str(output),
                 "--run-id",

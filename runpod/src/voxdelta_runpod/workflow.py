@@ -11,7 +11,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from voxdelta.evaluation.emotion_experiment import EmotionExperimentReport
 from voxdelta.evaluation.manifest import DatasetItem, read_trusted_regular_file
 
@@ -38,6 +38,26 @@ class _FrozenModel(BaseModel):
 class SelectedBatchProfile(_FrozenModel):
     schema_version: Literal["1"] = "1"
     profile: BatchProfile
+
+
+class RuntimeEnvironment(_FrozenModel):
+    """Sanitized runtime facts required to reproduce or audit one remote run."""
+
+    schema_version: Literal["1"] = "1"
+    python_version: str = Field(min_length=1, max_length=64)
+    torch_version: str = Field(min_length=1, max_length=128)
+    transformers_version: str = Field(min_length=1, max_length=128)
+    cuda_version: str = Field(min_length=1, max_length=64)
+    cudnn_version: int = Field(gt=0)
+    driver_version: str = Field(pattern=r"^[0-9]+(?:\.[0-9]+){1,3}$")
+    gpu_name: str = Field(min_length=1, max_length=256)
+    gpu_count: int = Field(gt=0, le=8)
+    gpu_total_memory_bytes: int = Field(gt=0)
+    gpu_capability: tuple[int, int]
+    bf16_supported: bool
+    disk_total_bytes: int = Field(gt=0)
+    disk_free_bytes: int = Field(ge=0)
+    run_identity_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 def _private_publish(path: Path, payload: bytes) -> None:
@@ -132,6 +152,13 @@ def load_run_identity(path: Path) -> RunIdentity:
         return RunIdentity.model_validate_json(read_trusted_regular_file(path))
     except Exception:
         raise WorkflowError("invalid_run_identity") from None
+
+
+def load_runtime_environment(path: Path) -> RuntimeEnvironment:
+    try:
+        return RuntimeEnvironment.model_validate_json(read_trusted_regular_file(path))
+    except Exception:
+        raise WorkflowError("invalid_runtime_environment") from None
 
 
 def write_evaluation_manifest(
@@ -318,6 +345,7 @@ def no_sensitive_result_json(paths: Iterable[Path]) -> bool:
 
 
 __all__ = [
+    "RuntimeEnvironment",
     "SelectedBatchProfile",
     "WorkflowError",
     "aggregate_from_backend",
@@ -327,6 +355,7 @@ __all__ = [
     "load_aggregate_report",
     "load_packaged_manifest",
     "load_run_identity",
+    "load_runtime_environment",
     "no_sensitive_result_json",
     "publish_model",
     "sampler_contract_digest",

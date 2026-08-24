@@ -31,10 +31,13 @@ SSH 자료, checkpoint, audit 기록, 결과 파일은 이미지 layer에 넣지
 
 - `train-validation.tar.zst`: 33,045개 정규화 WAV와 sanitized manifest;
 - `train-validation.sidecar.json`: 파일 수, split/label count, archive/manifest digest;
+- `xls-r-base.tar.zst`와 sidecar: 로컬에 이미 받은 고정 XLS-R 300M base model;
 - `SHA256SUMS`: 전송 전후 검증값;
 - `01-preflight-and-pilot.sh`: remote 검증과 두 pilot 실행;
 - gate 통과 후 별도 `02-full-or-resume.sh`: full 학습 또는 안전한 resume;
-- `03-download-results.sh`: aggregate 결과 패킷 회수.
+- `03-download-results.sh`: deployable checkpoint, 최신 exact-resume checkpoint, epoch별
+  metrics history, pilot/full reports, batch profile, CUDA/driver 환경, ledger, 로그 회수와
+  `archive/full-retrieval.tar.zst` 생성·즉시 검증.
 
 원본 CSV/ZIP, transcript, 절대경로, original filename, speaker/call ID, 로컬 audit
 note, 기존 item-level output은 보내지 않는다.
@@ -45,8 +48,10 @@ full validation gate와 candidate freeze 검증 후에만 별도로 만든다.
 
 - `final-holdout.tar.zst`: 이전에 노출된 35개를 제외한 3,585개 WAV;
 - `final-holdout.sidecar.json`과 `SHA256SUMS`;
+- `emotion2vec-baseline.tar.zst`와 sidecar: 고정 baseline checkpoint;
 - `04-final-once.sh`: 두 frozen provider의 단 한 번 평가;
-- `05-download-final.sh`: aggregate final 결과 회수.
+- `05-download-final.sh`: aggregate final 결과, final-consumed marker, ledger, 로그 회수와
+  `archive/final-retrieval.tar.zst` 생성·즉시 검증.
 
 학습 데이터 패킷에는 final holdout 파일이나 이를 여는 capability가 들어가지 않는다.
 
@@ -140,3 +145,15 @@ bash ./05-download-final.sh \
 
 확인 후 에이전트는 `deletion-ready`만 알린다. 실제 Pod/volume 삭제는 사용자가 RunPod
 UI에서 수행한다.
+
+삭제 직전에는 두 retrieval archive의 `zstd --test`와 `.sha256` 검증을 다시 수행하고,
+필요하면 별도 로컬/백업 저장소로 한 번 더 복사한다. 그 뒤 Pod를 중지하고 encrypted
+network volume을 삭제한 다음 RunPod 콘솔에서 Pod와 volume이 모두 사라져 추가 과금이
+없는지 확인한다. Registry image와 로컬 결과 archive는 학습 재개 필요성에 따라 별도로
+보관하거나 정리한다.
+
+Claude Code가 실제 실행을 맡아도 된다. 단, RunPod MCP 인증, registry credential helper,
+SSH agent/키, `rsync`, `zstd`는 각각 실행 환경에 준비되어 있어야 한다. Pod 생성·시작과
+volume 생성은 비용 발생 전 승인을 받고, final 1회 실행과 Pod/volume 삭제는 별도 명시
+승인을 받는다. Claude Code는 생성된 command packet만 실행하고 checkpoint/result 검증
+전에는 volume을 삭제하지 않는다.
