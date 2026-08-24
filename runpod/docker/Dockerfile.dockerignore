@@ -1,0 +1,15 @@
+**
+!backend/
+!backend/pyproject.toml
+!backend/uv.lock
+!backend/src/
+!backend/src/**
+!runpod/
+!runpod/pyproject.toml
+!runpod/uv.lock
+!runpod/config/
+!runpod/config/**
+!runpod/scripts/
+!runpod/scripts/**
+!runpod/src/
+!runpod/src/**
