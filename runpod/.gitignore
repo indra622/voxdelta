@@ -1,0 +1,27 @@
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Licensed/sensitive inputs and generated experiment state.
+runtime/
+packages/
+data/
+checkpoints/
+results/
+logs/
+
+# Downloaded models, caches, and Python tooling.
+models/
+.cache/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Operator-specific SSH and transfer files.
+ssh/
+rsync-partial/

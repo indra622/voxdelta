@@ -349,27 +349,32 @@ hyperparameter changes, reruns, label remapping, or a second holdout evaluation.
 
 ## Interfaces and File Boundaries
 
-The implementation should preserve focused responsibilities:
+RunPod-specific implementation has one top-level boundary: `runpod/`. Its executable work
+order and user/agent handoffs are defined in `runpod/IMPLEMENTATION_PLAN.md` and
+`runpod/README.md`. This keeps Pod configuration, orchestration, transfer state, training
+code, checkpoints, and operator instructions out of the production backend tree.
 
-- `backend/src/voxdelta/evaluation/runpod_package.py`: sanitized manifest models,
-  holdout exclusion, archive construction, sidecar digests, and archive validation;
-- `backend/src/voxdelta/evaluation/wav2vec_full_training.py`: full-training profile,
-  sampling and loss recipes, CUDA precision, parameter groups, evaluation, and payload;
-- `backend/src/voxdelta/evaluation/experiment_ledger.py`: immutable stage records,
-  checkpoint identities, transition validation, and resume selection;
-- `backend/src/voxdelta/evaluation/full_finetuning_gate.py`: pilot eligibility, winner
-  selection, validation promotion, and final comparison decisions;
-- `backend/scripts/prepare_runpod_emotion_data.py`: local package CLI;
-- `backend/scripts/run_wav2vec_full_experiment.py`: RunPod preflight and staged runner;
-- `backend/scripts/evaluate_final_emotion_holdout.py`: one-time two-provider comparison;
-- `backend/tests/evaluation/`: focused tests matching each boundary;
-- `data/README.md`: operator commands, transfer sequence, recovery, result retrieval, and
-  deletion checklist.
+The implementation should preserve focused responsibilities beneath that boundary:
 
-Existing generic provider and aggregate experiment report contracts are reused. The
-ordinary production provider must load the final checkpoint without PEFT or a training
-runtime. Existing local smoke, partial, LoRA, emotion2vec+, and benchmark artifacts remain
-immutable.
+- `runpod/src/voxdelta_runpod/package.py`: sanitized manifest models, holdout exclusion,
+  archive construction, sidecar digests, and archive validation;
+- `runpod/src/voxdelta_runpod/training.py`: full-training profile, sampling and loss
+  recipes, CUDA precision, parameter groups, evaluation, and payload;
+- `runpod/src/voxdelta_runpod/ledger.py`: immutable stage records, checkpoint identities,
+  transition validation, and resume selection;
+- `runpod/src/voxdelta_runpod/gates.py`: pilot eligibility, winner selection, validation
+  promotion, and final comparison decisions;
+- `runpod/scripts/`: separate local packaging, remote preflight/runner, sealed final
+  evaluation, and retrieval-verification CLIs;
+- `runpod/tests/`: focused and synthetic end-to-end tests without a live account;
+- `runpod/OPERATOR.md`: transfer sequence, recovery, result retrieval, handoffs, and
+  deletion-readiness instructions.
+
+Existing generic provider, manifest/audio validation, and aggregate experiment report
+contracts may be imported from `backend/`. The production backend must never import the
+RunPod package or contain live Pod state. The ordinary production provider must load the
+final checkpoint without PEFT or a training runtime. Existing local smoke, partial, LoRA,
+emotion2vec+, and benchmark artifacts remain immutable.
 
 ## Failure and Privacy Boundaries
 
