@@ -8,6 +8,17 @@ for command in docker git shasum zstd; do
   command -v "$command" >/dev/null 2>&1 || { echo "missing command: $command" >&2; exit 69; }
 done
 
+builder="${VOXDELTA_BUILDER:-${BUILDX_BUILDER:-}}"
+builder_args=()
+if [[ -n "$builder" ]]; then
+  builder_args=(--builder "$builder")
+fi
+driver="$(docker buildx inspect "${builder_args[@]}" 2>/dev/null | awk '/^Driver:/ {print $2}')"
+if [[ "$driver" == "docker" || -z "$driver" ]]; then
+  echo "attestation-capable buildx builder required; set VOXDELTA_BUILDER" >&2
+  exit 69
+fi
+
 if [[ $# -ne 1 || ! "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
   echo "usage: build_image.sh <run-id>" >&2
   exit 64
@@ -24,7 +35,7 @@ temporary="$(mktemp -d "${TMPDIR:-/tmp}/voxdelta-build.XXXXXX")"
 trap 'rm -rf -- "$temporary"' EXIT
 archive="$temporary/voxdelta-runpod.oci.tar"
 
-docker buildx build \
+docker buildx build "${builder_args[@]}" \
   --file "$runpod/docker/Dockerfile" \
   --platform linux/amd64 \
   --build-arg "VOXDELTA_GIT_COMMIT=$git_commit" \

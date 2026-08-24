@@ -21,6 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PATH="/opt/voxdelta/runpod/.venv/bin:${PATH}" \
+    PYTHONPATH="/opt/voxdelta/backend/src" \
     VOXDELTA_CODE_SHA256="${VOXDELTA_CODE_SHA256}" \
     VOXDELTA_GIT_COMMIT="${VOXDELTA_GIT_COMMIT}"
 

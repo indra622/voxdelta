@@ -119,6 +119,7 @@ manifest, authorization marker, and generated packets.
 
 ```bash
 run_id='xlsr-622-v1'
+export VOXDELTA_BUILDER='<docker-container-buildx-builder>'
 uv run --project runpod python runpod/scripts/preflight_local.py \
   --config "$(pwd)/runpod/config/experiment.toml" \
   --manifest '<absolute-source-manifest>' \

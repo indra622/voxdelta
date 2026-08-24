@@ -4,10 +4,13 @@ version = "0.1.0"
 description = "Isolated RunPod experiment tooling for VoxDelta"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "funasr>=1.4.2,<2",
+    "psutil>=7,<8",
     "pydantic>=2.12,<3",
+    "safetensors>=0.6,<1",
     "torch==2.8.0",
     "torchaudio==2.8.0",
-    "voxdelta",
+    "transformers>=4.55,<5",
 ]
 
 [dependency-groups]
@@ -15,6 +18,7 @@ dev = [
     "mypy>=1.18,<2",
     "pytest>=9,<10",
     "ruff>=0.14,<1",
+    "voxdelta",
 ]
 
 [build-system]
