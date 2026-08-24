@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -17,7 +18,24 @@ from voxdelta_runpod.recipes import (
     square_root_class_weights,
 )
 
-ACTUAL_MANIFEST = Path("/Volumes/nvme1/codes/voxdelta/data/manifests/emotion.jsonl")
+REPOSITORY = Path(__file__).parents[2]
+
+
+def _actual_manifest() -> Path:
+    completed = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=REPOSITORY,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    blocks = completed.stdout.strip().split("\n\n")
+    main = next(block for block in blocks if "branch refs/heads/main" in block)
+    root = Path(main.splitlines()[0].removeprefix("worktree "))
+    manifest = root / "data" / "manifests" / "emotion.jsonl"
+    if not manifest.is_file():
+        pytest.skip("local canonical emotion manifest is unavailable")
+    return manifest.resolve()
 
 
 def _manifest(path: Path, train_per_label: int = 1_500, validation_per_label: int = 60) -> Path:
@@ -88,8 +106,9 @@ def test_recipe_model_rejects_balanced_sampling_with_nonuniform_weights(
 
 
 def test_actual_full_recipe_counts_and_digests_are_stable() -> None:
-    pilot_a = expand_full_recipe(ACTUAL_MANIFEST.resolve(), "pilot-a")
-    pilot_b = expand_full_recipe(ACTUAL_MANIFEST.resolve(), "pilot-b")
+    manifest = _actual_manifest()
+    pilot_a = expand_full_recipe(manifest, "pilot-a")
+    pilot_b = expand_full_recipe(manifest, "pilot-b")
 
     assert len(pilot_a.train) == len(pilot_b.train) == 29_476
     assert len(pilot_a.validation) == len(pilot_b.validation) == 3_569

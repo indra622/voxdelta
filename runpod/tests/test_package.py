@@ -19,6 +19,7 @@ from voxdelta_runpod.package import (
     _publish_package,
     archive_members_are_safe,
     derive_holdout_identity,
+    extract_verified_package,
     select_audit_queue,
     summarize_audit,
 )
@@ -234,6 +235,14 @@ def test_small_package_is_deterministic_private_and_contains_allowlisted_fields(
         str(tmp_path),
     ):
         assert private_value not in serialized
+
+    extracted = extract_verified_package(
+        archive_a.resolve(),
+        (first / "train-validation.sidecar.json").resolve(),
+        (tmp_path / "extracted").resolve(),
+    )
+    assert len(tuple((extracted / "audio").glob("*.wav"))) == 14
+    assert (extracted / "manifest.jsonl").stat().st_mode & 0o077 == 0
 
     with pytest.raises(PackageError, match="^package_exists$"):
         _publish_package(

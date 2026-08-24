@@ -550,6 +550,95 @@ def archive_members_are_safe(names: Iterable[str]) -> bool:
     return True
 
 
+def extract_verified_package(archive: Path, sidecar_path: Path, target: Path) -> Path:
+    """Verify and stream-extract one transfer packet beneath a new private root."""
+
+    if not all(path.is_absolute() for path in (archive, sidecar_path, target)) or target.exists():
+        raise PackageError("invalid_remote_package")
+    try:
+        sidecar = PackageSidecar.model_validate_json(read_trusted_regular_file(sidecar_path))
+        archive_digest, archive_bytes = _trusted_digest(archive)
+        if archive_digest != sidecar.archive_sha256 or archive_bytes != sidecar.archive_bytes:
+            raise PackageError("transfer_digest_mismatch")
+    except PackageError:
+        raise
+    except Exception:
+        raise PackageError("invalid_remote_package") from None
+    staging = target.with_name(f".{target.name}.staging")
+    if staging.exists():
+        raise PackageError("invalid_remote_package")
+    staging.mkdir(mode=0o700, parents=True)
+    process = subprocess.Popen(
+        ["zstd", "--quiet", "--decompress", "--stdout", str(archive)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if process.stdout is None:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise PackageError("invalid_remote_package")
+    try:
+        with tarfile.open(fileobj=process.stdout, mode="r|") as stream:
+            first = stream.next()
+            if first is None or first.name != "manifest.jsonl" or not first.isfile():
+                raise PackageError("invalid_archive_members")
+            manifest_stream = stream.extractfile(first)
+            if manifest_stream is None or first.size > 64 * 1024 * 1024:
+                raise PackageError("invalid_archive_members")
+            manifest = manifest_stream.read()
+            if hashlib.sha256(manifest).hexdigest() != sidecar.manifest_sha256:
+                raise PackageError("transfer_digest_mismatch")
+            try:
+                records = tuple(
+                    SanitizedRecord.model_validate_json(line)
+                    for line in manifest.splitlines()
+                    if line.strip()
+                )
+            except Exception:
+                raise PackageError("invalid_archive_manifest") from None
+            if (
+                len(records) != sidecar.audio_file_count
+                or len({item.item_key for item in records}) != len(records)
+                or Counter(item.split for item in records) != Counter(sidecar.split_counts)
+                or Counter(item.emotion for item in records) != Counter(sidecar.label_counts)
+            ):
+                raise PackageError("invalid_archive_manifest")
+            expected = {item.audio_path: item.audio_sha256 for item in records}
+            found: set[str] = set()
+            while (member := stream.next()) is not None:
+                if (
+                    not member.isfile()
+                    or not archive_members_are_safe((member.name,))
+                    or member.name not in expected
+                    or member.name in found
+                ):
+                    raise PackageError("invalid_archive_members")
+                source = stream.extractfile(member)
+                if source is None:
+                    raise PackageError("invalid_archive_members")
+                destination = staging / member.name
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                digest = hashlib.sha256()
+                with destination.open("xb") as output:
+                    os.fchmod(output.fileno(), 0o600)
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+                        output.write(chunk)
+                if digest.hexdigest() != expected[member.name]:
+                    raise PackageError("transfer_digest_mismatch")
+                found.add(member.name)
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        if process.wait() != 0 or stderr or found != set(expected):
+            raise PackageError("invalid_archive_members")
+        _private_write(staging / "manifest.jsonl", manifest)
+        os.replace(staging, target)
+    except Exception:
+        process.kill()
+        process.wait()
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return target
+
+
 def re_full_audio_path(value: str) -> bool:
     if not value.startswith("audio/") or not value.endswith(".wav"):
         return False
@@ -568,6 +657,7 @@ __all__ = [
     "archive_members_are_safe",
     "build_train_validation_package",
     "derive_holdout_identity",
+    "extract_verified_package",
     "opaque_item_key",
     "select_audit_queue",
     "semantic_fingerprint",
