@@ -44,6 +44,7 @@ def _state(epoch: int, *, identity: RunIdentity | None = None) -> CheckpointStat
         epoch=epoch,
         optimizer_step=epoch * 100,
         best_metric=0.25,
+        best_epoch=epoch,
         patience_used=0,
         micro_batch_size=4,
         gradient_accumulation_steps=4,

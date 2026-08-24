@@ -161,13 +161,22 @@ def validate_checkpoint(
             raise ValueError
         schema_version = config.get("schema_version")
         if architecture == "wav2vec-xls-r":
+            class_weighting = config.get("class_weighting")
             if (
-                schema_version != "3"
+                schema_version not in {"3", "4"}
                 or set(config) != expected_config_keys | {"class_weighting", "class_weights"}
                 or config.get("model_revision") != WAV2VEC_MODEL_REVISION
                 or config.get("base_model_sha256") != WAV2VEC_WEIGHTS_SHA256
-                or config.get("class_weighting") != "inverse-frequency"
                 or not _valid_class_weights(config.get("class_weights"))
+                or (schema_version == "3" and class_weighting != "inverse-frequency")
+                or (
+                    schema_version == "4"
+                    and class_weighting not in {"none", "sqrt-inverse-frequency"}
+                )
+                or (
+                    class_weighting == "none"
+                    and config.get("class_weights") != [1.0] * len(CANONICAL_LABELS)
+                )
             ):
                 raise ValueError
         elif schema_version == "1":

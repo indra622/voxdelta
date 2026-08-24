@@ -56,6 +56,30 @@ def _checkpoint(path: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize("class_weighting", ["none", "sqrt-inverse-frequency"])
+def test_provider_accepts_runpod_schema_four_weighting_contracts(
+    tmp_path: Path, class_weighting: str
+) -> None:
+    from voxdelta.providers._emotion_runtime import validate_checkpoint
+
+    checkpoint = _checkpoint(tmp_path / class_weighting)
+    config = json.loads((checkpoint / "config.json").read_text())
+    config["schema_version"] = "4"
+    config["class_weighting"] = class_weighting
+    config["class_weights"] = (
+        [1.0] * 7 if class_weighting == "none" else [0.8, 0.9, 1.0, 1.1, 1.2, 1.0, 1.0]
+    )
+    (checkpoint / "config.json").write_text(json.dumps(config))
+
+    info = validate_checkpoint(
+        checkpoint,
+        architecture="wav2vec-xls-r",
+        model_id="facebook/wav2vec2-xls-r-300m",
+    )
+
+    assert info.path == checkpoint.resolve()
+
+
 class FakePredictor:
     def __init__(self, outputs: list[list[float]] | BaseException) -> None:
         self.outputs = outputs

@@ -29,7 +29,7 @@ _REQUIRED_FILES = frozenset(
         "rng-torch-cuda.pt",
     }
 )
-_OPTIONAL_FILES = frozenset({"scaler.pt"})
+_OPTIONAL_FILES = frozenset({"scaler.pt", "best-model.safetensors"})
 
 
 class CheckpointError(ValueError):
@@ -46,6 +46,7 @@ class CheckpointState(BaseModel):
     epoch: int = Field(ge=0)
     optimizer_step: int = Field(ge=0)
     best_metric: float = Field(ge=0, le=1)
+    best_epoch: int = Field(ge=0)
     patience_used: int = Field(ge=0)
     micro_batch_size: Literal[8, 4, 2, 1]
     gradient_accumulation_steps: Literal[2, 4, 8, 16]
@@ -56,6 +57,7 @@ class CheckpointState(BaseModel):
     def valid_state(self) -> CheckpointState:
         if (
             not math.isfinite(self.best_metric)
+            or self.best_epoch > self.epoch
             or self.micro_batch_size * self.gradient_accumulation_steps != 16
             or not _REQUIRED_FILES <= set(self.files)
             or not set(self.files) <= _REQUIRED_FILES | _OPTIONAL_FILES
@@ -81,7 +83,11 @@ class ResumeSelection(BaseModel):
 
     checkpoint: Path | None
     state: CheckpointState | None
-    incomplete_epoch_replay: bool
+    incomplete_checkpoint: Path | None
+
+    @property
+    def incomplete_epoch_replay(self) -> bool:
+        return self.incomplete_checkpoint is not None
 
 
 def publish_epoch_checkpoint(
@@ -156,7 +162,7 @@ def select_resume_checkpoint(
     if not root.is_absolute() or root.is_symlink():
         raise CheckpointError("invalid_checkpoint_root")
     if not root.exists():
-        return ResumeSelection(checkpoint=None, state=None, incomplete_epoch_replay=False)
+        return ResumeSelection(checkpoint=None, state=None, incomplete_checkpoint=None)
     complete: list[tuple[int, Path]] = []
     incomplete: list[int] = []
     for path in root.iterdir():
@@ -184,13 +190,17 @@ def select_resume_checkpoint(
         return ResumeSelection(
             checkpoint=None,
             state=None,
-            incomplete_epoch_replay=bool(incomplete),
+            incomplete_checkpoint=(
+                root / f".epoch-{incomplete[0]:04d}.staging" if incomplete else None
+            ),
         )
     _, path, state = states[-1]
     return ResumeSelection(
         checkpoint=path,
         state=state,
-        incomplete_epoch_replay=bool(incomplete),
+        incomplete_checkpoint=(
+            root / f".epoch-{incomplete[0]:04d}.staging" if incomplete else None
+        ),
     )
 
 
