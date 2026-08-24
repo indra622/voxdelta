@@ -1,0 +1,54 @@
+[project]
+name = "voxdelta-runpod"
+version = "0.1.0"
+description = "Isolated RunPod experiment tooling for VoxDelta"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic>=2.12,<3",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "voxdelta",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=9,<10",
+    "ruff>=0.14,<1",
+]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+]
+voxdelta = { path = "../backend" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "scripts"]
+plugins = ["pydantic.mypy"]
+mypy_path = ["../backend/src"]

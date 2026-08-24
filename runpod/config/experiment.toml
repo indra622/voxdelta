@@ -1,0 +1,60 @@
+schema_version = "1"
+experiment_name = "xls-r-300m-full-finetuning"
+seed = 622
+canonical_labels = [
+  "happiness",
+  "anger",
+  "disgust",
+  "fear",
+  "neutral",
+  "sadness",
+  "surprise",
+]
+
+[model]
+model_id = "facebook/wav2vec2-xls-r-300m"
+revision = "1a640f32ac3e39899438a2931f9924c02f080a54"
+weights_sha256 = "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
+
+[data]
+train_count = 29476
+validation_count = 3569
+nominal_test_count = 3620
+exposed_test_count = 35
+final_holdout_count = 3585
+pilot_train_count = 3500
+pilot_validation_count = 350
+
+[runtime]
+platform = "linux/amd64"
+python_version = "3.12"
+base_image = "docker.io/nvidia/cuda@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9"
+gpu_model = "NVIDIA A40"
+gpu_count = 1
+gpu_memory_gb = 48
+volume_root = "/workspace/voxdelta"
+volume_disk_gb = 100
+minimum_free_gb = 80
+
+[training]
+effective_batch_size = 16
+micro_batch_candidates = [8, 4, 2, 1]
+gradient_accumulation_candidates = [2, 4, 8, 16]
+encoder_learning_rate = 1e-5
+head_learning_rate = 1e-4
+weight_decay = 0.01
+warmup_ratio = 0.1
+gradient_clip_norm = 1.0
+pilot_max_epochs = 5
+full_max_epochs = 10
+early_stopping_patience = 2
+sample_rate = 16000
+window_seconds = 20
+
+[gates]
+pilot_macro_f1_min_exclusive = 0.15
+pilot_min_predicted_classes = 6
+pilot_min_positive_label_f1 = 5
+full_macro_f1_min_exclusive = 0.2400352
+full_required_predicted_classes = 7
+full_required_positive_label_f1 = 7
