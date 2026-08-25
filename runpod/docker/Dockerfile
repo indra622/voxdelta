@@ -32,6 +32,7 @@ RUN apt-get update \
         openssh-server \
         python3.12 \
         rsync \
+        zstd \
     && rm -rf /var/lib/apt/lists/*
 
 COPY runpod/docker/sshd.conf /etc/ssh/sshd_config.d/voxdelta.conf
