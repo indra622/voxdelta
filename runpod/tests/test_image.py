@@ -214,6 +214,9 @@ def test_publish_image_handoff_is_private_complete_and_non_overwriting(tmp_path:
     assert "image-reference.txt" in push_script
     assert "password" not in push_script.lower()
     assert "token" not in push_script.lower()
+    # image-digest.txt records the manifest-list digest, so the whole index has
+    # to move; a platform-selecting copy pushes one manifest and can never match.
+    assert "skopeo copy --all --preserve-digests" in push_script
 
     with pytest.raises(ImageHandoffError, match="^handoff_exists$"):
         publish_image_handoff(
