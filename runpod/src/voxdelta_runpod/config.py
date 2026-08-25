@@ -79,8 +79,8 @@ class RuntimeConfig(_FrozenModel):
     gpu_model: Literal["NVIDIA A40"] = "NVIDIA A40"
     gpu_count: Literal[1] = 1
     gpu_memory_gb: Literal[48] = 48
-    volume_root: str = "/workspace/voxdelta"
-    model_root: str = "/workspace/models"
+    volume_root: str = "/opt/voxdelta-run/runs"
+    model_root: str = "/opt/voxdelta-run/models"
     volume_disk_gb: Literal[100] = 100
     minimum_free_gb: Literal[80] = 80
 

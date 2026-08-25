@@ -64,3 +64,12 @@ def test_probe_rejects_relative_and_symlinked_targets(tmp_path: Path) -> None:
         module.probe_path(Path("relative/path"))
     with pytest.raises(module.FilesystemProbeError, match="^invalid_probe_target$"):
         module.probe_path(link)
+
+
+def test_probe_enforces_a_minimum_free_capacity(tmp_path: Path) -> None:
+    module = _module()
+    target = (tmp_path / "run").resolve()
+
+    assert module.main(["--path", str(target), "--min-free-gb", "0"]) == 0
+    # no filesystem in CI has an exabyte spare
+    assert module.main(["--path", str(target), "--min-free-gb", "1000000000"]) == 2

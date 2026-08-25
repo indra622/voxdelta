@@ -153,6 +153,11 @@ def _load_checkpoint(path: Path, expected_stage: CheckpointStage) -> CheckpointS
         raise CheckpointError("invalid_checkpoint") from None
 
 
+def verify_checkpoint_directory(path: Path, expected_stage: CheckpointStage) -> CheckpointState:
+    """Public re-verification of one published epoch directory."""
+    return _load_checkpoint(path, expected_stage)
+
+
 def select_resume_checkpoint(
     root: Path,
     *,
@@ -211,4 +216,5 @@ __all__ = [
     "ResumeSelection",
     "publish_epoch_checkpoint",
     "select_resume_checkpoint",
+    "verify_checkpoint_directory",
 ]

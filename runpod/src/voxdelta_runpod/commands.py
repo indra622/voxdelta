@@ -21,8 +21,8 @@ class CommandPacketError(ValueError):
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _VOLUME_ROOT = "__VOLUME_ROOT__"
 _MODEL_ROOT = "__MODEL_ROOT__"
-DEFAULT_VOLUME_ROOT = "/workspace/voxdelta"
-DEFAULT_MODEL_ROOT = "/workspace/models"
+DEFAULT_VOLUME_ROOT = "/opt/voxdelta-run/runs"
+DEFAULT_MODEL_ROOT = "/opt/voxdelta-run/models"
 
 
 def _header() -> str:
@@ -51,7 +51,7 @@ ssh "${ssh_args[@]}" "$user@$host" \
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/probe_filesystem.py \
   --path '$remote' --path '$remote/incoming' --path '$remote/incoming/models' \
-  --path '$remote/results' --path '__MODEL_ROOT__'"
+  --path '$remote/results' --path '__MODEL_ROOT__' --min-free-gb 100"
 rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   train-validation.tar.zst train-validation.sidecar.json "$user@$host:$remote/incoming/"
 rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \

@@ -272,7 +272,7 @@ temporary="$(mktemp -d "${TMPDIR:-/tmp}/voxdelta-image.XXXXXX")"
 trap 'rm -rf -- "$temporary"' EXIT
 zstd --quiet --decompress --stdout voxdelta-runpod.oci.tar.zst > "$temporary/image.oci.tar"
 skopeo copy --all --preserve-digests "oci-archive:$temporary/image.oci.tar" "docker://$1"
-remote="$(skopeo inspect --format '{{.Digest}}' "docker://$1")"
+remote="sha256:$(skopeo inspect --raw "docker://$1" | shasum -a 256 | awk '{print $1}')"
 if [[ "$remote" != "$expected" ]]; then
   echo "remote image digest mismatch" >&2
   exit 65

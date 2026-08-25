@@ -64,8 +64,8 @@ def test_configuration_rejects_unknown_or_sensitive_fields() -> None:
 def test_remote_roots_are_configurable_with_secure_defaults() -> None:
     config = load_experiment_config(CONFIG.resolve())
 
-    assert config.runtime.volume_root == "/workspace/voxdelta"
-    assert config.runtime.model_root == "/workspace/models"
+    assert config.runtime.volume_root == "/opt/voxdelta-run/runs"
+    assert config.runtime.model_root == "/opt/voxdelta-run/models"
 
     relocated = ExperimentConfig.model_validate(
         {

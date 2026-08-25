@@ -32,8 +32,9 @@ base_image = "docker.io/nvidia/cuda@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a
 gpu_model = "NVIDIA A40"
 gpu_count = 1
 gpu_memory_gb = 48
-volume_root = "/workspace/voxdelta"
-model_root = "/workspace/models"
+# container-disk roots: the RunPod network volume cannot hold 0700/0600
+volume_root = "/opt/voxdelta-run/runs"
+model_root = "/opt/voxdelta-run/models"
 volume_disk_gb = 100
 minimum_free_gb = 80
 

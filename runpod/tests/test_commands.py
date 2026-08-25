@@ -67,7 +67,7 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     )
     combined = "\n".join(path.read_text() for path in scripts)
     assert "<temporary-host>" not in combined and "VOXDELTA_RUN_ID" not in combined
-    assert "/workspace/voxdelta/run-622" in combined
+    assert "/opt/voxdelta-run/runs/run-622" in combined
     assert "final-holdout" not in combined
     assert "pilot" in (root / "01-preflight-and-pilot.sh").read_text()
     assert "full-or-resume" not in (root / "01-preflight-and-pilot.sh").read_text()

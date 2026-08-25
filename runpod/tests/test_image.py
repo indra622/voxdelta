@@ -217,6 +217,10 @@ def test_publish_image_handoff_is_private_complete_and_non_overwriting(tmp_path:
     # image-digest.txt records the manifest-list digest, so the whole index has
     # to move; a platform-selecting copy pushes one manifest and can never match.
     assert "skopeo copy --all --preserve-digests" in push_script
+    # inspect must not resolve a platform instance either: the operator machine is
+    # darwin/arm64 and image-digest.txt records the manifest-list digest.
+    assert "skopeo inspect --raw" in push_script
+    assert "{{.Digest}}" not in push_script
 
     with pytest.raises(ImageHandoffError, match="^handoff_exists$"):
         publish_image_handoff(
