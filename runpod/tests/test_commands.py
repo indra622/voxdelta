@@ -4,7 +4,13 @@ import os
 import subprocess
 from pathlib import Path
 
-from voxdelta_runpod.commands import render_operator_commands, update_checksums
+import pytest
+
+from voxdelta_runpod.commands import (
+    CommandPacketError,
+    render_operator_commands,
+    update_checksums,
+)
 
 
 def _executable(path: Path) -> Path:
@@ -70,6 +76,20 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     assert "full-retrieval.tar.zst" in (root / "03-download-results.sh").read_text()
     assert "run_remote_stage.py" in combined
 
+    # rsync --archive implies -o/-g; the RunPod receiver cannot chown on a
+    # network mount, which aborted the transfer with code 23.
+    rsync_lines = [line for line in combined.splitlines() if line.startswith("rsync ")]
+    assert rsync_lines
+    assert all(
+        "--no-owner" in line and "--no-group" in line and "--chmod=F600,D700" in line
+        for line in rsync_lines
+    )
+
+    # the capability probe must gate the first licensed-audio transfer
+    stage01 = (root / "01-preflight-and-pilot.sh").read_text()
+    assert "probe_filesystem.py" in stage01
+    assert stage01.index("probe_filesystem.py") < stage01.index("train-validation.tar.zst")
+
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     _executable(fake_bin / "ssh")
@@ -105,3 +125,32 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     assert "emotion2vec-baseline" in final_combined
     assert "final-consumed.json" in final_combined
     assert "final-retrieval.tar.zst" in final_combined
+
+
+def test_command_packets_honour_configured_remote_roots(tmp_path: Path) -> None:
+    root = (tmp_path / "handoff").resolve()
+    root.mkdir(mode=0o700)
+    scripts = render_operator_commands(
+        root,
+        run_id="run-622",
+        volume_root="/mnt/secure/voxdelta",
+        model_root="/mnt/secure/models",
+    )
+    combined = "\n".join(path.read_text() for path in scripts)
+
+    assert "/mnt/secure/voxdelta/run-622" in combined
+    assert "/mnt/secure/models/xls-r-300m" in combined
+    assert "/workspace" not in combined
+    assert all(
+        subprocess.run(["bash", "-n", str(path)], check=False).returncode == 0 for path in scripts
+    )
+
+
+def test_command_packets_reject_unsafe_remote_roots(tmp_path: Path) -> None:
+    root = (tmp_path / "handoff").resolve()
+    root.mkdir(mode=0o700)
+    for bad in ("relative/path", "/has space", "/quote'injection", "/back`tick", "/dots/../up"):
+        with pytest.raises(CommandPacketError, match="^invalid_command_target$"):
+            render_operator_commands(root, run_id="run-622", volume_root=bad)
+        with pytest.raises(CommandPacketError, match="^invalid_command_target$"):
+            render_operator_commands(root, run_id="run-622", model_root=bad)

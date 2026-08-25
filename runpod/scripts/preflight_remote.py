@@ -80,7 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--sidecar", required=True, type=Path)
     parser.add_argument("--data-root", required=True, type=Path)
     parser.add_argument("--container-sha256", required=True)
-    parser.add_argument("--base-model", type=Path, default=Path("/workspace/models/xls-r-300m"))
+    parser.add_argument("--base-model", type=Path, default=None)
     arguments = parser.parse_args(argv)
     try:
         import torch
@@ -93,7 +93,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         free = shutil.disk_usage(arguments.data_root.resolve().parent).free
         if free < config.runtime.minimum_free_gb * 1024**3:
             raise ValueError
-        prepared = validate_wav2vec_base(arguments.base_model.resolve())
+        base_model = arguments.base_model or Path(config.runtime.model_root) / "xls-r-300m"
+        prepared = validate_wav2vec_base(base_model.resolve())
         if prepared.weights_sha256 != config.model.weights_sha256:
             raise ValueError
         remote_root = arguments.data_root.resolve().parent

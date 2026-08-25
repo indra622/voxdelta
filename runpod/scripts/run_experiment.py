@@ -54,7 +54,7 @@ def _parser() -> argparse.ArgumentParser:
         stage = subparsers.add_parser(name)
         stage.add_argument("--config", required=True, type=Path)
         stage.add_argument("--root", required=True, type=Path)
-        stage.add_argument("--base-model", type=Path, default=Path("/workspace/models/xls-r-300m"))
+        stage.add_argument("--base-model", type=Path, default=None)
     probe = subparsers.add_parser("memory-probe-attempt")
     probe.add_argument("--config", required=True, type=Path)
     probe.add_argument("--root", required=True, type=Path)
@@ -319,7 +319,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config_path = arguments.config.resolve()
         root = arguments.root.resolve()
-        base_model = arguments.base_model.resolve()
+        base_model = (
+            arguments.base_model
+            or Path(load_experiment_config(config_path).runtime.model_root) / "xls-r-300m"
+        ).resolve()
         outcome = (
             _pilot(config_path, root, base_model)
             if arguments.stage == "pilot"

@@ -9,6 +9,8 @@ from pathlib import Path
 
 from voxdelta.evaluation.manifest import read_trusted_regular_file
 
+from voxdelta_runpod.config import validated_remote_root
+
 
 class CommandPacketError(ValueError):
     def __init__(self, code: str) -> None:
@@ -17,6 +19,10 @@ class CommandPacketError(ValueError):
 
 
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+_VOLUME_ROOT = "__VOLUME_ROOT__"
+_MODEL_ROOT = "__MODEL_ROOT__"
+DEFAULT_VOLUME_ROOT = "/workspace/voxdelta"
+DEFAULT_MODEL_ROOT = "/workspace/models"
 
 
 def _header() -> str:
@@ -26,7 +32,7 @@ umask 077
 if [[ $# -ne 3 ]]; then echo "usage: $0 <ssh-user> <ssh-host> <ssh-port>" >&2; exit 64; fi
 user="$1"; host="$2"; port="$3"
 root="$(cd "$(dirname "$0")" && pwd -P)"
-remote="/workspace/voxdelta/${VOXDELTA_RUN_ID:?set VOXDELTA_RUN_ID}"
+remote="__VOLUME_ROOT__/${VOXDELTA_RUN_ID:?set VOXDELTA_RUN_ID}"
 ssh_args=(-p "$port" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
 rsync_ssh="ssh -p $port -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 """
@@ -42,15 +48,19 @@ image_digest="$(tr -d '\n' < image-digest.txt)"
 container_sha256="${image_digest#sha256:}"
 ssh "${ssh_args[@]}" "$user@$host" \
   "install -d -m 700 '$remote/incoming' '$remote/incoming/models' '$remote/results'"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+ssh "${ssh_args[@]}" "$user@$host" \
+  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/probe_filesystem.py \
+  --path '$remote' --path '$remote/incoming' --path '$remote/incoming/models' \
+  --path '$remote/results' --path '__MODEL_ROOT__'"
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   train-validation.tar.zst train-validation.sidecar.json "$user@$host:$remote/incoming/"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   xls-r-base.tar.zst xls-r-base.sidecar.json "$user@$host:$remote/incoming/models/"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/extract_model_bundle.py \
   xls-r-base --archive '$remote/incoming/models/xls-r-base.tar.zst' \
   --sidecar '$remote/incoming/models/xls-r-base.sidecar.json' \
-  --target /workspace/models/xls-r-300m"
+  --target __MODEL_ROOT__/xls-r-300m"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/preflight_remote.py \
   --config /opt/voxdelta/runpod/config/experiment.toml \
@@ -63,7 +73,7 @@ ssh "${ssh_args[@]}" "$user@$host" \
   /opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_remote_stage.py \
   wait pilot --root '$remote'"
 install -d -m 700 "$root/results" "$root/results/pilots"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/pilots/" "$root/results/pilots/"
 """,
         "02-full-or-resume.sh": _header()
@@ -81,19 +91,19 @@ install -d -m 700 "$root/evidence/full"
 install -d -m 700 "$root/evidence/full/results/pilots"
 install -d -m 700 "$root/evidence/full/state/checkpoints"
 install -d -m 700 "$root/evidence/full/logs"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/full/" "$root/results/full/"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/pilots/" "$root/evidence/full/results/pilots/"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/state/checkpoints/" "$root/evidence/full/state/checkpoints/"
 for artifact in batch-profile.json environment.json preflight-complete.json run-identity.json; do
-  rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
     "$user@$host:$remote/state/$artifact" "$root/evidence/full/state/$artifact"
 done
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/logs/" "$root/evidence/full/logs/"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/ledger/" "$root/evidence/full/ledger/"
 install -d -m 700 "$root/archive"
 (
@@ -117,10 +127,13 @@ install -d -m 700 "$root/archive"
 cd "$root"; shasum -a 256 -c SHA256SUMS
 ssh "${ssh_args[@]}" "$user@$host" \
   "install -d -m 700 '$remote/incoming/final' '$remote/incoming/models'"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+ssh "${ssh_args[@]}" "$user@$host" \
+  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/probe_filesystem.py \
+  --path '$remote/incoming/final' --path '$remote/incoming/models' --path '__MODEL_ROOT__'"
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   final-holdout.tar.zst final-holdout.sidecar.json frozen-candidate.json \
   "$user@$host:$remote/incoming/final/"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   emotion2vec-baseline.tar.zst emotion2vec-baseline.sidecar.json \
   "$user@$host:$remote/incoming/models/"
 ssh "${ssh_args[@]}" "$user@$host" \
@@ -128,7 +141,7 @@ ssh "${ssh_args[@]}" "$user@$host" \
   emotion2vec-baseline \
   --archive '$remote/incoming/models/emotion2vec-baseline.tar.zst' \
   --sidecar '$remote/incoming/models/emotion2vec-baseline.sidecar.json' \
-  --target /workspace/models/emotion2vec-plus"
+  --target __MODEL_ROOT__/emotion2vec-plus"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/evaluate_final.py \
   --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote'"
@@ -139,15 +152,15 @@ install -d -m 700 "$root/results/final"
 install -d -m 700 "$root/evidence/final"
 install -d -m 700 "$root/evidence/final/state"
 install -d -m 700 "$root/evidence/final/logs"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/final/" "$root/results/final/"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/ledger/" "$root/evidence/final/ledger/"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/state/run-identity.json" "$root/evidence/final/state/run-identity.json"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/state/final-consumed.json" "$root/evidence/final/state/final-consumed.json"
-rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/logs/" "$root/evidence/final/logs/"
 install -d -m 700 "$root/archive"
 (
@@ -169,9 +182,21 @@ install -d -m 700 "$root/archive"
     }
 
 
-def render_operator_commands(output: Path, *, run_id: str, final: bool = False) -> tuple[Path, ...]:
+def render_operator_commands(
+    output: Path,
+    *,
+    run_id: str,
+    final: bool = False,
+    volume_root: str = DEFAULT_VOLUME_ROOT,
+    model_root: str = DEFAULT_MODEL_ROOT,
+) -> tuple[Path, ...]:
     if not output.is_absolute() or output.is_symlink() or not _RUN_ID.fullmatch(run_id):
         raise CommandPacketError("invalid_command_target")
+    try:
+        volume_root = validated_remote_root(volume_root)
+        model_root = validated_remote_root(model_root)
+    except ValueError as error:
+        raise CommandPacketError("invalid_command_target") from error
     output.mkdir(mode=0o700, parents=True, exist_ok=True)
     selected = (
         ("04-final-once.sh", "05-download-final.sh")
@@ -188,7 +213,11 @@ def render_operator_commands(output: Path, *, run_id: str, final: bool = False) 
         if path.exists() or path.is_symlink():
             raise CommandPacketError("command_packet_exists")
         payload = (
-            _scripts()[name].replace("${VOXDELTA_RUN_ID:?set VOXDELTA_RUN_ID}", run_id).encode()
+            _scripts()[name]
+            .replace("${VOXDELTA_RUN_ID:?set VOXDELTA_RUN_ID}", run_id)
+            .replace(_VOLUME_ROOT, volume_root)
+            .replace(_MODEL_ROOT, model_root)
+            .encode()
         )
         with path.open("xb") as stream:
             os.fchmod(stream.fileno(), 0o700)
@@ -213,4 +242,10 @@ def update_checksums(root: Path, files: tuple[Path, ...]) -> None:
     os.replace(temporary, sums)
 
 
-__all__ = ["CommandPacketError", "render_operator_commands", "update_checksums"]
+__all__ = [
+    "DEFAULT_MODEL_ROOT",
+    "DEFAULT_VOLUME_ROOT",
+    "CommandPacketError",
+    "render_operator_commands",
+    "update_checksums",
+]

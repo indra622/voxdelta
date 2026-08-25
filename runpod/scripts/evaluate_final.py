@@ -42,11 +42,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--root", required=True, type=Path)
-    parser.add_argument("--base-model", type=Path, default=Path("/workspace/models/xls-r-300m"))
+    parser.add_argument("--base-model", type=Path, default=None)
     parser.add_argument(
         "--baseline-checkpoint",
         type=Path,
-        default=Path("/workspace/models/emotion2vec-plus"),
+        default=None,
     )
     arguments = parser.parse_args(argv)
     root = arguments.root.resolve()
@@ -54,6 +54,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         import torch
 
         config = load_experiment_config(arguments.config.resolve())
+        model_root = Path(config.runtime.model_root)
+        base_model = arguments.base_model or model_root / "xls-r-300m"
+        baseline_checkpoint = arguments.baseline_checkpoint or model_root / "emotion2vec-plus"
         state = root / "state"
         results = root / "results"
         incoming = root / "incoming" / "final"
@@ -105,7 +108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             architecture="wav2vec-xls-r",
             device="cuda",
             split="test",
-            base_model_path=arguments.base_model.resolve(),
+            base_model_path=base_model.resolve(),
         )
         allocated, reserved = _cuda_peaks()
         xls_report = aggregate_from_backend(
@@ -117,14 +120,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         baseline_backend = evaluate_emotion_checkpoint(
             manifest,
-            arguments.baseline_checkpoint.resolve(),
+            baseline_checkpoint.resolve(),
             architecture="emotion2vec-plus",
             device="cuda",
             split="test",
         )
         baseline_report = aggregate_from_backend(
             baseline_backend,
-            checkpoint_root=arguments.baseline_checkpoint.resolve(),
+            checkpoint_root=baseline_checkpoint.resolve(),
             opened_test_count=config.data.final_holdout_count,
         )
         if (

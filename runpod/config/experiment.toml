@@ -33,6 +33,7 @@ gpu_model = "NVIDIA A40"
 gpu_count = 1
 gpu_memory_gb = 48
 volume_root = "/workspace/voxdelta"
+model_root = "/workspace/models"
 volume_disk_gb = 100
 minimum_free_gb = 80
 

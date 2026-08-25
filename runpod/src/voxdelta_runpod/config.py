@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import tomllib
 from pathlib import Path
 from typing import Literal
@@ -29,6 +30,16 @@ CANONICAL_LABELS: tuple[EmotionLabel, ...] = (
 BASE_IMAGE: Literal[
     "docker.io/nvidia/cuda@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9"
 ] = "docker.io/nvidia/cuda@sha256:9175fa92f96de35a8cfb9493f0dfcf9435c7a597e9d95ad41d2cae382a95e3f9"
+
+
+_REMOTE_ROOT = re.compile(r"^(?:/[A-Za-z0-9._-]+)+$")
+
+
+def validated_remote_root(value: str) -> str:
+    """Accept only an absolute, traversal-free path safe to quote into a shell packet."""
+    if not _REMOTE_ROOT.fullmatch(value) or ".." in value.split("/"):
+        raise ValueError("invalid remote root")
+    return value
 
 
 class _FrozenModel(BaseModel):
@@ -68,9 +79,15 @@ class RuntimeConfig(_FrozenModel):
     gpu_model: Literal["NVIDIA A40"] = "NVIDIA A40"
     gpu_count: Literal[1] = 1
     gpu_memory_gb: Literal[48] = 48
-    volume_root: Literal["/workspace/voxdelta"] = "/workspace/voxdelta"
+    volume_root: str = "/workspace/voxdelta"
+    model_root: str = "/workspace/models"
     volume_disk_gb: Literal[100] = 100
     minimum_free_gb: Literal[80] = 80
+
+    @field_validator("volume_root", "model_root")
+    @classmethod
+    def safe_remote_root(cls, value: str) -> str:
+        return validated_remote_root(value)
 
 
 class TrainingConfig(_FrozenModel):

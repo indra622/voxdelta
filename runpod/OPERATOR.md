@@ -104,9 +104,13 @@ bash ./01-preflight-and-pilot.sh \
   "$RUNPOD_SSH_USER" "$RUNPOD_SSH_HOST" "$RUNPOD_SSH_PORT"
 ```
 
-스크립트는 local checksum 확인, mode `0700` remote root 생성, `rsync --partial`, remote
+스크립트는 local checksum 확인, mode `0700` remote root 생성, 대상 파일시스템이
+`0700`/`0600`을 실제로 유지하는지 확인하는 capability probe, `rsync --partial`, remote
 checksum 재검증, archive member 검사, CUDA/BF16/GPU/disk/base/code preflight, pilot A/B
 실행까지만 담당한다. full stage는 포함하지 않는다.
+
+probe가 실패하면 licensed audio와 base model을 전송하기 전에 중단된다. 일부 RunPod
+region의 network volume은 요청한 mode를 무시하므로, 그런 Pod에는 데이터를 올리지 않는다.
 
 pilot aggregate 결과를 내려받아 에이전트가 gate를 판정한 뒤, 통과한 경우에만:
 

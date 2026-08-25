@@ -72,7 +72,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(read_trusted_regular_file(candidate_path))
         baseline = _copy_baseline(arguments.baseline_bundle_root.resolve(), output)
-        scripts = render_operator_commands(output, run_id=arguments.run_id, final=True)
+        scripts = render_operator_commands(
+            output,
+            run_id=arguments.run_id,
+            final=True,
+            volume_root=config.runtime.volume_root,
+            model_root=config.runtime.model_root,
+        )
         update_checksums(
             output,
             (

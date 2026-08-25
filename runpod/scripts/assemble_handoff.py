@@ -11,6 +11,7 @@ from pathlib import Path
 from voxdelta.evaluation.manifest import read_trusted_regular_file
 
 from voxdelta_runpod.commands import render_operator_commands, update_checksums
+from voxdelta_runpod.config import load_experiment_config
 
 IMAGE_FILES = frozenset(
     {
@@ -23,6 +24,7 @@ IMAGE_FILES = frozenset(
 )
 TRAINING_FILES = frozenset({"train-validation.tar.zst", "train-validation.sidecar.json"})
 BASE_MODEL_FILES = frozenset({"xls-r-base.tar.zst", "xls-r-base.sidecar.json"})
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config" / "experiment.toml"
 
 
 def _trusted_files(root: Path, expected: frozenset[str]) -> dict[str, Path]:
@@ -47,6 +49,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--base-model-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     arguments = parser.parse_args(argv)
     output = arguments.output.resolve()
     staging = output.with_name(f".{output.name}.staging")
@@ -64,7 +67,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             except OSError:
                 shutil.copyfile(source, destination)
                 destination.chmod(source.stat(follow_symlinks=False).st_mode & 0o700)
-        scripts = render_operator_commands(staging, run_id=arguments.run_id)
+        runtime = load_experiment_config(arguments.config.resolve()).runtime
+        scripts = render_operator_commands(
+            staging,
+            run_id=arguments.run_id,
+            volume_root=runtime.volume_root,
+            model_root=runtime.model_root,
+        )
         files = tuple(
             path for path in staging.iterdir() if path.is_file() and path.name != "SHA256SUMS"
         )

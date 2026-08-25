@@ -59,3 +59,51 @@ def test_configuration_rejects_unknown_or_sensitive_fields() -> None:
 
     with pytest.raises(ValueError):
         ExperimentConfig.model_validate(payload)
+
+
+def test_remote_roots_are_configurable_with_secure_defaults() -> None:
+    config = load_experiment_config(CONFIG.resolve())
+
+    assert config.runtime.volume_root == "/workspace/voxdelta"
+    assert config.runtime.model_root == "/workspace/models"
+
+    relocated = ExperimentConfig.model_validate(
+        {
+            **config.model_dump(mode="json"),
+            "runtime": {
+                **config.runtime.model_dump(mode="json"),
+                "volume_root": "/mnt/secure/voxdelta",
+                "model_root": "/mnt/secure/models",
+            },
+        }
+    )
+    assert relocated.runtime.volume_root == "/mnt/secure/voxdelta"
+    assert relocated.runtime.model_root == "/mnt/secure/models"
+    assert relocated.digest() != config.digest()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "relative/path",
+        "/trailing/slash/",
+        "/dots/../escape",
+        "/has space",
+        "/quote'injection",
+        "/back`tick",
+        "/dollar$sign",
+        "/semi;colon",
+        "",
+        "/",
+    ],
+)
+def test_remote_roots_reject_unsafe_values(value: str) -> None:
+    config = load_experiment_config(CONFIG.resolve())
+    for field in ("volume_root", "model_root"):
+        with pytest.raises(ValueError):
+            ExperimentConfig.model_validate(
+                {
+                    **config.model_dump(mode="json"),
+                    "runtime": {**config.runtime.model_dump(mode="json"), field: value},
+                }
+            )
