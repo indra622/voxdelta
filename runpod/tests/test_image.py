@@ -240,6 +240,30 @@ def test_docker_context_is_an_explicit_code_only_allowlist() -> None:
     assert "/Users/" not in dockerfile and "/Volumes/" not in dockerfile
 
 
+def test_pod_image_provides_operator_access_and_transfer_tooling() -> None:
+    dockerfile = (RUNPOD / "docker" / "Dockerfile").read_text()
+    assert "openssh-server" in dockerfile
+    assert "rsync" in dockerfile
+    assert 'ENTRYPOINT ["/usr/local/bin/voxdelta-start"]' in dockerfile
+    assert "/usr/sbin/sshd" in dockerfile
+
+    ignore = (RUNPOD / "docker" / "Dockerfile.dockerignore").read_text().splitlines()
+    assert "!runpod/docker/start.sh" in ignore
+    assert "!runpod/docker/sshd.conf" in ignore
+
+    start = RUNPOD / "docker" / "start.sh"
+    assert subprocess.run(["bash", "-n", str(start)], check=False).returncode == 0
+    body = start.read_text()
+    assert "PUBLIC_KEY" in body
+    assert "ssh-keygen -A" in body
+    assert "VOXDELTA_CODE_SHA256" in body
+    assert body.rstrip().endswith('exec "$@"')
+
+    daemon = (RUNPOD / "docker" / "sshd.conf").read_text()
+    assert "PermitRootLogin prohibit-password" in daemon
+    assert "PasswordAuthentication no" in daemon
+
+
 def test_build_and_push_scripts_have_valid_shell_syntax() -> None:
     build_script = RUNPOD / "scripts" / "build_image.sh"
     completed = subprocess.run(

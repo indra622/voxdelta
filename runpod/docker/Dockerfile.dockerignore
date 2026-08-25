@@ -7,6 +7,9 @@
 !runpod/
 !runpod/pyproject.toml
 !runpod/uv.lock
+!runpod/docker/
+!runpod/docker/sshd.conf
+!runpod/docker/start.sh
 !runpod/config/
 !runpod/config/**
 !runpod/scripts/

@@ -13,6 +13,21 @@ def _executable(path: Path) -> Path:
     return path
 
 
+def _fake_rsync(path: Path) -> Path:
+    """Stand in for rsync, including its refusal to create a missing parent."""
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'destination="${@: -1}"\n'
+        'if [[ "$destination" == *:* ]]; then exit 0; fi\n'
+        'parent="$(dirname "$destination")"\n'
+        '[[ -d "$parent" ]] || { echo "rsync: mkdir failed: $destination" >&2; exit 1; }\n'
+        'if [[ "$destination" == */ ]]; then mkdir -p "$destination"; fi\n'
+    )
+    path.chmod(0o700)
+    return path
+
+
 def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     tmp_path: Path,
 ) -> None:
@@ -58,7 +73,7 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     _executable(fake_bin / "ssh")
-    _executable(fake_bin / "rsync")
+    _fake_rsync(fake_bin / "rsync")
     environment = dict(os.environ)
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     completed = subprocess.run(
@@ -70,6 +85,8 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
+    assert (root / "results" / "pilots").is_dir()
+    assert (root / "results" / "pilots").stat().st_mode & 0o077 == 0
 
     final_root = (root / "final").resolve()
     final_root.mkdir(mode=0o700)

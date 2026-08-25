@@ -29,8 +29,15 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
         libsndfile1 \
+        openssh-server \
         python3.12 \
+        rsync \
     && rm -rf /var/lib/apt/lists/*
+
+COPY runpod/docker/sshd.conf /etc/ssh/sshd_config.d/voxdelta.conf
+COPY runpod/docker/start.sh /usr/local/bin/voxdelta-start
+RUN chmod 0644 /etc/ssh/sshd_config.d/voxdelta.conf \
+    && chmod 0755 /usr/local/bin/voxdelta-start
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
@@ -51,5 +58,5 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && find /opt/voxdelta -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 WORKDIR /workspace/voxdelta
-ENTRYPOINT ["/opt/voxdelta/runpod/.venv/bin/python"]
-CMD ["-c", "from voxdelta_runpod.config import CANONICAL_LABELS; print('voxdelta-runpod-ready', len(CANONICAL_LABELS))"]
+ENTRYPOINT ["/usr/local/bin/voxdelta-start"]
+CMD ["/usr/sbin/sshd", "-D", "-e"]

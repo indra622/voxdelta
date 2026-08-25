@@ -62,7 +62,8 @@ ssh "${ssh_args[@]}" "$user@$host" \
   launch pilot --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote' && \
   /opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/run_remote_stage.py \
   wait pilot --root '$remote'"
-rsync --archive --partial -e "$rsync_ssh" \
+install -d -m 700 "$root/results" "$root/results/pilots"
+rsync --archive --partial --chmod=F600,D700 -e "$rsync_ssh" \
   "$user@$host:$remote/results/pilots/" "$root/results/pilots/"
 """,
         "02-full-or-resume.sh": _header()
