@@ -99,6 +99,28 @@ class Utterance(SpeakerSegment):
     transcript: str
 
 
+class EmotionCalibration(BaseModel):
+    """Post-hoc calibration applied to one result, and whether it was abstained on.
+
+    Present only when a verified calibration artifact is enabled. Its absence means the
+    result carries the provider's raw scores, which is the default and unchanged
+    behaviour: nothing downstream may read the confidence as calibrated without this.
+    """
+
+    calibration_id: str = Field(min_length=1)
+    method: Literal["temperature-scaling"]
+    temperature: float = Field(gt=0)
+    abstain_threshold: float = Field(ge=0, le=1)
+    abstained: bool
+    raw_confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def finite_calibration(self) -> EmotionCalibration:
+        if not isfinite(self.temperature):
+            raise ValueError("temperature must be finite")
+        return self
+
+
 class EmotionResult(BaseModel):
     utterance_id: str
     probabilities: dict[EmotionLabel, float]
@@ -108,6 +130,7 @@ class EmotionResult(BaseModel):
     confidence: float = Field(ge=0, le=1)
     provider: ProviderProvenance
     usage: ProviderUsage | None = None
+    calibration: EmotionCalibration | None = None
 
     @model_validator(mode="after")
     def valid_distribution(self) -> EmotionResult:
@@ -120,6 +143,14 @@ class EmotionResult(BaseModel):
             raise ValueError("emotion probabilities must be between zero and one")
         if abs(sum(self.probabilities.values()) - 1.0) > 1e-6:
             raise ValueError("emotion probabilities must sum to one")
+        calibration = self.calibration
+        if calibration is not None:
+            # The abstain decision is the threshold comparison, not an independent
+            # claim: a result cannot say it answered while its confidence says otherwise.
+            if calibration.abstained != (self.confidence < calibration.abstain_threshold):
+                raise ValueError("abstained must follow from the calibrated confidence")
+            if calibration.abstained and self.operational_state != "uncertain":
+                raise ValueError("an abstained result must not assert an operational state")
         return self
 
 

@@ -67,6 +67,8 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
     )
     combined = "\n".join(path.read_text() for path in scripts)
     assert "<temporary-host>" not in combined and "VOXDELTA_RUN_ID" not in combined
+    assert "ServerAliveInterval=15" in combined
+    assert "ServerAliveCountMax=4" in combined
     assert "/opt/voxdelta-run/runs/run-622" in combined
     assert "final-holdout" not in combined
     assert "pilot" in (root / "01-preflight-and-pilot.sh").read_text()
@@ -122,9 +124,20 @@ def test_command_packets_are_stage_separated_syntax_valid_and_fake_rehearsed(
         for path in final_scripts
     )
     final_combined = "\n".join(path.read_text() for path in final_scripts)
+    assert "ServerAliveInterval=15" in final_combined
+    assert "ServerAliveCountMax=4" in final_combined
     assert "emotion2vec-baseline" in final_combined
+    assert "xls-r-base.tar.zst" in final_combined
+    assert "full-state.tar.zst" in final_combined
+    assert ".final-restore.staging" in final_combined
+    assert final_combined.index("full-state.tar.zst") < final_combined.index("evaluate_final.py")
     assert "final-consumed.json" in final_combined
     assert "final-retrieval.tar.zst" in final_combined
+    download_final = (final_root / "05-download-final.sh").read_text()
+    assert "install -d -m 700 '$remote/logs'" in download_final
+    assert download_final.index("install -d -m 700 '$remote/logs'") < download_final.index(
+        '"$user@$host:$remote/logs/"'
+    )
 
 
 def test_command_packets_honour_configured_remote_roots(tmp_path: Path) -> None:

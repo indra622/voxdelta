@@ -49,10 +49,7 @@ def test_detached_stage_persists_log_status_and_is_idempotent(tmp_path: Path) ->
     assert status.outcome == "succeeded" and status.attempt == 1 and status.exit_code == 0
     assert "fake training completed" in (root / "logs" / "pilot.log").read_text()
     assert (root / "runner-ok").read_text() == "ok"
-    assert all(
-        path.stat().st_mode & 0o077 == 0
-        for path in (root / "state" / "stages").iterdir()
-    )
+    assert all(path.stat().st_mode & 0o077 == 0 for path in (root / "state" / "stages").iterdir())
 
 
 def test_wait_reports_failed_detached_stage(tmp_path: Path) -> None:
@@ -83,8 +80,5 @@ def test_wait_reports_failed_detached_stage(tmp_path: Path) -> None:
         assert time.monotonic() < deadline
         time.sleep(0.01)
     assert (
-        module.main(
-            ["wait", "full-or-resume", "--root", str(root), "--poll-interval", "0.01"]
-        )
-        == 3
+        module.main(["wait", "full-or-resume", "--root", str(root), "--poll-interval", "0.01"]) == 3
     )

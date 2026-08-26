@@ -91,14 +91,11 @@ def _validate_tree(root: Path, kind: BundleKind) -> tuple[dict[str, str], dict[s
         raise ModelBundleError("invalid_model_input")
     try:
         entries = tuple(root.iterdir())
-        if (
-            {entry.name for entry in entries} != _FILES[kind]
-            or any(
-                entry.is_symlink()
-                or not entry.is_file()
-                or entry.stat(follow_symlinks=False).st_mode & 0o077
-                for entry in entries
-            )
+        if {entry.name for entry in entries} != _FILES[kind] or any(
+            entry.is_symlink()
+            or not entry.is_file()
+            or entry.stat(follow_symlinks=False).st_mode & 0o077
+            for entry in entries
         ):
             raise ModelBundleError("invalid_model_input")
         if kind == "xls-r-base":
@@ -220,9 +217,7 @@ def extract_model_bundle(
     sidecar_path = sidecar_path.resolve()
     target = target.resolve()
     try:
-        sidecar = ModelBundleSidecar.model_validate_json(
-            read_trusted_regular_file(sidecar_path)
-        )
+        sidecar = ModelBundleSidecar.model_validate_json(read_trusted_regular_file(sidecar_path))
         if sidecar.bundle_kind != expected_kind or _digest(archive) != (
             sidecar.archive_sha256,
             sidecar.archive_bytes,

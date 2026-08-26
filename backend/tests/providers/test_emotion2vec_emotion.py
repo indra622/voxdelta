@@ -68,6 +68,7 @@ class FakeFactory:
     def __init__(self, predictor: FakePredictor) -> None:
         self.predictor = predictor
         self.calls: list[tuple[Path, str, str, str, str, bool]] = []
+        self.encoder_sources: list[Path | None] = []
 
     def __call__(
         self,
@@ -78,10 +79,12 @@ class FakeFactory:
         encoder_hash: str,
         device: str,
         freeze_encoder: bool,
+        encoder_source: Path | None = None,
     ) -> FakePredictor:
         self.calls.append(
             (checkpoint, encoder_id, encoder_revision, encoder_hash, device, freeze_encoder)
         )
+        self.encoder_sources.append(encoder_source)
         return self.predictor
 
 
@@ -307,3 +310,77 @@ def test_encoder_hash_mismatch_fails_safely() -> None:
         _verify_encoder_identity(object(), expected_hash="a" * 64, hasher=lambda _encoder: "b" * 64)
 
     assert raised.value.code == "invalid_local_checkpoint"
+
+
+# --- local encoder bundle: the loader must name a directory, not a hub id ---
+
+
+def test_the_encoder_source_is_threaded_from_the_provider_to_the_factory(
+    tmp_path: Path,
+) -> None:
+    from voxdelta.providers.emotion2vec_emotion import Emotion2VecEmotionProvider
+
+    predictor = FakePredictor([0.1] * 7)
+    factory = FakeFactory(predictor)
+    bundle = tmp_path / "encoder-bundle"
+    bundle.mkdir()
+
+    provider = Emotion2VecEmotionProvider(
+        _checkpoint(tmp_path / "checkpoint"),
+        device="cpu",
+        encoder_source=bundle,
+        model_factory=factory,
+        hardware_probe=lambda: (False, False),
+    )
+    provider._load()
+
+    assert factory.encoder_sources == [bundle]
+
+
+def test_without_an_encoder_source_production_behaviour_is_unchanged(tmp_path: Path) -> None:
+    from voxdelta.providers.emotion2vec_emotion import Emotion2VecEmotionProvider
+
+    predictor = FakePredictor([0.1] * 7)
+    factory = FakeFactory(predictor)
+
+    provider = Emotion2VecEmotionProvider(
+        _checkpoint(tmp_path / "checkpoint"),
+        device="cpu",
+        model_factory=factory,
+        hardware_probe=lambda: (False, False),
+    )
+    provider._load()
+
+    assert factory.encoder_sources == [None]
+
+
+def test_the_default_encoder_factory_names_a_directory_when_given_a_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Naming a hub id makes the loader resolve remotely; a directory stays local."""
+
+    import voxdelta.providers.emotion2vec_emotion as module
+
+    seen: list[dict[str, object]] = []
+
+    class FakeFunasr:
+        @staticmethod
+        def AutoModel(**kwargs: object) -> object:  # noqa: N802 - mirrors funasr's name
+            seen.append(kwargs)
+            return object()
+
+    monkeypatch.setattr(module, "import_module", lambda name: FakeFunasr())
+
+    module._default_encoder_factory(
+        "iic/emotion2vec_plus_large",
+        revision="v2.0.5",
+        device="cpu",
+        encoder_source=tmp_path / "bundle",
+    )
+    module._default_encoder_factory("iic/emotion2vec_plus_large", revision="v2.0.5", device="cpu")
+
+    assert seen[0]["model"] == str(tmp_path / "bundle")
+    assert "model_revision" not in seen[0]
+    assert seen[0]["disable_update"] is True
+    assert seen[1]["model"] == "iic/emotion2vec_plus_large"
+    assert seen[1]["model_revision"] == "v2.0.5"

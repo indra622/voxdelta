@@ -156,6 +156,32 @@ network volume을 삭제한 다음 RunPod 콘솔에서 Pod와 volume이 모두 �
 없는지 확인한다. Registry image와 로컬 결과 archive는 학습 재개 필요성에 따라 별도로
 보관하거나 정리한다.
 
+## 릴리스 봉인
+
+최종 비교가 XLS-R 승격으로 끝난 뒤에만 수행한다. 전부 로컬 작업이며 RunPod 접속, 추가
+과금, holdout 재개봉이 없다. Pod/volume 삭제 전후 어느 쪽에서도 실행할 수 있다.
+
+```bash
+uv run --project runpod python runpod/scripts/build_release.py ...
+uv run --project runpod python runpod/scripts/verify_release.py \
+  --bundle "$(pwd)/runpod/dist/$VOXDELTA_RUN_ID/release/$RELEASE_ID"
+uv run --project runpod python runpod/scripts/smoke_release_inference.py \
+  --bundle "$(pwd)/runpod/dist/$VOXDELTA_RUN_ID/release/$RELEASE_ID"
+```
+
+정확한 `build_release.py` 인자는 `README.md`의 릴리스 블록을 따른다. 세 명령은 각각
+`release_built`, `release_verified`, `release_smoke_ok`만 성공 신호로 인정한다. 스모크는
+번들 안의 `checkpoint/`와 `base-model/`만 읽어 오프라인으로 재적재하며, 합성 클립 한 개의
+집계만 출력한다. 실패 시 코드만 출력되므로 번들을 수정하지 말고 에이전트에게 전달한다.
+
+calibration은 릴리스 번들에 덧쓰지 않고 별도 불변 artifact로 게시한다. 로컬의
+train-validation 패키지에서 validation 3,569건만 추출하고, item id·reference label·audio
+SHA-256이 packaged manifest와 정확히 일치하는지 확인한 뒤 `build_calibration.py`를 실행한다.
+final holdout archive/report는 인자로 전달하지 않는다. 기본 제품 기준은 target coverage
+`0.9`이며, 출력의 temperature·abstain threshold·coverage·answered accuracy·ECE 전후 값을
+기록한다. backend에서는 release flag와 calibration flag/path를 함께 켜며, artifact가 exact
+release/checkpoint에 결속되지 않으면 startup이 fail-closed 해야 한다.
+
 Claude Code가 실제 실행을 맡아도 된다. 단, RunPod MCP 인증, registry credential helper,
 SSH agent/키, `rsync`, `zstd`는 각각 실행 환경에 준비되어 있어야 한다. Pod 생성·시작과
 volume 생성은 비용 발생 전 승인을 받고, final 1회 실행과 Pod/volume 삭제는 별도 명시

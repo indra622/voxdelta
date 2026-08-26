@@ -33,8 +33,10 @@ if [[ $# -ne 3 ]]; then echo "usage: $0 <ssh-user> <ssh-host> <ssh-port>" >&2; e
 user="$1"; host="$2"; port="$3"
 root="$(cd "$(dirname "$0")" && pwd -P)"
 remote="__VOLUME_ROOT__/${VOXDELTA_RUN_ID:?set VOXDELTA_RUN_ID}"
-ssh_args=(-p "$port" -o BatchMode=yes -o StrictHostKeyChecking=accept-new)
-rsync_ssh="ssh -p $port -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+ssh_args=(-p "$port" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+rsync_ssh="ssh -p $port -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 """
 
 
@@ -126,28 +128,61 @@ install -d -m 700 "$root/archive"
         + """
 cd "$root"; shasum -a 256 -c SHA256SUMS
 ssh "${ssh_args[@]}" "$user@$host" \
-  "install -d -m 700 '$remote/incoming/final' '$remote/incoming/models'"
+  "install -d -m 700 '$remote/incoming/final' '$remote/incoming/models' \
+  '$remote/incoming/restore'"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/probe_filesystem.py \
-  --path '$remote/incoming/final' --path '$remote/incoming/models' --path '__MODEL_ROOT__'"
+  --path '$remote' --path '$remote/incoming/final' --path '$remote/incoming/models' \
+  --path '$remote/incoming/restore' --path '__MODEL_ROOT__' --min-free-gb 10"
 rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
-  final-holdout.tar.zst final-holdout.sidecar.json frozen-candidate.json \
-  "$user@$host:$remote/incoming/final/"
-rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  xls-r-base.tar.zst xls-r-base.sidecar.json \
   emotion2vec-baseline.tar.zst emotion2vec-baseline.sidecar.json \
   "$user@$host:$remote/incoming/models/"
+ssh "${ssh_args[@]}" "$user@$host" \
+  "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/extract_model_bundle.py \
+  xls-r-base --archive '$remote/incoming/models/xls-r-base.tar.zst' \
+  --sidecar '$remote/incoming/models/xls-r-base.sidecar.json' \
+  --target __MODEL_ROOT__/xls-r-300m"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/extract_model_bundle.py \
   emotion2vec-baseline \
   --archive '$remote/incoming/models/emotion2vec-baseline.tar.zst' \
   --sidecar '$remote/incoming/models/emotion2vec-baseline.sidecar.json' \
   --target __MODEL_ROOT__/emotion2vec-plus"
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  full-state.tar.zst full-state.tar.zst.sha256 \
+  "$user@$host:$remote/incoming/restore/"
+ssh "${ssh_args[@]}" "$user@$host" \
+  "set -euo pipefail; umask 077; cd '$remote/incoming/restore'; \
+  sha256sum -c full-state.tar.zst.sha256; \
+  if [[ ! -f '$remote/results/full/report.json' ]]; then \
+    [[ ! -e '$remote/results/full' && ! -e '$remote/ledger' \
+      && ! -e '$remote/state/run-identity.json' \
+      && ! -e '$remote/.final-restore.staging' ]]; \
+    install -d -m 700 '$remote/.final-restore.staging'; \
+    tar --zstd --no-same-owner --no-same-permissions \
+      -xf full-state.tar.zst -C '$remote/.final-restore.staging'; \
+    [[ -f '$remote/.final-restore.staging/results/full/report.json' \
+      && -f '$remote/.final-restore.staging/state/run-identity.json' \
+      && -d '$remote/.final-restore.staging/ledger' ]]; \
+    install -d -m 700 '$remote/results' '$remote/state'; \
+    mv '$remote/.final-restore.staging/results/full' '$remote/results/full'; \
+    mv '$remote/.final-restore.staging/ledger' '$remote/ledger'; \
+    mv '$remote/.final-restore.staging/state/run-identity.json' \
+      '$remote/state/run-identity.json'; \
+    rmdir '$remote/.final-restore.staging/results' \
+      '$remote/.final-restore.staging/state' '$remote/.final-restore.staging'; \
+  fi"
+rsync --archive --no-owner --no-group --partial --chmod=F600,D700 -e "$rsync_ssh" \
+  final-holdout.tar.zst final-holdout.sidecar.json frozen-candidate.json \
+  "$user@$host:$remote/incoming/final/"
 ssh "${ssh_args[@]}" "$user@$host" \
   "/opt/voxdelta/runpod/.venv/bin/python /opt/voxdelta/runpod/scripts/evaluate_final.py \
   --config /opt/voxdelta/runpod/config/experiment.toml --root '$remote'"
 """,
         "05-download-final.sh": _header()
         + """
+ssh "${ssh_args[@]}" "$user@$host" "install -d -m 700 '$remote/logs'"
 install -d -m 700 "$root/results/final"
 install -d -m 700 "$root/evidence/final"
 install -d -m 700 "$root/evidence/final/state"

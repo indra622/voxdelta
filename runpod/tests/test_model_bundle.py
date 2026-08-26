@@ -35,9 +35,12 @@ def _baseline(root: Path) -> Path:
             "class_weighting": "inverse-frequency",
             "class_weights": [1.0] * 7,
         },
-        "label_mapping.json": {str(index): label for index, label in enumerate(
-            ["happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise"]
-        )},
+        "label_mapping.json": {
+            str(index): label
+            for index, label in enumerate(
+                ["happiness", "anger", "disgust", "fear", "neutral", "sadness", "surprise"]
+            )
+        },
         "metrics.json": {"macro_f1": 0.24, "validation_hash": "b" * 64},
     }
     for name, payload in payloads.items():

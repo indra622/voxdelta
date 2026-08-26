@@ -17,6 +17,8 @@ from voxdelta.providers.base import (
     EmotionProvider,
     TranscriptionProvider,
 )
+from voxdelta.providers.calibrated_emotion import CalibratedEmotionProvider
+from voxdelta.providers.calibration_artifact import verify_calibration_artifact
 from voxdelta.providers.emotion2vec_emotion import (
     Emotion2VecEmotionProvider,
 )
@@ -45,6 +47,7 @@ from voxdelta.providers.qwen3_asr import (
 from voxdelta.providers.qwen3_asr import (
     ModelFactory as QwenModelFactory,
 )
+from voxdelta.providers.release_bundle import verify_release_bundle
 from voxdelta.providers.wav2vec_emotion import (
     ModelFactory as Wav2VecFactory,
 )
@@ -131,6 +134,24 @@ def build_dependencies(
 
         if selected.emotion_provider == "fake":
             emotion = FakeEmotionProvider()
+        elif selected.xlsr_release_enabled:
+            if selected.emotion_provider != "wav2vec" or selected.xlsr_release_path is None:
+                raise ProviderConfigurationError()
+            release = verify_release_bundle(selected.xlsr_release_path)
+            emotion = Wav2VecEmotionProvider(
+                release.checkpoint_path,
+                base_model_path=release.base_model_path,
+                device=selected.emotion_device,
+                model_factory=factories.wav2vec_model,
+            )
+            if selected.xlsr_calibration_enabled:
+                if selected.xlsr_calibration_path is None:
+                    raise ProviderConfigurationError()
+                calibration = verify_calibration_artifact(
+                    selected.xlsr_calibration_path,
+                    release=release,
+                )
+                emotion = CalibratedEmotionProvider(emotion, calibration)
         else:
             if selected.emotion_checkpoint_path is None:
                 raise ProviderConfigurationError()

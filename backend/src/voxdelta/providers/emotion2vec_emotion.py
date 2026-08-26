@@ -39,6 +39,7 @@ class ModelFactory(Protocol):
         encoder_hash: str,
         device: str,
         freeze_encoder: bool,
+        encoder_source: Path | None = None,
     ) -> Predictor: ...
 
 
@@ -54,6 +55,7 @@ class _Emotion2VecPredictor:
         encoder_revision: str,
         expected_encoder_hash: str,
         device: str,
+        encoder_source: Path | None = None,
     ) -> None:
         try:
             torch = import_module("torch")
@@ -68,7 +70,10 @@ class _Emotion2VecPredictor:
                 raise ValueError
             embedding_size = int(raw_embedding_size)
             self._encoder = _default_encoder_factory(
-                encoder_id, revision=encoder_revision, device=device
+                encoder_id,
+                revision=encoder_revision,
+                device=device,
+                encoder_source=encoder_source,
             )
             _verify_encoder_identity(
                 self._encoder,
@@ -120,14 +125,45 @@ def _default_factory(
     encoder_hash: str,
     device: str,
     freeze_encoder: bool,
+    encoder_source: Path | None = None,
 ) -> Predictor:
     if not freeze_encoder:
         raise ProviderError("invalid_local_checkpoint")
-    return _Emotion2VecPredictor(checkpoint, encoder_id, encoder_revision, encoder_hash, device)
+    return _Emotion2VecPredictor(
+        checkpoint,
+        encoder_id,
+        encoder_revision,
+        encoder_hash,
+        device,
+        encoder_source=encoder_source,
+    )
 
 
-def _default_encoder_factory(encoder_id: str, *, revision: str, device: str) -> _Encoder:
+def _default_encoder_factory(
+    encoder_id: str,
+    *,
+    revision: str,
+    device: str,
+    encoder_source: Path | None = None,
+) -> _Encoder:
+    """Load the encoder, from a verified local bundle when one was supplied.
+
+    Naming the model by id makes the loader resolve it against a remote repository even
+    when a cache is populated. Naming an absolute directory keeps the load entirely
+    local. The directory is only ever one a caller has already verified; this function
+    does not decide what is trustworthy.
+    """
+
     funasr = import_module("funasr")
+    if encoder_source is not None:
+        return cast(
+            _Encoder,
+            funasr.AutoModel(
+                model=str(encoder_source),
+                device=device,
+                disable_update=True,
+            ),
+        )
     return cast(
         _Encoder,
         funasr.AutoModel(
@@ -159,6 +195,7 @@ class Emotion2VecEmotionProvider:
         checkpoint_path: str | Path,
         *,
         device: Device = "auto",
+        encoder_source: Path | None = None,
         model_factory: ModelFactory | None = None,
         hardware_probe: Callable[[], tuple[bool, bool]] | None = None,
         inference_context: Callable[[], AbstractContextManager[object]] | None = None,
@@ -177,6 +214,7 @@ class Emotion2VecEmotionProvider:
             revision=self._checkpoint.digest,
         )
         self._requested_device = device
+        self._encoder_source = encoder_source
         self._factory = model_factory or _default_factory
         self._hardware_probe = hardware_probe or default_hardware_probe
         self._inference_context = inference_context or default_inference_context
@@ -197,6 +235,7 @@ class Emotion2VecEmotionProvider:
                 encoder_hash=cast(str, self._checkpoint.encoder_hash),
                 device=device,
                 freeze_encoder=True,
+                encoder_source=self._encoder_source,
             )
         except ProviderError:
             raise

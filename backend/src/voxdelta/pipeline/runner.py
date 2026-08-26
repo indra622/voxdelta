@@ -185,6 +185,12 @@ class PipelineRunner:
         self._locks: dict[str, RLock] = {}
         self._locks_guard = Lock()
 
+    @property
+    def emotion_provider(self) -> EmotionProvider:
+        """The composed emotion provider, so readiness tooling need not reach inside."""
+
+        return self._emotion
+
     def _job_lock(self, job_id: str) -> RLock:
         with self._locks_guard:
             return self._locks.setdefault(job_id, RLock())

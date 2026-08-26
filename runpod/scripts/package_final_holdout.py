@@ -12,14 +12,14 @@ from voxdelta.evaluation.manifest import read_trusted_regular_file
 
 from voxdelta_runpod.commands import render_operator_commands, update_checksums
 from voxdelta_runpod.config import load_experiment_config
+from voxdelta_runpod.final_restore import build_final_restore_bundle
 from voxdelta_runpod.gates import FrozenCandidate, build_authorized_final_package
 
-BASELINE_FILES = frozenset(
-    {"emotion2vec-baseline.tar.zst", "emotion2vec-baseline.sidecar.json"}
-)
+BASELINE_FILES = frozenset({"emotion2vec-baseline.tar.zst", "emotion2vec-baseline.sidecar.json"})
+BASE_MODEL_FILES = frozenset({"xls-r-base.tar.zst", "xls-r-base.sidecar.json"})
 
 
-def _copy_baseline(root: Path, output: Path) -> tuple[Path, ...]:
+def _copy_bundle(root: Path, output: Path, expected: frozenset[str]) -> tuple[Path, ...]:
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise ValueError
     files = {
@@ -27,7 +27,7 @@ def _copy_baseline(root: Path, output: Path) -> tuple[Path, ...]:
         for path in root.iterdir()
         if path.is_file() and not path.is_symlink() and path.name != "SHA256SUMS"
     }
-    if set(files) != BASELINE_FILES:
+    if set(files) != expected:
         raise ValueError
     copied: list[Path] = []
     for name, source in sorted(files.items()):
@@ -50,6 +50,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--authorization-marker", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
     parser.add_argument("--baseline-bundle-root", required=True, type=Path)
+    parser.add_argument("--base-model-bundle-root", required=True, type=Path)
+    parser.add_argument("--full-result-root", required=True, type=Path)
+    parser.add_argument("--full-ledger-root", required=True, type=Path)
+    parser.add_argument("--run-identity", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
     arguments = parser.parse_args(argv)
@@ -71,7 +75,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         with frozen.open("xb") as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(read_trusted_regular_file(candidate_path))
-        baseline = _copy_baseline(arguments.baseline_bundle_root.resolve(), output)
+        baseline = _copy_bundle(arguments.baseline_bundle_root.resolve(), output, BASELINE_FILES)
+        base_model = _copy_bundle(
+            arguments.base_model_bundle_root.resolve(), output, BASE_MODEL_FILES
+        )
+        restore = build_final_restore_bundle(
+            arguments.full_result_root.resolve(),
+            arguments.full_ledger_root.resolve(),
+            arguments.run_identity.resolve(),
+            output,
+        )
         scripts = render_operator_commands(
             output,
             run_id=arguments.run_id,
@@ -86,6 +99,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output / "final-holdout.sidecar.json",
                 frozen,
                 *baseline,
+                *base_model,
+                *restore,
                 *scripts,
             ),
         )

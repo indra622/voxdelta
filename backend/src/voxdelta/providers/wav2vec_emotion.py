@@ -146,6 +146,12 @@ class Wav2VecEmotionProvider:
         self._rss_probe = rss_probe or default_rss_probe
         self._predictor: Predictor | None = None
 
+    @property
+    def model_loaded(self) -> bool:
+        """Whether the heavy model is allocated yet; verification must precede this."""
+
+        return self._predictor is not None
+
     def _load(self) -> Predictor:
         if self._predictor is not None:
             return self._predictor

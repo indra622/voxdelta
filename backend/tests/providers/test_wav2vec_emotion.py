@@ -683,3 +683,66 @@ def test_transformers_predictor_loads_verified_base_local_only(
     assert calls[0] == ("extractor", str(tmp_path / "base"), {"local_files_only": True})
     assert calls[1][0:2] == ("model", str(tmp_path / "base"))
     assert calls[1][2]["local_files_only"] is True
+
+
+def test_transformers_predictor_binds_the_fixed_seven_class_head_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voxdelta.providers.wav2vec_emotion as module
+
+    calls: list[tuple[str, str, dict[str, object]]] = []
+    loaded: list[str] = []
+
+    class Loader:
+        def __init__(self, kind: str, result: object) -> None:
+            self.kind = kind
+            self.result = result
+
+        def from_pretrained(self, source: str, **kwargs: object) -> object:
+            calls.append((self.kind, source, kwargs))
+            return self.result
+
+    class Model:
+        def load_state_dict(self, state: object) -> None:
+            assert state == {}
+
+        def to(self, device: str) -> None:
+            assert device == "cpu"
+
+        def eval(self) -> None:
+            pass
+
+    class Transformers:
+        AutoFeatureExtractor = Loader("extractor", object())
+        AutoModelForAudioClassification = Loader("model", Model())
+
+    class Safetensors:
+        @staticmethod
+        def load_file(path: str) -> dict[str, object]:
+            loaded.append(path)
+            return {}
+
+    modules = {
+        "torch": object(),
+        "transformers": Transformers(),
+        "safetensors.torch": Safetensors(),
+    }
+    monkeypatch.setattr(module, "import_module", lambda name: modules[name])
+    bundle = tmp_path / "release"
+    checkpoint = bundle / "checkpoint"
+    checkpoint.mkdir(parents=True)
+    base = bundle / "base-model"
+    base.mkdir()
+
+    module._TransformersPredictor(checkpoint, base, "cpu")
+
+    assert [call[0:2] for call in calls] == [
+        ("extractor", str(base)),
+        ("model", str(base)),
+    ]
+    assert all(call[2]["local_files_only"] is True for call in calls)
+    head = calls[1][2]
+    assert head["num_labels"] == 7
+    assert head["id2label"] == dict(enumerate(LABELS))
+    assert head["label2id"] == {label: index for index, label in enumerate(LABELS)}
+    assert loaded == [str(checkpoint / "model.safetensors")]

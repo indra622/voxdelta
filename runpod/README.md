@@ -145,7 +145,60 @@ uv run --project runpod python runpod/scripts/assemble_handoff.py \
 The resulting `runpod/dist/<run-id>/` is the only training handoff. Candidate freeze and
 final packaging use `freeze_candidate.py` and `package_final_holdout.py`. Build the pinned
 emotion2vec baseline with `package_model_bundle.py emotion2vec-baseline` and pass its output
-as `--baseline-bundle-root` when making the final package.
+as `--baseline-bundle-root` when making the final package. Final packaging also requires the
+XLS-R base bundle, verified full result, append-only ledger, and run identity. It emits a
+checksum-covered `full-state.tar.zst`, allowing `04-final-once.sh` to restore the minimum
+authenticated evaluation state on a fresh Pod after the training Pod has been deleted.
+
+After the final comparison promotes XLS-R, `build_release.py` seals the result into an
+immutable release bundle: the fine-tuned checkpoint, the pinned base model whose feature
+extractor the runtime loads, frozen provenance and hashed configuration, a model card, a
+deterministic `RELEASE.json`, and `SHA256SUMS`. `verify_release.py` re-verifies integrity,
+provenance, and reload prerequisites. `smoke_release_inference.py` then proves the raw release
+still infers offline from `checkpoint/` and `base-model/` alone. These commands do not mutate
+an already published release.
+
+Calibration is published separately so the promoted release remains byte-for-byte immutable.
+`build_calibration.py` reads only the train-validation package, proves that the evaluation
+manifest exactly matches its 3,569 validation identities and audio digests, runs offline local
+inference, fits one temperature by validation NLL, and selects an abstain threshold at an
+explicit target coverage. Its resumable cache is bound per row to item id, audio digest,
+reference label, and index. The output contains only aggregate fit values and validation
+provenance; it contains no per-item scores and has no final-holdout input. The production
+backend verifies this artifact against the exact release before wrapping the provider.
+
+```bash
+release_id='xls-r-emotion-7class-v1'
+uv run --project runpod python runpod/scripts/build_release.py \
+  --checkpoint-dir '<absolute-promoted-checkpoint-directory>' \
+  --base-archive "$(pwd)/runpod/packages/$run_id-xls-r-base/xls-r-base.tar.zst" \
+  --base-sidecar "$(pwd)/runpod/packages/$run_id-xls-r-base/xls-r-base.sidecar.json" \
+  --frozen-candidate '<absolute-frozen-candidate-json>' \
+  --validation-report '<absolute-full-validation-report-json>' \
+  --final-report '<absolute-final-report-json>' \
+  --baseline-report '<absolute-baseline-final-report-json>' \
+  --decision '<absolute-final-decision-json>' \
+  --config "$(pwd)/runpod/config/experiment.toml" \
+  --output "$(pwd)/runpod/dist/$run_id/release/$release_id" \
+  --release-id "$release_id"
+uv run --project runpod python runpod/scripts/verify_release.py \
+  --bundle "$(pwd)/runpod/dist/$run_id/release/$release_id"
+uv run --project runpod python runpod/scripts/smoke_release_inference.py \
+  --bundle "$(pwd)/runpod/dist/$run_id/release/$release_id"
+
+calibration_id="${release_id}-calibration-v1"
+PYTHONPATH="$(pwd)/backend/src:$(pwd)/runpod/src" \
+uv run --project runpod python runpod/scripts/build_calibration.py \
+  --release "$(pwd)/runpod/dist/$run_id/release/$release_id" \
+  --packaged-manifest '<absolute-extracted-train-validation-manifest>' \
+  --sidecar "$(pwd)/runpod/dist/$run_id/train-validation.sidecar.json" \
+  --evaluation-manifest '<absolute-validation-only-evaluation-manifest>' \
+  --cache '<absolute-private-resumable-cache>' \
+  --output "$(pwd)/runpod/dist/$run_id/calibration/$calibration_id" \
+  --calibration-id "$calibration_id" \
+  --target-coverage 0.9 \
+  --device cpu
+```
 
 Pilot and full stages are launched by `run_remote_stage.py`, so a local SSH disconnect does
 not terminate training. Each epoch's validation metrics are retained in

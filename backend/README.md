@@ -65,6 +65,28 @@ Application settings are read from `VOXDELTA_` process-environment variables. Uv
 - `VOXDELTA_ADMISSION_RECONCILIATION_LEASE_SECONDS`: stale admission recovery lease; default
   `300`.
 - `VOXDELTA_MAX_ACTIVE_JOBS`: maximum incomplete jobs admitted at once; default `8`.
+- `VOXDELTA_XLSR_RELEASE_ENABLED`: opt in to the promoted local XLS-R seven-emotion release;
+  default `false`. When it is unset or false the emotion stage behaves exactly as before.
+- `VOXDELTA_XLSR_RELEASE_PATH`: absolute directory of the immutable release bundle. It is
+  required when the flag is on, and it must then be the only emotion source: the flag also
+  requires `VOXDELTA_EMOTION_PROVIDER=wav2vec` and forbids `VOXDELTA_EMOTION_CHECKPOINT_PATH`.
+  At startup the bundle's `RELEASE.json`, `SHA256SUMS`, payload bytes, checkpoint and
+  base-model files, pinned encoder identity, and fixed seven-class label order are all verified
+  offline. Any missing, symlinked, tampered, malformed, incompatible, or wrong-label bundle
+  fails startup with the generic provider-configuration error and never falls back to another
+  model.
+- `VOXDELTA_XLSR_CALIBRATION_ENABLED`: opt in to release-bound temperature scaling and
+  abstention; default `false`. It requires the promoted XLS-R release flag.
+- `VOXDELTA_XLSR_CALIBRATION_PATH`: absolute directory of the separately versioned
+  calibration artifact. When calibration is enabled, startup verifies its manifest,
+  checksums, validation-only provenance, and exact release/checkpoint binding before wrapping
+  the XLS-R provider. Rejection fails closed and never falls back to raw confidence.
+
+Before enabling either flag anywhere that matters, measure the pair locally with
+`scripts/check_release_readiness.py` and follow [`CANARY_RUNBOOK.md`](CANARY_RUNBOOK.md),
+which carries the exact environment, the go/no-go gates, the staged shadow/canary
+sequence, and the one-step rollback. The readiness runner reads validation-only or
+synthetic audio, never the sealed final holdout, and publishes an aggregate-only report.
 - `VOXDELTA_API_CAPABILITY_TOKEN`: per-launch local API capability. Supply a fresh high-entropy
   value of at least 32 visible HTTP-header ASCII characters (`!` through `~`) in the process
   environment; it is held as a secret in memory and is never logged or persisted by VoxDelta.

@@ -17,6 +17,7 @@ from voxdelta.domain.models import (
     ProviderProvenance,
     ProviderUsage,
 )
+from voxdelta.evaluation.calibration import CalibrationSummary, fit_temperature_scaling
 from voxdelta.evaluation.emotion_experiment import (
     EmotionExperimentReport,
     build_stratified_smoke_manifest,
@@ -510,3 +511,182 @@ def test_evaluation_cli_failure_is_sanitized(tmp_path: Path) -> None:
     assert completed.stdout == ""
     assert completed.stderr == "emotion evaluation failed\n"
     assert "private" not in completed.stderr
+
+
+def test_validation_evaluation_fits_calibration_without_retaining_item_scores(
+    tmp_path: Path,
+) -> None:
+    manifest = _smoke_evaluation_manifest(tmp_path)
+    provider = FakeProvider()
+
+    report = evaluate_emotion_checkpoint(
+        manifest,
+        tmp_path / "checkpoint",
+        architecture="emotion2vec-plus",
+        split="validation",
+        calibration_target_coverage=0.9,
+        provider_factory=lambda _checkpoint, _device: provider,
+    )
+
+    assert report.schema_version == "3"
+    calibration = report.calibration
+    assert calibration is not None
+    assert calibration.method == "temperature-scaling"
+    assert calibration.fitted_item_count == report.completed_count
+    assert calibration.target_coverage == 0.9
+    assert calibration.achieved_coverage >= 0.9
+    assert 0 <= calibration.abstain_threshold <= 1
+    assert calibration.post_temperature_ece <= calibration.pre_temperature_ece
+
+    serialized = report.model_dump_json()
+    for forbidden in ("transcript", "audio_path", "validation-happiness-", "test-surprise-"):
+        assert forbidden not in serialized
+    # Only the aggregate summary survives: no per-item score or identity.
+    assert set(json.loads(serialized)["calibration"]) == set(calibration.model_dump())
+
+
+def test_evaluation_without_a_requested_coverage_fits_no_calibration(tmp_path: Path) -> None:
+    manifest = _smoke_evaluation_manifest(tmp_path)
+    provider = FakeProvider()
+
+    report = evaluate_emotion_checkpoint(
+        manifest,
+        tmp_path / "checkpoint",
+        architecture="emotion2vec-plus",
+        split="validation",
+        provider_factory=lambda _checkpoint, _device: provider,
+    )
+
+    assert report.calibration is None
+    assert json.loads(report.model_dump_json())["calibration"] is None
+
+
+def test_calibration_is_refused_on_the_sealed_test_split_before_any_inference(
+    tmp_path: Path,
+) -> None:
+    manifest = _smoke_evaluation_manifest(tmp_path)
+    provider = FakeProvider()
+
+    with pytest.raises(ValueError, match="^calibration_requires_validation_split$"):
+        evaluate_emotion_checkpoint(
+            manifest,
+            tmp_path / "checkpoint",
+            architecture="emotion2vec-plus",
+            split="test",
+            calibration_target_coverage=0.9,
+            provider_factory=lambda _checkpoint, _device: provider,
+        )
+
+    # The refusal happens before the manifest is opened or the provider is built.
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize("coverage", [0.0, -0.5, 1.5, float("nan"), float("inf")])
+def test_calibration_rejects_an_impossible_target_coverage(tmp_path: Path, coverage: float) -> None:
+    manifest = _smoke_evaluation_manifest(tmp_path)
+    provider = FakeProvider()
+
+    with pytest.raises(ValueError, match="^invalid_calibration_target_coverage$"):
+        evaluate_emotion_checkpoint(
+            manifest,
+            tmp_path / "checkpoint",
+            architecture="emotion2vec-plus",
+            split="validation",
+            calibration_target_coverage=coverage,
+            provider_factory=lambda _checkpoint, _device: provider,
+        )
+
+    assert provider.calls == []
+
+
+def test_report_refuses_a_calibration_attached_to_a_test_split_report() -> None:
+    calibration = fit_temperature_scaling(
+        [{label: 1 / 7 for label in LABELS}, {label: 1 / 7 for label in LABELS}],
+        ["happiness", "anger"],
+        target_coverage=1.0,
+    )
+    assert isinstance(calibration, CalibrationSummary)
+    fields = _report_fixture().model_dump()
+    fields.pop("schema_version")
+    fields.pop("split")
+    fields.pop("calibration")
+
+    with pytest.raises(ValueError, match="invalid experiment report"):
+        EmotionExperimentReport(**fields, split="test", calibration=calibration)
+
+    validation = EmotionExperimentReport(**fields, split="validation", calibration=calibration)
+    assert validation.calibration == calibration
+    assert EmotionExperimentReport(**fields, split="test").calibration is None
+
+
+def test_evaluation_cli_forwards_the_requested_calibration_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(BACKEND))
+    from scripts.evaluate_emotion_checkpoint import _parser
+
+    assert (
+        _parser()
+        .parse_args(
+            [
+                "--manifest",
+                "/manifest.jsonl",
+                "--checkpoint",
+                "/checkpoint",
+                "--output",
+                "/report.json",
+                "--architecture",
+                "emotion2vec-plus",
+            ]
+        )
+        .calibration_target_coverage
+        is None
+    )
+
+    arguments = _parser().parse_args(
+        [
+            "--manifest",
+            "/manifest.jsonl",
+            "--checkpoint",
+            "/checkpoint",
+            "--output",
+            "/report.json",
+            "--architecture",
+            "emotion2vec-plus",
+            "--split",
+            "validation",
+            "--calibration-target-coverage",
+            "0.9",
+        ]
+    )
+    assert arguments.calibration_target_coverage == 0.9
+
+    import scripts.evaluate_emotion_checkpoint as cli
+
+    seen: dict[str, object] = {}
+
+    def capture(*_args: object, **kwargs: object) -> EmotionExperimentReport:
+        seen.update(kwargs)
+        raise ValueError("stop")
+
+    monkeypatch.setattr(cli, "evaluate_emotion_checkpoint", capture)
+    assert (
+        cli.main(
+            [
+                "--manifest",
+                "/manifest.jsonl",
+                "--checkpoint",
+                "/checkpoint",
+                "--output",
+                "/report.json",
+                "--architecture",
+                "emotion2vec-plus",
+                "--split",
+                "validation",
+                "--calibration-target-coverage",
+                "0.9",
+            ]
+        )
+        == 2
+    )
+    assert seen["calibration_target_coverage"] == 0.9

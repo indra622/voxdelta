@@ -45,9 +45,7 @@ def _driver_version() -> str:
     return versions.pop()
 
 
-def _runtime_environment(
-    torch: Any, remote_root: Path, identity_sha256: str
-) -> RuntimeEnvironment:
+def _runtime_environment(torch: Any, remote_root: Path, identity_sha256: str) -> RuntimeEnvironment:
     cuda = torch.cuda
     cudnn = torch.backends.cudnn.version()
     cuda_version = torch.version.cuda

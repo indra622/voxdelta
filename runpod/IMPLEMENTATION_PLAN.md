@@ -106,6 +106,12 @@ effective batch 16, encoder LR `1e-5`, head LR `1e-4`, AdamW weight decay `0.01`
 warmup `0.1`, clipping `1.0`, deterministic crop keys, epoch validation, best-checkpoint
 restore, and patience two.
 
+After promotion, run one local validation-only pass against the immutable release. Fit one
+temperature by negative log-likelihood and one abstain threshold at the explicitly selected
+target coverage, then publish those scalars as a separate release-bound artifact. The
+resumable private cache is per-item bound and never shipped; the sealed final holdout is not
+an input.
+
 The preflight memory probe tries micro-batches `8, 4, 2, 1` in fresh processes with
 accumulation `2, 4, 8, 16`. Each attempt covers synthetic forward/backward and the fixed
 14-train/7-validation actual-data slice, checkpoint publication, reload, and provider
@@ -135,9 +141,15 @@ Add narrowly scoped scripts:
 - `scripts/preflight_remote.py`: image/GPU/storage/base/code/archive verification;
 - `scripts/run_experiment.py`: `pilot`, `full`, and safe `resume` stages;
 - `scripts/freeze_candidate.py`: publish validation decision and holdout capability;
-- `scripts/package_final_holdout.py`: local one-time package after user authorization;
+- `scripts/package_final_holdout.py`: local one-time package after user authorization,
+  including the minimal authenticated full-stage state required by a fresh Pod;
 - `scripts/evaluate_final.py`: two-provider aggregate final evaluation exactly once;
-- `scripts/verify_retrieved_results.py`: local digest, ledger, privacy, and provider checks.
+- `scripts/verify_retrieved_results.py`: local digest, ledger, privacy, and provider checks;
+- `scripts/build_release.py`: assemble the immutable raw release bundle after promotion;
+- `scripts/verify_release.py`: re-verify one release bundle's integrity and identity;
+- `scripts/smoke_release_inference.py`: offline reload and one synthetic forward pass;
+- `scripts/build_calibration.py`: fit validation-only temperature scaling and publish a
+  separate release-bound abstention artifact.
 
 CLIs return stable non-sensitive error codes, refuse overwrite, and never print private
 paths, item identities, credentials, raw predictions, or evidence contents. The user runs
@@ -180,7 +192,9 @@ Keep implementation reviewable in this order:
 6. CUDA training/preflight;
 7. gates/final sealing;
 8. CLIs;
-9. end-to-end tests/operator docs.
+9. end-to-end tests/operator docs;
+10. calibration/abstention fit and its release surface;
+11. release bundle sealing and offline reload smoke.
 
 Each commit must pass its focused tests and static checks. No live RunPod call, data
 transfer, full training, holdout opening, model promotion, push, or destructive cleanup is
@@ -203,7 +217,15 @@ Implementation is complete only when all of the following pass from a clean work
 - generated command-packet shell syntax checks and a fake-SSH/rsync rehearsal proving the
   user can perform each stage without editing generated scripts;
 - independent confirmation that the backend does not import `voxdelta_runpod` and the
-  final holdout cannot be opened before freeze or more than once.
+  final holdout cannot be opened before freeze or more than once;
+- a release bundle round trip: build, re-verify, tamper rejection, and an offline
+  reload smoke inference that loads only from the bundle's own `checkpoint/` and
+  `base-model/` directories;
+- calibration fitted on the development split only, refused on the sealed `test`
+  split and on any aggregate that opened holdout items, carried as scalars into
+  `results/full/report.json`, published as a separate release-bound artifact that
+  leaves the frozen release byte-identical, and applied by the backend's calibrated
+  provider after that artifact verifies against the exact release.
 
 Passing these gates produces the first Docker/manual command packet. It does not authorize
 billable infrastructure, registry login/push, actual-data transfer, holdout use, or

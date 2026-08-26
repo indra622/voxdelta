@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     asr_device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     qwen_profile: Literal["default", "low-memory"] = "default"
     emotion_device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
+    xlsr_release_enabled: bool = False
+    xlsr_release_path: Path | None = None
+    xlsr_calibration_enabled: bool = False
+    xlsr_calibration_path: Path | None = None
 
     model_config = SettingsConfigDict(env_prefix="VOXDELTA_", extra="ignore")
 
@@ -43,6 +47,32 @@ class Settings(BaseSettings):
     def valid_audio_limits(self) -> Settings:
         if self.min_audio_seconds > self.max_audio_seconds:
             raise ValueError("min_audio_seconds must not exceed max_audio_seconds")
+        return self
+
+    @model_validator(mode="after")
+    def valid_promoted_release_selection(self) -> Settings:
+        """Reject release combinations that would leave the promoted bundle ambiguous.
+
+        Messages name settings only; a configured bundle location is never echoed.
+        """
+
+        if self.xlsr_release_path is not None and not self.xlsr_release_path.is_absolute():
+            raise ValueError("xlsr_release_path must be absolute")
+        if self.xlsr_calibration_path is not None and not self.xlsr_calibration_path.is_absolute():
+            raise ValueError("xlsr_calibration_path must be absolute")
+        if self.xlsr_calibration_enabled:
+            if not self.xlsr_release_enabled:
+                raise ValueError("xlsr_calibration_enabled requires xlsr_release_enabled")
+            if self.xlsr_calibration_path is None:
+                raise ValueError("xlsr_calibration_enabled requires xlsr_calibration_path")
+        if not self.xlsr_release_enabled:
+            return self
+        if self.xlsr_release_path is None:
+            raise ValueError("xlsr_release_enabled requires xlsr_release_path")
+        if self.emotion_provider != "wav2vec":
+            raise ValueError("xlsr_release_enabled requires emotion_provider=wav2vec")
+        if self.emotion_checkpoint_path is not None:
+            raise ValueError("xlsr_release_enabled forbids emotion_checkpoint_path")
         return self
 
 

@@ -29,6 +29,12 @@ def clear_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "VOXDELTA_MIN_AUDIO_SECONDS",
         "VOXDELTA_MAX_UPLOAD_BYTES",
         "VOXDELTA_ADMISSION_RECONCILIATION_LEASE_SECONDS",
+        "VOXDELTA_EMOTION_PROVIDER",
+        "VOXDELTA_EMOTION_CHECKPOINT_PATH",
+        "VOXDELTA_XLSR_RELEASE_ENABLED",
+        "VOXDELTA_XLSR_RELEASE_PATH",
+        "VOXDELTA_XLSR_CALIBRATION_ENABLED",
+        "VOXDELTA_XLSR_CALIBRATION_PATH",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -149,6 +155,211 @@ def test_public_loader_rejects_minimum_audio_limit_above_maximum(
         env_file,
         "VOXDELTA_MIN_AUDIO_SECONDS=61\nVOXDELTA_MAX_AUDIO_SECONDS=60\n",
     )
+
+    with pytest.raises(ValidationError):
+        config_module().load_settings(env_file)
+
+
+def test_promoted_release_flag_defaults_to_disabled_with_no_bundle_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    monkeypatch.delenv("VOXDELTA_XLSR_RELEASE_ENABLED", raising=False)
+    monkeypatch.delenv("VOXDELTA_XLSR_RELEASE_PATH", raising=False)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(env_file, "")
+
+    settings = config_module().load_settings(env_file)
+
+    assert settings.xlsr_release_enabled is False
+    assert settings.xlsr_release_path is None
+
+
+def test_promoted_release_settings_parse_from_the_environment_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    monkeypatch.delenv("VOXDELTA_XLSR_RELEASE_ENABLED", raising=False)
+    monkeypatch.delenv("VOXDELTA_XLSR_RELEASE_PATH", raising=False)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "\n".join(
+            (
+                "VOXDELTA_EMOTION_PROVIDER=wav2vec",
+                "VOXDELTA_XLSR_RELEASE_ENABLED=true",
+                "VOXDELTA_XLSR_RELEASE_PATH=/srv/releases/xls-r-emotion-7class-v1",
+            )
+        ),
+    )
+
+    settings = config_module().load_settings(env_file)
+
+    assert settings.xlsr_release_enabled is True
+    assert settings.xlsr_release_path == Path("/srv/releases/xls-r-emotion-7class-v1")
+    assert settings.emotion_provider == "wav2vec"
+
+
+def test_promoted_release_flag_requires_a_bundle_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "VOXDELTA_EMOTION_PROVIDER=wav2vec\nVOXDELTA_XLSR_RELEASE_ENABLED=true\n",
+    )
+
+    with pytest.raises(ValidationError):
+        config_module().load_settings(env_file)
+
+
+@pytest.mark.parametrize("provider", ["fake", "emotion2vec"])
+def test_promoted_release_flag_requires_the_wav2vec_emotion_provider(
+    provider: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "\n".join(
+            (
+                f"VOXDELTA_EMOTION_PROVIDER={provider}",
+                "VOXDELTA_XLSR_RELEASE_ENABLED=true",
+                "VOXDELTA_XLSR_RELEASE_PATH=/srv/releases/xls-r-emotion-7class-v1",
+            )
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        config_module().load_settings(env_file)
+
+
+def test_promoted_release_flag_forbids_a_separate_emotion_checkpoint_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "\n".join(
+            (
+                "VOXDELTA_EMOTION_PROVIDER=wav2vec",
+                "VOXDELTA_EMOTION_CHECKPOINT_PATH=/srv/other/checkpoint",
+                "VOXDELTA_XLSR_RELEASE_ENABLED=true",
+                "VOXDELTA_XLSR_RELEASE_PATH=/srv/releases/xls-r-emotion-7class-v1",
+            )
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        config_module().load_settings(env_file)
+
+
+def test_promoted_release_bundle_path_must_be_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "\n".join(
+            (
+                "VOXDELTA_EMOTION_PROVIDER=wav2vec",
+                "VOXDELTA_XLSR_RELEASE_ENABLED=true",
+                "VOXDELTA_XLSR_RELEASE_PATH=releases/xls-r-emotion-7class-v1",
+            )
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        config_module().load_settings(env_file)
+
+
+def test_settings_validation_errors_never_disclose_the_configured_bundle_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    secret = "/srv/private-release-sentinel"
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "\n".join(
+            (
+                "VOXDELTA_EMOTION_PROVIDER=fake",
+                "VOXDELTA_XLSR_RELEASE_ENABLED=true",
+                f"VOXDELTA_XLSR_RELEASE_PATH={secret}",
+            )
+        ),
+    )
+
+    with pytest.raises(ValidationError) as raised:
+        config_module().load_settings(env_file)
+
+    assert secret not in str(raised.value)
+
+
+def test_xlsr_calibration_defaults_off_with_no_artifact_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(env_file, "")
+
+    settings = config_module().load_settings(env_file)
+
+    assert settings.xlsr_calibration_enabled is False
+    assert settings.xlsr_calibration_path is None
+
+
+def test_xlsr_calibration_parses_only_with_the_promoted_release_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(
+        env_file,
+        "\n".join(
+            (
+                "VOXDELTA_EMOTION_PROVIDER=wav2vec",
+                "VOXDELTA_XLSR_RELEASE_ENABLED=true",
+                "VOXDELTA_XLSR_RELEASE_PATH=/srv/releases/xls-r-emotion-7class-v1",
+                "VOXDELTA_XLSR_CALIBRATION_ENABLED=true",
+                "VOXDELTA_XLSR_CALIBRATION_PATH=/srv/calibration/xls-r-emotion-7class-v1-calibration-v1",
+            )
+        ),
+    )
+
+    settings = config_module().load_settings(env_file)
+
+    assert settings.xlsr_calibration_enabled is True
+    assert settings.xlsr_calibration_path == Path(
+        "/srv/calibration/xls-r-emotion-7class-v1-calibration-v1"
+    )
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "VOXDELTA_XLSR_CALIBRATION_ENABLED=true\n"
+        "VOXDELTA_XLSR_CALIBRATION_PATH=/srv/calibration/v1\n",
+        "VOXDELTA_EMOTION_PROVIDER=wav2vec\n"
+        "VOXDELTA_XLSR_RELEASE_ENABLED=true\n"
+        "VOXDELTA_XLSR_RELEASE_PATH=/srv/releases/v1\n"
+        "VOXDELTA_XLSR_CALIBRATION_ENABLED=true\n",
+        "VOXDELTA_EMOTION_PROVIDER=wav2vec\n"
+        "VOXDELTA_XLSR_RELEASE_ENABLED=true\n"
+        "VOXDELTA_XLSR_RELEASE_PATH=/srv/releases/v1\n"
+        "VOXDELTA_XLSR_CALIBRATION_ENABLED=true\n"
+        "VOXDELTA_XLSR_CALIBRATION_PATH=calibration/v1\n",
+    ),
+)
+def test_xlsr_calibration_rejects_incomplete_or_relative_configuration(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_settings_environment(monkeypatch)
+    env_file = tmp_path / "backend" / ".env"
+    write_env(env_file, content)
 
     with pytest.raises(ValidationError):
         config_module().load_settings(env_file)

@@ -45,6 +45,7 @@ def _parser() -> argparse.ArgumentParser:
         choices=("validation", "test"),
         default="test",
     )
+    parser.add_argument("--calibration-target-coverage", type=float, default=None)
     return parser
 
 
@@ -60,6 +61,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             device=cast(Device, arguments.device),
             split=cast(EvaluationSplit, arguments.split),
             base_model_path=arguments.base_model_path,
+            calibration_target_coverage=arguments.calibration_target_coverage,
         )
         write_experiment_report(arguments.output, report)
     except Exception:

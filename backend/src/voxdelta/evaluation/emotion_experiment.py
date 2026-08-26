@@ -17,6 +17,11 @@ from typing import Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from voxdelta.domain.models import EmotionLabel
+from voxdelta.evaluation.calibration import (
+    CalibrationSummary,
+    expected_calibration_error,
+    fit_temperature_scaling,
+)
 from voxdelta.evaluation.manifest import (
     DatasetItem,
     DatasetSplit,
@@ -57,7 +62,7 @@ class EmotionExperimentReport(BaseModel):
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    schema_version: Literal["2"] = "2"
+    schema_version: Literal["3"] = "3"
     architecture: Literal["emotion2vec-plus", "wav2vec-xls-r"]
     model_id: str = Field(min_length=1)
     checkpoint_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -74,9 +79,14 @@ class EmotionExperimentReport(BaseModel):
     peak_rss_mb: float | None = Field(default=None, ge=0)
     elapsed_seconds: float = Field(ge=0)
     requested_device: Device
+    calibration: CalibrationSummary | None = None
 
     @model_validator(mode="after")
     def valid_aggregate_contract(self) -> EmotionExperimentReport:
+        # Calibration may only ever be fitted on the development split. Fitting it
+        # on `test` would tune against the sealed final holdout.
+        if self.calibration is not None and self.split != "validation":
+            raise ValueError("invalid experiment report")
         if (
             self.completed_count > self.item_count
             or abs(self.completion_rate - self.completed_count / self.item_count) > 1e-12
@@ -108,7 +118,9 @@ def _reject_symlink_components(path: Path, error_code: str) -> None:
             raise ValueError(error_code)
 
 
-def _publish_private_file(path: Path, payload: bytes, error_code: str) -> None:
+def publish_private_file(path: Path, payload: bytes, error_code: str) -> None:
+    """Atomically publish one private file, refusing overwrite and symlinked parents."""
+
     if not path.is_absolute():
         raise ValueError(error_code)
     target = Path(os.path.abspath(path.expanduser()))
@@ -213,7 +225,7 @@ def build_stratified_smoke_manifest(
         raise ValueError("invalid_smoke_manifest") from None
 
     payload = _smoke_payload(selected)
-    _publish_private_file(output, payload, "smoke_manifest_publication_failed")
+    publish_private_file(output, payload, "smoke_manifest_publication_failed")
     return SmokeManifestSummary(
         total_count=len(selected),
         split_counts=dict(Counter(item.split for item in selected)),
@@ -250,24 +262,12 @@ def _aggregate_metrics(
         scores[label] = 0.0 if denominator == 0 else 2 * true_positive / denominator
     macro_f1 = math.fsum(scores.values()) / len(CANONICAL_LABELS)
 
-    bins: list[list[tuple[bool, float]]] = [[] for _ in range(10)]
-    for truth, guess, score in zip(expected, predicted, confidence, strict=True):
-        bins[min(int(score * 10), 9)].append((truth == guess, score))
-    expected_calibration_error = math.fsum(
-        len(bucket)
-        / len(expected)
-        * abs(
-            math.fsum(float(correct) for correct, _ in bucket) / len(bucket)
-            - math.fsum(score for _, score in bucket) / len(bucket)
-        )
-        for bucket in bins
-        if bucket
-    )
+    correct = tuple(truth == guess for truth, guess in zip(expected, predicted, strict=True))
     return (
         macro_f1,
         scores,
         tuple(tuple(row) for row in matrix),
-        expected_calibration_error,
+        expected_calibration_error(correct, confidence),
     )
 
 
@@ -297,8 +297,15 @@ def evaluate_emotion_checkpoint(
     split: EvaluationSplit = "test",
     base_model_path: Path | None = None,
     provider_factory: ProviderFactory | None = None,
+    calibration_target_coverage: float | None = None,
 ) -> EmotionExperimentReport:
-    """Evaluate a checkpoint on held-out items and retain aggregate metrics only."""
+    """Evaluate a checkpoint on held-out items and retain aggregate metrics only.
+
+    When `calibration_target_coverage` is given, a temperature and abstain threshold
+    are fitted in this process from the per-item distributions, which are discarded
+    before returning. Only the aggregate summary survives. Calibration is refused on
+    the `test` split: fitting there would tune against the sealed final holdout.
+    """
 
     if (
         not manifest.is_absolute()
@@ -306,6 +313,14 @@ def evaluate_emotion_checkpoint(
         or split not in ("validation", "test")
     ):
         raise ValueError("invalid_experiment_manifest")
+    if calibration_target_coverage is not None:
+        if split != "validation":
+            raise ValueError("calibration_requires_validation_split")
+        if (
+            not math.isfinite(calibration_target_coverage)
+            or not 0 < calibration_target_coverage <= 1
+        ):
+            raise ValueError("invalid_calibration_target_coverage")
     try:
         manifest_payload = read_trusted_regular_file(manifest)
         items = load_manifest(manifest)
@@ -334,6 +349,7 @@ def evaluate_emotion_checkpoint(
     expected: list[EmotionLabel] = []
     predicted: list[EmotionLabel] = []
     confidence: list[float] = []
+    distributions: list[dict[EmotionLabel, float]] = []
     latency: list[float] = []
     rss: list[float] = []
     started = time.perf_counter()
@@ -347,6 +363,7 @@ def evaluate_emotion_checkpoint(
                 expected.append(cast(EmotionLabel, item.emotion))
                 predicted.append(guess)
                 confidence.append(result.confidence)
+                distributions.append(dict(result.probabilities))
                 latency.append(result.usage.latency_ms)
                 if result.usage.peak_rss_mb is not None:
                     rss.append(result.usage.peak_rss_mb)
@@ -363,6 +380,17 @@ def evaluate_emotion_checkpoint(
     revision = provider.provenance.revision
     if revision is None:
         raise ValueError("invalid_experiment_report")
+    calibration: CalibrationSummary | None = None
+    if calibration_target_coverage is not None:
+        try:
+            calibration = fit_temperature_scaling(
+                distributions,
+                expected,
+                target_coverage=calibration_target_coverage,
+            )
+        except Exception:
+            raise ValueError("invalid_calibration_fit") from None
+    distributions.clear()
     return EmotionExperimentReport(
         architecture=architecture,
         model_id=provider.provenance.model,
@@ -380,6 +408,7 @@ def evaluate_emotion_checkpoint(
         peak_rss_mb=max(rss, default=None),
         elapsed_seconds=max(0.0, time.perf_counter() - started),
         requested_device=device,
+        calibration=calibration,
     )
 
 
@@ -395,4 +424,4 @@ def write_experiment_report(path: Path, report: EmotionExperimentReport) -> None
         ).encode()
         + b"\n"
     )
-    _publish_private_file(path, payload, "experiment_report_publication_failed")
+    publish_private_file(path, payload, "experiment_report_publication_failed")
