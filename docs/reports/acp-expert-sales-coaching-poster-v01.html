@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>고객의 분노는 ‘질문이 반복될 때’ 커진다 — ACP Expert 코칭 포스터 v01</title>
+<!--
+  ACP Expert · 상담 코칭 포스터 (16:9 / 1600×900)
+  편집 지점
+    1) :root 의 --c-* 토큰 = 색상 팔레트
+    2) 본문 텍스트는 브라우저에서 바로 편집 가능 (contenteditable, 우하단 "편집" 토글)
+    3) 인쇄 / PDF: 우하단 "PDF" 버튼 또는 Cmd+P → 배경 그래픽 켜기 → 가로 방향
+  외부 리소스 없음(폰트·이미지·스크립트 전부 로컬/인라인).
+-->
+<style>
+:root{
+  /* ── 팔레트 ─────────────────────────────── */
+  --c-navy:      #16324A;   /* 본문 네이비 */
+  --c-navy-deep: #0F2639;
+  --c-panel:     #FFFFFF;
+  --c-panel-2:   #F4F7FA;
+  --c-teal:      #2F6F9F;   /* 유일한 강조: 차분한 블루 */
+  --c-teal-soft: #5B8FB7;
+  --c-amber:     #587186;   /* 긴장/주의도 블루-그레이로 절제 */
+  --c-ink:       #14283B;
+  --c-ink-dim:   #52677A;
+  --c-ink-faint: #8392A0;
+  --c-line:      #D8E1E8;
+
+  /* ── 타이포 ─────────────────────────────── */
+  --font: "Pretendard Variable","Pretendard","Apple SD Gothic Neo",
+          "Noto Sans KR","Malgun Gothic","Nanum Gothic",
+          system-ui,-apple-system,"Helvetica Neue",sans-serif;
+  --stage-w: 1600px;
+  --stage-h: 900px;
+}
+
+*,*::before,*::after{ box-sizing:border-box; }
+html,body{ margin:0; padding:0; }
+html{ background:#F2F5F7; }
+body{
+  font-family:var(--font);
+  color:var(--c-ink);
+  background:#F2F5F7;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  word-break:keep-all;          /* 한국어 어절 단위 줄바꿈 */
+  overflow-wrap:break-word;
+  line-break:strict;
+}
+
+/* ── 무대(16:9 고정) + 뷰포트 맞춤 스케일 ───────────── */
+.viewport{
+  min-height:100vh;
+  display:flex; align-items:center; justify-content:center;
+  padding:24px;
+}
+.scaler{
+  width:var(--stage-w); height:var(--stage-h);
+  transform-origin:center center;
+  transform:scale(var(--fit,1));
+  flex:0 0 auto;
+}
+.stage{
+  position:relative; overflow:hidden;
+  width:var(--stage-w); height:var(--stage-h);
+  padding:38px 52px 30px;
+  display:flex; flex-direction:column;
+  background:#FFFFFF;
+  box-shadow:0 24px 60px rgba(22,50,74,.10);
+  isolation:isolate;
+}
+/* 추상 연결 모티프: 동심 호 + 미세 그리드 */
+.stage::before{
+  content:""; position:absolute; z-index:0; pointer-events:none;
+  right:-190px; top:-150px; width:760px; height:760px; border-radius:50%;
+  background:
+    repeating-radial-gradient(circle at center,
+      rgba(47,111,159,.10) 0 1.5px, transparent 1.5px 62px);
+  -webkit-mask-image:radial-gradient(circle at center, #000 42%, transparent 72%);
+          mask-image:radial-gradient(circle at center, #000 42%, transparent 72%);
+  opacity:.60;
+}
+.stage::after{
+  content:""; position:absolute; inset:0; z-index:0; pointer-events:none;
+  background:
+    repeating-linear-gradient(90deg, rgba(22,50,74,.028) 0 1px, transparent 1px 80px),
+    repeating-linear-gradient(0deg,  rgba(22,50,74,.018) 0 1px, transparent 1px 80px);
+  -webkit-mask-image:linear-gradient(190deg, #000 0%, transparent 58%);
+          mask-image:linear-gradient(190deg, #000 0%, transparent 58%);
+}
+.stage > *{ position:relative; z-index:1; }
+
+/* ── 헤더 ─────────────────────────────────── */
+.head{ display:flex; align-items:flex-start; gap:40px; }
+.head__main{ flex:1 1 auto; min-width:0; }
+
+.eyebrow{
+  display:inline-flex; align-items:center; gap:12px;
+  font-size:15px; font-weight:600; letter-spacing:.055em;
+  color:var(--c-teal-soft); text-transform:none; margin:0 0 16px;
+}
+.eyebrow .tick{
+  width:30px; height:2px; border-radius:2px;
+  background:linear-gradient(90deg,var(--c-teal),rgba(0,166,166,0));
+}
+.eyebrow .sep{ color:var(--c-ink-faint); font-weight:400; }
+.eyebrow .ctx{ color:var(--c-ink-dim); font-weight:500; letter-spacing:.02em; }
+
+.title{
+  margin:0; font-size:54px; line-height:1.16; font-weight:800;
+  letter-spacing:-.022em; color:var(--c-ink);
+}
+.title .mark{
+  position:relative; color:var(--c-teal); white-space:nowrap;
+}
+.title .mark::after{
+  content:""; position:absolute; left:-2px; right:-2px; bottom:4px; height:12px;
+  border-radius:8px; background:rgba(47,111,159,.13); z-index:-1;
+}
+.subtitle{
+  margin:12px 0 0; font-size:17px; line-height:1.5; font-weight:500;
+  color:var(--c-ink-dim); max-width:920px;
+}
+.subtitle b{ color:var(--c-ink); font-weight:700; }
+
+/* 안전 배지 */
+.badge{
+  flex:0 0 auto; width:230px;
+  border:1px solid var(--c-line); border-radius:16px;
+  background:#F7FAFC;
+  padding:14px 16px 13px;
+}
+.badge__k{
+  display:flex; align-items:center; gap:9px;
+  font-size:12.5px; font-weight:700; letter-spacing:.14em;
+  color:var(--c-ink-faint);
+}
+.badge__k .pip{
+  width:9px; height:9px; border-radius:50%; background:var(--c-teal);
+  box-shadow:0 0 0 4px rgba(47,111,159,.12);
+}
+.badge__v{
+  margin-top:7px; font-size:24px; font-weight:800; letter-spacing:-.01em;
+  color:var(--c-teal);
+}
+.badge__n{ margin-top:5px; font-size:12.5px; line-height:1.45; color:var(--c-ink-dim); }
+
+/* ── 중심선(스파인) ───────────────────────── */
+.spine{
+  margin-top:20px; position:relative;
+  padding:18px 0 0;
+}
+.spine__rail{
+  position:absolute; left:26px; right:26px; top:47px; height:3px; border-radius:3px;
+  background:linear-gradient(90deg,
+    #B5C1CB 0%, #7D91A1 38%, #52708A 50%, var(--c-teal) 70%, #B8C9D6 100%);
+  opacity:.9;
+}
+.spine__rail::before,
+.spine__rail::after{
+  content:""; position:absolute; top:50%; width:9px; height:9px;
+  border-top:2px solid; border-right:2px solid; transform:translateY(-50%) rotate(45deg);
+}
+.spine__rail::before{ left:31%;  color:#C9973F; }
+.spine__rail::after { right:9%;  color:var(--c-teal); }
+
+.lanes{
+  display:grid; gap:0;
+  grid-template-columns:repeat(3,1fr) 148px repeat(3,1fr);
+}
+.stop{ padding:0 11px; display:flex; flex-direction:column; }
+.stop__dot{
+  position:relative; height:16px; margin:0 auto 18px;
+  width:18px; border-radius:50%;
+  background:#FFFFFF; border:3px solid var(--c-amber);
+  box-shadow:0 0 0 5px #FFFFFF, 0 0 0 7px rgba(88,113,134,.15);
+}
+.stop--turn .stop__dot{
+  border-color:var(--c-teal);
+  box-shadow:0 0 0 5px #FFFFFF, 0 0 0 7px rgba(47,111,159,.15);
+}
+.stop__card{
+  flex:1 1 auto;
+  border-radius:14px; padding:12px 14px 13px; min-height:96px;
+  border:1px solid var(--c-line);
+  background:#FFFFFF;
+}
+.stop--tense .stop__card{ border-color:#C9D3DC; }
+.stop--turn  .stop__card{ border-color:rgba(0,166,166,.30);
+  background:#F4F8FB; }
+.stop__idx{
+  font-size:11.5px; font-weight:800; letter-spacing:.16em; color:var(--c-ink-faint);
+}
+.stop--tense .stop__idx{ color:#647B8D; }
+.stop--turn  .stop__idx{ color:var(--c-teal-soft); }
+.stop__t{
+  margin:7px 0 0; font-size:19px; line-height:1.3; font-weight:700; letter-spacing:-.012em;
+}
+.stop__s{ margin:6px 0 0; font-size:12.5px; line-height:1.42; color:var(--c-ink-dim); }
+
+/* 가운데 전환 피벗 */
+.pivot{ position:relative; display:flex; flex-direction:column; align-items:center; }
+.pivot__ring{
+  width:68px; height:68px; border-radius:50%; margin-top:-23px;
+  display:flex; align-items:center; justify-content:center; text-align:center;
+  font-size:15px; font-weight:800; letter-spacing:-.01em; color:#FFFFFF;
+  background:var(--c-teal);
+  box-shadow:
+    0 0 0 7px #FFFFFF,
+    0 0 0 9px rgba(47,111,159,.28),
+    0 0 0 18px rgba(47,111,159,.08);
+}
+.pivot__cap{
+  margin-top:18px; font-size:11.5px; font-weight:700; letter-spacing:.1em;
+  color:var(--c-ink-faint); text-align:center; line-height:1.5;
+}
+
+/* 레인 라벨 */
+.lanelabels{
+  display:grid; grid-template-columns:repeat(3,1fr) 148px repeat(3,1fr);
+  margin-bottom:10px;
+}
+.lanelabel{
+  display:flex; align-items:center; gap:10px;
+  font-size:13px; font-weight:800; letter-spacing:.13em;
+}
+.lanelabel--a{ grid-column:1 / span 3; color:rgba(244,185,66,.88); padding-left:11px; }
+.lanelabel--b{ grid-column:5 / span 3; color:var(--c-teal-soft); padding-left:11px; }
+.lanelabel .bar{ width:22px; height:3px; border-radius:3px; background:currentColor; opacity:.8; }
+.lanelabel .en{ color:var(--c-ink-faint); font-weight:600; letter-spacing:.08em; }
+
+/* ── 하단 2단 ─────────────────────────────── */
+.lower{
+  margin-top:18px; padding-top:0;
+  display:grid; grid-template-columns:600px 1fr; gap:34px; align-items:stretch;
+}
+
+/* 말풍선(추상 CSS 스피치 모티프) */
+.quote{
+  position:relative; border-radius:20px; padding:18px 22px 18px;
+  border:1px solid #BFD2E0;
+  background:#F5F9FC;
+  display:flex; flex-direction:column;
+}
+.quote::after{           /* 말풍선 꼬리 */
+  content:""; position:absolute; left:52px; bottom:-15px; width:28px; height:28px;
+  transform:rotate(45deg);
+  background:#F5F9FC;
+  border-right:1px solid #BFD2E0;
+  border-bottom:1px solid #BFD2E0;
+}
+.quote__k{
+  display:flex; align-items:center; gap:10px;
+  font-size:12.5px; font-weight:800; letter-spacing:.15em; color:var(--c-teal-soft);
+}
+.quote__k .bars{ display:inline-flex; gap:3px; align-items:flex-end; height:13px; }
+.quote__k .bars i{ width:3px; border-radius:2px; background:var(--c-teal); display:block; }
+.quote__k .bars i:nth-child(1){ height:6px; }
+.quote__k .bars i:nth-child(2){ height:13px; }
+.quote__k .bars i:nth-child(3){ height:9px; }
+.quote__k .bars i:nth-child(4){ height:4px; }
+.quote__t{
+  margin:10px 0 0; font-size:24px; line-height:1.38; font-weight:700; letter-spacing:-.018em;
+  color:var(--c-ink);
+}
+.quote__t::before{ content:"“"; color:var(--c-teal); margin-right:2px; }
+.quote__t::after { content:"”"; color:var(--c-teal); margin-left:2px; }
+.quote__ask{
+  margin:12px 0 0; padding:10px 13px 11px;
+  border-left:3px solid var(--c-teal);
+  border-radius:0 10px 10px 0;
+  background:#EAF2F7;
+  font-size:13px; line-height:1.45; font-weight:600; color:var(--c-ink);
+}
+.quote__ask .lbl{
+  display:block; margin-bottom:5px;
+  font-size:11.5px; font-weight:800; letter-spacing:.15em; color:var(--c-teal-soft);
+}
+.quote__f{
+  margin-top:auto; padding-top:11px; font-size:12px; line-height:1.4; color:var(--c-ink-dim);
+  border-top:1px solid var(--c-line);
+}
+
+/* 실행 3단계 */
+.acts{ display:flex; flex-direction:column; }
+.acts__k{
+  display:flex; align-items:baseline; gap:12px; margin-bottom:9px;
+  font-size:13px; font-weight:800; letter-spacing:.13em; color:var(--c-ink-faint);
+}
+.acts__k .now{ color:var(--c-teal-soft); }
+.acts__grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:16px; flex:1 1 auto; }
+.act{
+  position:relative; border-radius:16px; padding:14px 15px 15px;
+  border:1px solid var(--c-line);
+  background:#FFFFFF;
+  display:flex; flex-direction:column;
+  border-top:3px solid var(--c-teal);
+}
+.act__n{
+  width:34px; height:34px; border-radius:10px;
+  display:flex; align-items:center; justify-content:center;
+  font-size:18px; font-weight:800; color:#FFFFFF;
+  background:var(--c-teal);
+}
+.act__t{
+  margin:10px 0 0; font-size:19px; line-height:1.32; font-weight:700; letter-spacing:-.016em;
+}
+.act__s{ margin:7px 0 0; font-size:12px; line-height:1.42; color:var(--c-ink-dim); }
+.act__chk{
+  margin-top:auto; padding-top:10px; display:flex; gap:8px; align-items:flex-start;
+  border-top:1px solid var(--c-line);
+  font-size:12px; line-height:1.38; font-weight:600; color:rgba(79,209,203,.94);
+}
+.act__chk::before{
+  content:""; flex:0 0 auto; margin-top:5px;
+  width:8px; height:5px; border-left:2px solid var(--c-teal);
+  border-bottom:2px solid var(--c-teal); transform:rotate(-45deg);
+}
+
+/* ── 푸터 ─────────────────────────────────── */
+.foot{
+  margin-top:16px; display:flex; align-items:center; gap:15px;
+  border-radius:13px; padding:10px 18px;
+  border:1px solid #C8D6E0;
+  background:#F5F8FA;
+}
+.foot__k{
+  flex:0 0 auto; display:flex; align-items:center; gap:9px;
+  font-size:12.5px; font-weight:800; letter-spacing:.15em; color:var(--c-teal);
+}
+.foot__k .pip{
+  width:8px; height:8px; background:var(--c-teal); border-radius:2px;
+  transform:rotate(45deg);
+}
+.foot__t{ font-size:14px; font-weight:600; letter-spacing:-.008em; color:var(--c-ink); }
+.foot__src{
+  margin-left:auto; flex:0 0 auto; font-size:12.5px; letter-spacing:.04em;
+  color:var(--c-ink-faint); text-align:right; line-height:1.5;
+}
+
+/* ── 편집 모드 ─────────────────────────────── */
+[contenteditable]{ outline:none; border-radius:5px; }
+body.editing [contenteditable]{
+  box-shadow:inset 0 0 0 1px rgba(0,166,166,.35);
+  cursor:text;
+}
+body.editing [contenteditable]:hover{ box-shadow:inset 0 0 0 1px rgba(0,166,166,.6); }
+[contenteditable]:focus{ box-shadow:inset 0 0 0 2px var(--c-teal) !important; }
+
+.tools{
+  position:fixed; left:18px; bottom:18px; z-index:50;
+  display:flex; gap:8px; padding:8px; border-radius:13px;
+  background:rgba(7,23,38,.9); border:1px solid rgba(242,246,248,.16);
+  backdrop-filter:blur(8px);
+}
+.tools button{
+  font:inherit; font-size:13px; font-weight:700; letter-spacing:.02em;
+  color:var(--c-ink); background:rgba(255,255,255,.07);
+  border:1px solid rgba(242,246,248,.16); border-radius:9px;
+  padding:8px 14px; cursor:pointer;
+}
+.tools button:hover{ background:rgba(0,166,166,.22); border-color:var(--c-teal); }
+.tools button[aria-pressed="true"]{
+  background:var(--c-teal); border-color:var(--c-teal); color:#03212B;
+}
+
+/* ── 반응형: 무대를 통째로 축소해 잘림/넘침 방지 ── */
+@media (max-width:1400px){ .viewport{ padding:16px; } }
+@media (max-width:760px){  .viewport{ padding:10px; } }
+
+/* ── 인쇄 / PDF (16:9 가로) ─────────────────── */
+@page{ size:1600px 900px; margin:0; }
+@media print{
+  html,body{
+    width:1600px; height:900px; overflow:hidden;
+    background:#fff; margin:0; padding:0;
+  }
+  .viewport{ min-height:0; padding:0; display:block; }
+  .scaler{ transform:none !important; width:1600px; height:900px; }
+  .stage{ box-shadow:none; border-radius:0; break-inside:avoid; page-break-inside:avoid; }
+  .tools{ display:none !important; }
+  [contenteditable]{ box-shadow:none !important; }
+  *{ -webkit-print-color-adjust:exact !important; print-color-adjust:exact !important; }
+}
+</style>
+</head>
+<body>
+
+<div class="viewport">
+ <div class="scaler" id="scaler">
+  <main class="stage" id="stage" role="img"
+        aria-label="상담 코칭 포스터: 고객의 분노는 질문이 반복될 때 커진다">
+
+    <!-- 헤더 -->
+    <header class="head">
+      <div class="head__main">
+        <p class="eyebrow">
+          <span class="tick" aria-hidden="true"></span>
+          <span contenteditable="plaintext-only">ACP Expert mode 샘플</span>
+          <span class="sep" aria-hidden="true">·</span>
+          <span class="ctx" contenteditable="plaintext-only">USER_EVAL_20260911_01</span>
+        </p>
+        <h1 class="title" contenteditable="plaintext-only">고객의 분노는 <span class="mark">‘질문이 반복될 때’</span> 커진다</h1>
+        <p class="subtitle" contenteditable="plaintext-only">절차 자체보다, <b>같은 질문을 다시 해야 했던 순간</b>에 감정이 올라갑니다. 방어 대신 재확인으로 통화의 방향을 바꿉니다.</p>
+      </div>
+      <aside class="badge">
+        <div class="badge__k"><span class="pip" aria-hidden="true"></span><span>안전 수준</span></div>
+        <div class="badge__v" contenteditable="plaintext-only">watch</div>
+        <div class="badge__n" contenteditable="plaintext-only">강한 언어적 분노·민원 확대 가능성. 긴급위험 표현은 확인되지 않음.</div>
+      </aside>
+    </header>
+
+    <!-- 중심선 -->
+    <section class="spine" aria-label="대화 흐름: 긴장된 접수에서 건설적 회복으로">
+      <div class="lanelabels" aria-hidden="true">
+        <div class="lanelabel lanelabel--a"><span class="bar"></span>문제 흐름 <span class="en">TENSION</span></div>
+        <div class="lanelabel lanelabel--b"><span class="bar"></span>전환 <span class="en">RECOVERY</span></div>
+      </div>
+
+      <div class="spine__rail" aria-hidden="true"></div>
+
+      <div class="lanes">
+        <div class="stop stop--tense">
+          <div class="stop__dot" aria-hidden="true"></div>
+          <div class="stop__card">
+            <div class="stop__idx">01 · 요청</div>
+            <p class="stop__t" contenteditable="plaintext-only">절차 안내 요청</p>
+            <p class="stop__s" contenteditable="plaintext-only">“무엇을 어떻게 하면 되는지” 구체적 안내를 직접 요구.</p>
+          </div>
+        </div>
+
+        <div class="stop stop--tense">
+          <div class="stop__dot" aria-hidden="true"></div>
+          <div class="stop__card">
+            <div class="stop__idx">02 · 간극</div>
+            <p class="stop__t" contenteditable="plaintext-only">회피로 들린 응답</p>
+            <p class="stop__s" contenteditable="plaintext-only">판단을 고객에게 넘기거나 통화를 마무리하려는 말로 해석됨.</p>
+          </div>
+        </div>
+
+        <div class="stop stop--tense">
+          <div class="stop__dot" aria-hidden="true"></div>
+          <div class="stop__card">
+            <div class="stop__idx">03 · 상승</div>
+            <p class="stop__t" contenteditable="plaintext-only">감정 고조</p>
+            <p class="stop__s" contenteditable="plaintext-only">질문이 해소되지 않은 채 반복되며 분노 신호가 강해짐.</p>
+          </div>
+        </div>
+
+        <div class="stop pivot">
+          <div class="pivot__ring" aria-hidden="true">전환점</div>
+          <div class="pivot__cap" contenteditable="plaintext-only">방어를 멈추는<br>한 문장</div>
+        </div>
+
+        <div class="stop stop--turn">
+          <div class="stop__dot" aria-hidden="true"></div>
+          <div class="stop__card">
+            <div class="stop__idx">04 · 공감</div>
+            <p class="stop__t" contenteditable="plaintext-only">공감</p>
+            <p class="stop__s" contenteditable="plaintext-only">안내가 부족했던 사실을 먼저 인정하고 사과.</p>
+          </div>
+        </div>
+
+        <div class="stop stop--turn">
+          <div class="stop__dot" aria-hidden="true"></div>
+          <div class="stop__card">
+            <div class="stop__idx">05 · 재확인</div>
+            <p class="stop__t" contenteditable="plaintext-only">질문 재확인</p>
+            <p class="stop__s" contenteditable="plaintext-only">고객이 지금 가장 먼저 원하는 답을 한 문장으로 되짚음.</p>
+          </div>
+        </div>
+
+        <div class="stop stop--turn">
+          <div class="stop__dot" aria-hidden="true"></div>
+          <div class="stop__card">
+            <div class="stop__idx">06 · 선택지</div>
+            <p class="stop__t" contenteditable="plaintext-only">선택지 제시</p>
+            <p class="stop__s" contenteditable="plaintext-only">지금 답할 수 있는 것과 확인 후 안내할 것을 나눠 제시.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 하단 -->
+    <section class="lower">
+      <blockquote class="quote">
+        <div class="quote__k">
+          <span class="bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span>바로 쓰는 문장</span>
+        </div>
+        <p class="quote__t" contenteditable="plaintext-only">제가 안내를 충분히 못 드렸습니다. 가장 먼저 해결할 질문부터 같이 정리하겠습니다.</p>
+        <p class="quote__ask" contenteditable="plaintext-only"><span class="lbl">이어서 묻기</span>지금 먼저 확인할 부분이 대리 처리 가능 여부인지, 기한 안에 제출하는 방법인지 말씀해 주시겠어요?</p>
+        <p class="quote__f" contenteditable="plaintext-only">사과 → 질문 정리 → 순서 안내. 보장할 수 없는 약속은 넣지 않습니다.</p>
+      </blockquote>
+
+      <div class="acts">
+        <div class="acts__k"><span class="now">지금 할 것</span><span>THREE ACTIONS</span></div>
+        <div class="acts__grid">
+          <article class="act">
+            <div class="act__n">1</div>
+            <p class="act__t" contenteditable="plaintext-only">감정 인정</p>
+            <p class="act__s" contenteditable="plaintext-only">불편을 끼친 지점을 구체적으로 짚어 사과합니다. 변명은 뒤로 미룹니다.</p>
+            <p class="act__chk" contenteditable="plaintext-only">‘제 설명이 부족했습니다’로 시작</p>
+          </article>
+          <article class="act">
+            <div class="act__n">2</div>
+            <p class="act__t" contenteditable="plaintext-only">질문을 한 문장으로 재확인</p>
+            <p class="act__s" contenteditable="plaintext-only">추측해 되받지 않고, 무엇부터 답해 드릴지 고객 말로 확인합니다.</p>
+            <p class="act__chk" contenteditable="plaintext-only">‘지금 가장 먼저’를 넣어 묻기</p>
+          </article>
+          <article class="act">
+            <div class="act__n">3</div>
+            <p class="act__t" contenteditable="plaintext-only">서류·방법·기한을 순서대로 안내</p>
+            <p class="act__s" contenteditable="plaintext-only">권한 확인이 필요한 건 ‘확인 후 안내’로 분명히 구분합니다.</p>
+            <p class="act__chk" contenteditable="plaintext-only">답할 수 있는 사실부터 짧게</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- 푸터 -->
+    <footer class="foot">
+      <div class="foot__k"><span class="pip" aria-hidden="true"></span><span>SAFETY</span></div>
+      <div class="foot__t" contenteditable="plaintext-only">원인 단정 금지 · 근거가 약하면 확인 질문부터</div>
+      <div class="foot__src" contenteditable="plaintext-only">단일 Gold case 샘플 · 업무 규정·권한·제출 절차를 대신하지 않음</div>
+    </footer>
+
+  </main>
+ </div>
+</div>
+
+<div class="tools" role="toolbar" aria-label="포스터 도구">
+  <button type="button" id="editBtn" aria-pressed="false">편집</button>
+  <button type="button" id="pdfBtn">PDF</button>
+</div>
+
+<script>
+(function(){
+  var scaler = document.getElementById('scaler');
+  function fit(){
+    var pad = window.innerWidth <= 760 ? 20 : (window.innerWidth <= 1400 ? 32 : 48);
+    var s = Math.min(
+      (window.innerWidth  - pad) / 1600,
+      (window.innerHeight - pad) / 900
+    );
+    scaler.style.setProperty('--fit', s);
+    /* 축소된 실제 크기만큼만 자리를 차지하도록 보정 */
+    scaler.style.margin = (900 * (s - 1) / 2) + 'px ' + (1600 * (s - 1) / 2) + 'px';
+  }
+  fit();
+  window.addEventListener('resize', fit);
+
+  var editBtn = document.getElementById('editBtn');
+  editBtn.addEventListener('click', function(){
+    var on = document.body.classList.toggle('editing');
+    editBtn.setAttribute('aria-pressed', String(on));
+  });
+  document.getElementById('pdfBtn').addEventListener('click', function(){ window.print(); });
+})();
+</script>
+</body>
+</html>
