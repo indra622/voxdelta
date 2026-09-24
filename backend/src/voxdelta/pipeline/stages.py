@@ -20,6 +20,7 @@ from voxdelta.domain.models import (
     Role,
     SpeakerSegment,
     StageName,
+    TranscriptionCoverage,
     Utterance,
 )
 from voxdelta.security import is_credential_key
@@ -173,6 +174,9 @@ class TranscribeArtifact(StageArtifact):
     schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.TRANSCRIBE] = StageName.TRANSCRIBE
     utterances: list[Utterance]
+    # Additive and optional, so artifacts written before this field still load and the
+    # version stays "1". None means the recognizer needed no timestamp sanitation.
+    timestamp_coverage: TranscriptionCoverage | None = None
 
 
 class RoleArtifact(StageArtifact):
@@ -194,6 +198,9 @@ class EmotionArtifact(StageArtifact):
     schema_version: Literal["1"] = SCHEMA_VERSION
     stage: Literal[StageName.EMOTION] = StageName.EMOTION
     results: list[EmotionResult]
+    # Why a confirmed customer turn has no result here. Empty for a fully scored call;
+    # never a substitute for a result, only the record that one was not produced.
+    warnings: list[str] = Field(default_factory=list)
 
 
 class StrategyArtifact(StageArtifact):

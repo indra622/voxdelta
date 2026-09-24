@@ -31,6 +31,7 @@ from voxdelta.domain.models import (
     Role,
     StageName,
     StageStatus,
+    TranscriptionCoverage,
     Utterance,
 )
 from voxdelta.jobs.artifacts import ArtifactStore
@@ -57,6 +58,7 @@ from voxdelta.providers.base import (
     DiarizationProvider,
     DiarizationTimelineProvider,
     EmotionProvider,
+    ProviderError,
     ReportSummaryProvider,
     ResponseStrategyProvider,
     TranscriptionProvider,
@@ -110,6 +112,61 @@ class PipelineStateError(PipelineValidationError):
     """A safe conflict between the requested operation and persisted stage state."""
 
 
+def _transcription_coverage(provider: object) -> TranscriptionCoverage | None:
+    """Map a recognizer's timestamp-sanitation coverage into the pipeline's own model.
+
+    Read structurally rather than by provider type: a recognizer that reports coverage
+    surfaces it, one that does not reports nothing, and neither needs the pipeline to
+    know which recognizer it is holding. The model validates what it is handed, so a
+    provider cannot publish a ratio that disagrees with its own omission count.
+    """
+
+    coverage = getattr(provider, "last_timestamp_coverage", None)
+    if coverage is None:
+        return None
+    as_dict = getattr(coverage, "as_dict", None)
+    if not callable(as_dict):
+        raise ValueError("transcription coverage provider returned an unreadable figure")
+    payload = as_dict()
+    try:
+        return TranscriptionCoverage(
+            policy=str(payload["policy"]),
+            attributed_words=int(payload["attributed_words"]),
+            attributed_ratio=float(payload["attributed_ratio"]),
+            omitted_words=int(payload["omitted_words"]),
+            uncertain=bool(payload["uncertain"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("transcription coverage provider returned an unreadable figure") from error
+
+
+def _transcription_fallback(provider: object) -> object | None:
+    """The fallback event from the most recent transcription, if the provider reports one."""
+
+    return getattr(provider, "last_fallback", None)
+
+
+def _fallback_warning(event: object) -> str:
+    """Name the substitution in the reader's terms, including why it happened."""
+
+    primary = getattr(event, "primary", "the primary recogniser")
+    fallback = getattr(event, "fallback", "a fallback recogniser")
+    code = getattr(event, "code", "unknown")
+    return (
+        f"기본 음성 인식 모델({primary})을 실행할 수 없어 대체 모델({fallback})로 "
+        f"전사했습니다(사유 코드: {code})."
+    )
+
+
+def _coverage_warning(coverage: TranscriptionCoverage) -> str:
+    """One sentence naming what the transcript is missing, in the reader's terms."""
+
+    return (
+        f"음성 인식 결과 중 {coverage.omitted_words}개 단어는 시각 정보가 명확하지 않아 "
+        f"화자 배정에서 제외했습니다(전사 반영률 {coverage.attributed_ratio:.1%})."
+    )
+
+
 def _stage_rows(job: dict[str, object]) -> dict[str, dict[str, object]]:
     rows = job.get("stages")
     if not isinstance(rows, dict):
@@ -133,6 +190,14 @@ def _relevant_agent_ids(ordered: list[Utterance]) -> list[str]:
         and ordered[index - 1].role == Role.CUSTOMER
         and ordered[index + 1].role == Role.CUSTOMER
     ]
+
+
+def _diagnostic_metadata(error: BaseException) -> Mapping[str, object] | None:
+    """Return a provider's sanitized boundary classification, when it reported one."""
+
+    if isinstance(error, ProviderError) and error.diagnostic is not None:
+        return error.diagnostic
+    return None
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
@@ -184,6 +249,12 @@ class PipelineRunner:
         self._logger = logger or PipelineLogger(artifacts)
         self._locks: dict[str, RLock] = {}
         self._locks_guard = Lock()
+
+    @property
+    def emotion_provider(self) -> EmotionProvider:
+        """The composed emotion provider, so readiness tooling need not reach inside."""
+
+        return self._emotion
 
     def _job_lock(self, job_id: str) -> RLock:
         with self._locks_guard:
@@ -517,8 +588,18 @@ class PipelineRunner:
             customer_ids = [
                 item.id for item in _ordered_utterances(roles) if item.role == Role.CUSTOMER
             ]
-            return [item.utterance_id for item in artifact.results] == customer_ids and all(
-                item.provider == self._emotion.provenance for item in artifact.results
+            scored = [item.utterance_id for item in artifact.results]
+            # Results are the scored customer turns in timeline order. A turn may be left
+            # unscored, but never quietly: each omission must be named in the warnings, so
+            # a silently dropped turn cannot pass this check.
+            remaining = iter(customer_ids)
+            in_timeline_order = all(item in remaining for item in scored)
+            omitted = [item for item in customer_ids if item not in set(scored)]
+            return (
+                in_timeline_order
+                and len(set(scored)) == len(scored)
+                and all(any(item in warning for warning in artifact.warnings) for item in omitted)
+                and all(item.provider == self._emotion.provenance for item in artifact.results)
             )
         if isinstance(artifact, StrategyArtifact):
             roles = self._read(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
@@ -637,6 +718,11 @@ class PipelineRunner:
     def _public_failure(self, stage: StageName, error: BaseException) -> PipelineValidationError:
         if isinstance(error, PipelineValidationError):
             return error
+        if isinstance(error, ProviderError):
+            # Already a typed, payload-free failure. Recording it as the stage's public
+            # code keeps the job in its normal failed representation instead of escaping
+            # as an unhandled error that the resuming request would surface as a 500.
+            return PipelineValidationError(error.code, str(error))
         if isinstance(error, AudioRejected):
             return PipelineValidationError("audio_rejected", str(error))
         if isinstance(error, InsufficientEmotionCoverage):
@@ -656,6 +742,7 @@ class PipelineRunner:
         event: str,
         started: float,
         error_code: str | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> None:
         provider = self._provider(stage)
         self._logger.event(
@@ -666,6 +753,7 @@ class PipelineRunner:
             provider=provider.name if provider is not None else None,
             model=provider.model if provider is not None else None,
             error_code=error_code,
+            metadata=metadata,
         )
 
     def _diagnostic(
@@ -753,17 +841,26 @@ class PipelineRunner:
             utterances = self._transcription.transcribe(
                 normalized.asset, diarized.alignment_segments
             )
+            # Re-read after the call: a provider that fell back reports the model that
+            # actually ran, and the artifact must name that one rather than the attempt.
+            provider = self._provider(stage)
+            coverage = _transcription_coverage(self._transcription)
             self._diagnostic(
                 job_id,
                 stage,
                 "response",
-                {"result_type": "utterances", "item_count": len(utterances)},
+                {
+                    "result_type": "utterances",
+                    "item_count": len(utterances),
+                    "omitted_words": coverage.omitted_words if coverage else 0,
+                },
             )
             return TranscribeArtifact(
                 cache_key=cache_key,
                 upstream_hashes=upstream_hashes,
                 provider=provider,
                 utterances=utterances,
+                timestamp_coverage=coverage,
             )
         if stage == StageName.CONFIRM_ROLES:
             transcribed = self._read(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
@@ -794,6 +891,7 @@ class PipelineRunner:
             normalized = self._read(job_id, StageName.NORMALIZE, NormalizeArtifact)
             customer_utterances = [item for item in ordered if item.role == Role.CUSTOMER]
             raw_results = []
+            emotion_warnings: list[str] = []
             for item in customer_utterances:
                 with self._emotion_clip(job_id, normalized, item) as audio_path:
                     self._diagnostic(
@@ -806,7 +904,26 @@ class PipelineRunner:
                             "end_seconds": item.end,
                         },
                     )
-                    emotion_result = self._emotion.analyze(item.id, audio_path, item.transcript)
+                    try:
+                        emotion_result = self._emotion.analyze(item.id, audio_path, item.transcript)
+                    except ProviderError as error:
+                        if error.code != "audio_too_short":
+                            raise
+                        # The turn is real but unscorable. Inventing a distribution would
+                        # be a fabricated reading, and dropping it in silence would hide
+                        # one. It is left out and said out loud: downstream already
+                        # treats a missing result as an ineligible triple and as lost
+                        # coverage.
+                        emotion_warnings.append(
+                            f"{item.id}: 오디오 구간이 0.5초보다 짧아 감정을 판정하지 않았습니다."
+                        )
+                        self._diagnostic(
+                            job_id,
+                            stage,
+                            "response",
+                            {"utterance_id": item.id, "result_type": "audio_too_short"},
+                        )
+                        continue
                     self._diagnostic(
                         job_id,
                         stage,
@@ -819,6 +936,7 @@ class PipelineRunner:
                 upstream_hashes=upstream_hashes,
                 provider=provider,
                 results=median_smooth(raw_results),
+                warnings=emotion_warnings,
             )
         if stage == StageName.RESPONSE_STRATEGY:
             relevant_ids = set(_relevant_agent_ids(ordered))
@@ -858,6 +976,18 @@ class PipelineRunner:
             transitions = self._read(job_id, StageName.TRANSITIONS, TransitionsArtifact)
             customers = [item for item in ordered if item.role == Role.CUSTOMER]
             summary = build_call_summary(customers, emotions.results, transitions.results)
+            transcribed = self._read(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
+            coverage = transcribed.timestamp_coverage
+            report_warnings = list(emotions.warnings)
+            fallback = _transcription_fallback(self._transcription)
+            if fallback is not None:
+                # A different model produced this transcript than the one configured.
+                # Said out loud, because the provenance alone is easy to miss.
+                report_warnings.append(_fallback_warning(fallback))
+            if coverage is not None and coverage.uncertain:
+                # Said out loud rather than left to be inferred from a ratio: the reader
+                # is looking at a transcript that is missing words the recognizer produced.
+                report_warnings.append(_coverage_warning(coverage))
             report = AnalysisReport(
                 job_id=job_id,
                 summary=summary,
@@ -865,6 +995,8 @@ class PipelineRunner:
                 emotions=emotions.results,
                 strategies=strategies.results,
                 transitions=transitions.results,
+                warnings=report_warnings,
+                transcription_coverage=coverage,
             )
             self._diagnostic(
                 job_id,
@@ -1095,6 +1227,7 @@ class PipelineRunner:
             AudioRejected,
             InsufficientEmotionCoverage,
             PipelineValidationError,
+            ProviderError,
             ValidationError,
             ValueError,
         ) as error:
@@ -1103,7 +1236,10 @@ class PipelineRunner:
                 claim,
                 {"code": public.code, "message": public.message},
             )
-            self._log(job_id, stage, "failed", started, public.code)
+            # The stored failure stays the bare public code a caller may read. The
+            # classification of which remote boundary failed goes only to the operator
+            # log, which already redacts and is written 0600 alongside the job.
+            self._log(job_id, stage, "failed", started, public.code, _diagnostic_metadata(error))
             return False
         except Exception as error:
             error_class = type(error).__name__
@@ -1192,6 +1328,9 @@ class PipelineRunner:
                     "transmits": provider.transmits if provider is not None else (),
                     "retention_policy_url": (
                         provider.retention_policy_url if provider is not None else None
+                    ),
+                    "retention_window_hours": (
+                        provider.retention_window_hours if provider is not None else None
                     ),
                 }
             )

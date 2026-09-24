@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from pydantic import SecretStr
 
@@ -17,6 +18,8 @@ from voxdelta.providers.base import (
     EmotionProvider,
     TranscriptionProvider,
 )
+from voxdelta.providers.calibrated_emotion import CalibratedEmotionProvider
+from voxdelta.providers.calibration_artifact import verify_calibration_artifact
 from voxdelta.providers.emotion2vec_emotion import (
     Emotion2VecEmotionProvider,
 )
@@ -28,6 +31,7 @@ from voxdelta.providers.fake import (
     FakeEmotionProvider,
     FakeTranscriptionProvider,
 )
+from voxdelta.providers.fallback_asr import FallbackTranscriptionProvider
 from voxdelta.providers.faster_whisper_asr import (
     FasterWhisperProvider,
 )
@@ -38,6 +42,12 @@ from voxdelta.providers.pyannote_diarization import (
     PipelineFactory,
     PyannoteDiarizationProvider,
 )
+from voxdelta.providers.pyannote_precision import (
+    ClientFactory as PyannoteAiClientFactory,
+)
+from voxdelta.providers.pyannote_precision import (
+    PyannotePrecisionProvider,
+)
 from voxdelta.providers.qwen3_asr import (
     AlignerFactory,
     Qwen3AsrProvider,
@@ -45,6 +55,7 @@ from voxdelta.providers.qwen3_asr import (
 from voxdelta.providers.qwen3_asr import (
     ModelFactory as QwenModelFactory,
 )
+from voxdelta.providers.release_bundle import verify_release_bundle
 from voxdelta.providers.wav2vec_emotion import (
     ModelFactory as Wav2VecFactory,
 )
@@ -65,6 +76,7 @@ class ProviderFactories:
     """Test-only lazy model construction seams; production leaves every field unset."""
 
     pyannote_pipeline: PipelineFactory | None = None
+    pyannoteai_client: PyannoteAiClientFactory | None = None
     faster_whisper_model: FasterWhisperFactory | None = None
     qwen_model: QwenModelFactory | None = None
     qwen_aligner: AlignerFactory | None = None
@@ -81,6 +93,30 @@ class ApiDependencies:
     admission_reconciliation_lease_seconds: int
     max_active_jobs: int
     api_capability_token: SecretStr | None
+    annotation_root: Path
+    annotation_audio_root: Path
+
+
+def default_annotation_root(settings: Settings) -> Path:
+    """Where private annotation artifacts live when no location was configured.
+
+    Silver and gold both hold verbatim transcript, so the default is a named directory
+    under the data root rather than anything that could collide with job artifacts.
+    """
+
+    return settings.annotation_root or settings.data_root / "annotations"
+
+
+def default_annotation_audio_root(settings: Settings) -> Path:
+    """Where the recordings behind silver drafts are read from, in place.
+
+    Both supported, locally-derived review collections live under this root. Resolution
+    itself is still an explicit allowlist (KCSC, 022 finance, and the dated
+    user-provided evaluation sets), rather
+    than a recursive search or a path supplied by the browser.
+    """
+
+    return settings.annotation_audio_root or settings.data_root / "derived"
 
 
 def build_dependencies(
@@ -97,6 +133,18 @@ def build_dependencies(
         emotion: EmotionProvider
         if selected.diarization_provider == "fake":
             diarization = FakeDiarizationProvider()
+        elif selected.diarization_provider == "pyannoteai-precision":
+            # The only provider that leaves this machine, so it is never a fallback: it is
+            # built solely because it was named, and only when its own key is present.
+            selected_credentials = credentials
+            if selected_credentials is None:
+                selected_credentials = load_credentials()
+            if selected_credentials.pyannoteai_api_key is None:
+                raise ProviderConfigurationError()
+            diarization = PyannotePrecisionProvider(
+                selected_credentials,
+                client_factory=factories.pyannoteai_client,
+            )
         else:
             selected_credentials = credentials
             if selected_credentials is None:
@@ -122,15 +170,47 @@ def build_dependencies(
                 model_factory=factories.faster_whisper_model,
             )
         else:
-            transcription = Qwen3AsrProvider(
+            qwen = Qwen3AsrProvider(
                 profile=selected.qwen_profile,
                 device=selected.asr_device,
                 model_factory=factories.qwen_model,
                 aligner_factory=factories.qwen_aligner,
             )
+            if selected.asr_fallback_provider == "none":
+                transcription = qwen
+            else:
+                # The fallback is pinned to CPU rather than inheriting asr_device: it
+                # exists for the case where the requested device rejected Qwen, so
+                # requesting that same device again would defeat the point. faster-whisper
+                # also refuses mps outright.
+                transcription = FallbackTranscriptionProvider(
+                    qwen,
+                    FasterWhisperProvider(
+                        device="cpu",
+                        model_factory=factories.faster_whisper_model,
+                    ),
+                )
 
         if selected.emotion_provider == "fake":
             emotion = FakeEmotionProvider()
+        elif selected.xlsr_release_enabled:
+            if selected.emotion_provider != "wav2vec" or selected.xlsr_release_path is None:
+                raise ProviderConfigurationError()
+            release = verify_release_bundle(selected.xlsr_release_path)
+            emotion = Wav2VecEmotionProvider(
+                release.checkpoint_path,
+                base_model_path=release.base_model_path,
+                device=selected.emotion_device,
+                model_factory=factories.wav2vec_model,
+            )
+            if selected.xlsr_calibration_enabled:
+                if selected.xlsr_calibration_path is None:
+                    raise ProviderConfigurationError()
+                calibration = verify_calibration_artifact(
+                    selected.xlsr_calibration_path,
+                    release=release,
+                )
+                emotion = CalibratedEmotionProvider(emotion, calibration)
         else:
             if selected.emotion_checkpoint_path is None:
                 raise ProviderConfigurationError()
@@ -174,6 +254,8 @@ def build_dependencies(
         admission_reconciliation_lease_seconds=selected.admission_reconciliation_lease_seconds,
         max_active_jobs=selected.max_active_jobs,
         api_capability_token=selected.api_capability_token,
+        annotation_root=default_annotation_root(selected),
+        annotation_audio_root=default_annotation_audio_root(selected),
     )
 
 
@@ -182,4 +264,6 @@ __all__ = [
     "ProviderConfigurationError",
     "ProviderFactories",
     "build_dependencies",
+    "default_annotation_audio_root",
+    "default_annotation_root",
 ]

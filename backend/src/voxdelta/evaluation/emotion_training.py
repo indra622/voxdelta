@@ -124,6 +124,14 @@ class AudioClip:
     sample_rate: int = SAMPLE_RATE
 
 
+class AudioTooShort(ValueError):
+    """A well-formed clip that holds fewer samples than the model can score.
+
+    Kept a ``ValueError`` so every existing caller behaves exactly as before; callers
+    that must tell "unscorable length" apart from "unreadable file" catch this instead.
+    """
+
+
 def load_audio(path: str | Path) -> AudioClip:
     """Read one trusted 16 kHz mono PCM16 WAV without following symlinks."""
 
@@ -143,7 +151,7 @@ def load_audio(path: str | Path) -> AudioClip:
                 raise ValueError("invalid_audio")
         samples = tuple(value / 32768.0 for value in struct.unpack(f"<{frame_count}h", frames))
         if len(samples) < MIN_SAMPLES:
-            raise ValueError("invalid_audio")
+            raise AudioTooShort("invalid_audio")
         return AudioClip(samples=samples)
     except ValueError as error:
         if str(error) == "invalid_audio":

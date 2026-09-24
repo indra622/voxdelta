@@ -275,10 +275,12 @@ def test_ingest_rejects_duration_outside_configured_bounds(
     assert not job_dir.exists() or list(job_dir.iterdir()) == []
 
 
+@pytest.mark.parametrize("extension", [".m4a", ".mp4"])
 def test_ingest_uses_decoded_audio_duration_not_longer_video_container(
+    extension: str,
     tmp_path: Path,
 ) -> None:
-    source = tmp_path / "sidecar-video.m4a"
+    source = tmp_path / ("sidecar-video" + extension)
     generated = tmp_path / "sidecar-video.mp4"
     subprocess.run(
         [

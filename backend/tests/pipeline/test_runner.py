@@ -42,7 +42,7 @@ from voxdelta.pipeline.stages import (
     TransitionsArtifact,
     cache_key_for_stage,
 )
-from voxdelta.providers.base import DiarizationTimelines
+from voxdelta.providers.base import DiarizationTimelines, ProviderDiagnostic, ProviderError
 from voxdelta.providers.fake import (
     FakeDiarizationProvider,
     FakeEmotionProvider,
@@ -50,6 +50,8 @@ from voxdelta.providers.fake import (
     FakeResponseStrategyProvider,
     FakeTranscriptionProvider,
 )
+from voxdelta.providers.fallback_asr import FallbackEvent
+from voxdelta.providers.qwen_timestamps import SANITATION_POLICY, TimestampCoverage
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "synthetic_65s.wav"
 
@@ -256,6 +258,20 @@ class WrongIdEmotion(FakeEmotionProvider):
     def analyze(self, utterance_id: str, audio_path: Path, transcript: str) -> EmotionResult:
         result = super().analyze(utterance_id, audio_path, transcript)
         return result.model_copy(update={"utterance_id": f"wrong-{utterance_id}"})
+
+
+class ShortClipEmotion(FakeEmotionProvider):
+    """Refuse exactly one customer turn the way the local model refuses a sub-0.5 s clip."""
+
+    def __init__(self, refuse_index: int = 1) -> None:
+        self.refuse_index = refuse_index
+        self.seen: list[str] = []
+
+    def analyze(self, utterance_id: str, audio_path: Path, transcript: str) -> EmotionResult:
+        self.seen.append(utterance_id)
+        if len(self.seen) - 1 == self.refuse_index:
+            raise ProviderError("audio_too_short")
+        return super().analyze(utterance_id, audio_path, transcript)
 
 
 class WrongIdStrategy(FakeResponseStrategyProvider):
@@ -1116,3 +1132,247 @@ def test_cross_artifact_or_wrong_type_provider_output_fails_safely(
     error = json.loads(repository.get_job(job_id)["stages"][failed_stage.value]["error_json"])
     assert error["code"] == "invalid_stage_output"
     assert "7" not in error["message"]
+
+
+def test_a_turn_too_short_to_score_is_omitted_and_named_in_the_report_warnings(
+    tmp_path: Path,
+) -> None:
+    """No fabricated distribution, and no silent drop either.
+
+    The pipeline models "we could not score this turn" already: the utterance simply has
+    no emotion result, which makes its transition triples ineligible and lowers
+    `valid_coverage`. The only thing missing was saying so out loud.
+    """
+
+    emotion = ShortClipEmotion(refuse_index=1)
+    runner, _, store, job_id = _harness(tmp_path, emotion=emotion)
+    runner.run_until_pause(job_id)
+
+    completed = _confirm(runner, job_id)
+
+    assert completed["stages"]["emotion"]["status"] == "completed"
+    role = store.read_model(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
+    customer_ids = [u.id for u in role.utterances if u.role == Role.CUSTOMER]
+    skipped = customer_ids[1]
+    emotions = store.read_model(job_id, StageName.EMOTION, EmotionArtifact)
+
+    # Every other turn is scored exactly as before, and the refused one is not invented.
+    assert [result.utterance_id for result in emotions.results] == [
+        item for item in customer_ids if item != skipped
+    ]
+    assert any(skipped in warning for warning in emotions.warnings)
+    assert any("0.5초" in warning for warning in emotions.warnings)
+
+
+def test_a_turn_too_short_to_score_never_becomes_a_fabricated_distribution(
+    tmp_path: Path,
+) -> None:
+    emotion = ShortClipEmotion(refuse_index=0)
+    runner, _, store, job_id = _harness(tmp_path, emotion=emotion)
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+
+    role = store.read_model(job_id, StageName.CONFIRM_ROLES, RoleArtifact)
+    refused = [u.id for u in role.utterances if u.role == Role.CUSTOMER][0]
+    emotions = store.read_model(job_id, StageName.EMOTION, EmotionArtifact)
+
+    assert refused not in {result.utterance_id for result in emotions.results}
+
+
+def test_an_emotion_provider_failure_that_is_not_length_still_fails_the_stage(
+    tmp_path: Path,
+) -> None:
+    """Only the length case is a policy; every other provider failure still fails."""
+
+    class UnavailableEmotion(FakeEmotionProvider):
+        def analyze(self, utterance_id: str, audio_path: Path, transcript: str) -> EmotionResult:
+            raise ProviderError("provider_unavailable")
+
+    runner, _, _, job_id = _harness(tmp_path, emotion=UnavailableEmotion())
+    runner.run_until_pause(job_id)
+
+    completed = _confirm(runner, job_id)
+
+    assert completed["stages"]["emotion"]["status"] == "failed"
+    assert completed["status"] == "failed"
+
+
+def test_retrying_a_failed_emotion_stage_never_re_runs_diarization_or_transcription(
+    tmp_path: Path,
+) -> None:
+    """Recovery after an emotion failure must stay local to emotion and below.
+
+    Diarization is the one stage that can leave this machine, so a retry that re-ran it
+    would turn a local recovery into a second remote call on the same audio.
+    """
+
+    class FailThenSucceedEmotion(FakeEmotionProvider):
+        def __init__(self) -> None:
+            self.fail = True
+
+        def analyze(self, utterance_id: str, audio_path: Path, transcript: str) -> EmotionResult:
+            if self.fail:
+                raise ProviderError("provider_unavailable")
+            return super().analyze(utterance_id, audio_path, transcript)
+
+    diarizer = CountingDiarizer()
+    emotion = FailThenSucceedEmotion()
+    runner, _, store, job_id = _harness(tmp_path, diarizer=diarizer, emotion=emotion)
+    runner.run_until_pause(job_id)
+    failed = _confirm(runner, job_id)
+    assert failed["stages"]["emotion"]["status"] == "failed"
+    diarize_calls_after_first_pass = diarizer.calls
+    transcribe_before = store.content_hash(job_id, StageName.TRANSCRIBE)
+
+    emotion.fail = False
+    recovered = runner.retry(job_id, StageName.EMOTION)
+
+    assert recovered["status"] == "completed"
+    assert diarizer.calls == diarize_calls_after_first_pass
+    assert recovered["stages"]["diarize"]["status"] == "completed"
+    assert store.content_hash(job_id, StageName.TRANSCRIBE) == transcribe_before
+    # The role gate stays decided: a retry from emotion must not re-open it.
+    assert recovered["stages"]["confirm_roles"]["role_confirmed"] == 1
+
+
+class CoverageReportingTranscription(FakeTranscriptionProvider):
+    """A recognizer that reports timestamp-sanitation coverage, as Qwen's does."""
+
+    def __init__(self, coverage: TimestampCoverage | None) -> None:
+        self.last_timestamp_coverage = coverage
+
+
+def test_transcription_coverage_reaches_the_report_and_names_the_loss(tmp_path: Path) -> None:
+    coverage = TimestampCoverage(
+        total_words=100, positive_spans=90, zero_spans=10, zero_spans_unplaceable=4, omitted_words=4
+    ).with_alignment_omissions(0)
+    runner, _repository, store, job_id = _harness(
+        tmp_path, transcription=CoverageReportingTranscription(coverage)
+    )
+
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+    runner.run_until_pause(job_id)
+
+    transcribed = store.read_model(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
+    assert transcribed.timestamp_coverage is not None
+    assert transcribed.timestamp_coverage.omitted_words == 4
+    report = store.read_model(job_id, StageName.REPORT, ReportArtifact).report
+    assert report.transcription_coverage is not None
+    assert report.transcription_coverage.policy == SANITATION_POLICY
+    assert report.transcription_coverage.attributed_words == 96
+    assert report.transcription_coverage.uncertain is True
+    assert any("4개 단어" in warning for warning in report.warnings)
+
+
+def test_a_recognizer_that_lost_nothing_adds_no_warning(tmp_path: Path) -> None:
+    coverage = TimestampCoverage(
+        total_words=50, positive_spans=48, zero_spans=2, zero_spans_unplaceable=0, omitted_words=0
+    ).with_alignment_omissions(0)
+    runner, _repository, store, job_id = _harness(
+        tmp_path, transcription=CoverageReportingTranscription(coverage)
+    )
+
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+    runner.run_until_pause(job_id)
+
+    report = store.read_model(job_id, StageName.REPORT, ReportArtifact).report
+    assert report.transcription_coverage is not None
+    assert report.transcription_coverage.uncertain is False
+    assert not any("전사에서" in warning or "단어" in warning for warning in report.warnings)
+
+
+def test_a_recognizer_without_coverage_leaves_the_report_field_absent(tmp_path: Path) -> None:
+    """faster-whisper reports none, and must keep producing a report that claims none."""
+
+    runner, _repository, store, job_id = _harness(tmp_path)
+
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+    runner.run_until_pause(job_id)
+
+    transcribed = store.read_model(job_id, StageName.TRANSCRIBE, TranscribeArtifact)
+    assert transcribed.timestamp_coverage is None
+    report = store.read_model(job_id, StageName.REPORT, ReportArtifact).report
+    assert report.transcription_coverage is None
+    assert report.warnings == []
+
+
+class FallingBackTranscription(FakeTranscriptionProvider):
+    """A transcription provider that reports having fallen back, as the wrapper does."""
+
+    def __init__(self, code: str = "provider_unavailable") -> None:
+        self.last_fallback = FallbackEvent(
+            primary="qwen3-asr", fallback="faster-whisper", code=code
+        )
+        self.last_timestamp_coverage = None
+
+
+def test_a_fallback_is_named_in_the_report_warnings(tmp_path: Path) -> None:
+    """Provenance alone is easy to miss; the substitution is said out loud."""
+
+    runner, _repository, store, job_id = _harness(
+        tmp_path, transcription=FallingBackTranscription()
+    )
+
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+    runner.run_until_pause(job_id)
+
+    report = store.read_model(job_id, StageName.REPORT, ReportArtifact).report
+    assert any(
+        "qwen3-asr" in warning and "faster-whisper" in warning for warning in report.warnings
+    )
+    assert any("provider_unavailable" in warning for warning in report.warnings)
+
+
+def test_a_run_without_a_fallback_adds_no_fallback_warning(tmp_path: Path) -> None:
+    runner, _repository, store, job_id = _harness(tmp_path)
+
+    runner.run_until_pause(job_id)
+    _confirm(runner, job_id)
+    runner.run_until_pause(job_id)
+
+    report = store.read_model(job_id, StageName.REPORT, ReportArtifact).report
+    assert not any("대체 모델" in warning for warning in report.warnings)
+
+
+def test_a_provider_diagnostic_reaches_the_failed_stage_event_sanitized(tmp_path: Path) -> None:
+    """The stored public code stays a bare typed code; the operator log names the hop."""
+
+    class ClassifyingDiarizer(FakeDiarizationProvider):
+        def diarize_timelines(self, asset: AudioAsset) -> DiarizationTimelines:
+            raise ProviderError(
+                "provider_unavailable",
+                diagnostic=ProviderDiagnostic(
+                    boundary="media_input",
+                    failure="http_status",
+                    status=403,
+                ),
+            )
+
+    runner, repository, store, job_id = _harness(tmp_path, diarizer=ClassifyingDiarizer())
+
+    runner.run_until_pause(job_id)
+
+    stage = cast(dict[str, object], repository.get_job(job_id)["stages"])["diarize"]
+    assert stage["status"] == "failed"
+    assert json.loads(cast(str, stage["error_json"])) == {
+        "code": "provider_unavailable",
+        "message": "The provider is unavailable.",
+    }
+    events = [
+        json.loads(line)
+        for line in (store.job_dir(job_id) / "pipeline.jsonl").read_text().splitlines()
+    ]
+    failed = [
+        event for event in events if event["stage"] == "diarize" and event["event"] == "failed"
+    ]
+    assert len(failed) == 1
+    assert failed[0]["error_code"] == "provider_unavailable"
+    assert failed[0]["metadata"] == {
+        "boundary": "media_input",
+        "failure": "http_status",
+        "status": 403,
+    }

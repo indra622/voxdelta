@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import io
 import json
 import os
-from collections.abc import AsyncIterator, Callable
+import wave
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import AbstractContextManager, asynccontextmanager
 from pathlib import Path
 from threading import Lock
 from time import time
-from typing import Annotated, Any, BinaryIO, cast
+from typing import Annotated, Any, BinaryIO, Literal, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -32,21 +34,55 @@ from pydantic import SecretStr
 from starlette.background import BackgroundTask
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from voxdelta.api.dependencies import build_dependencies
+from voxdelta.annotation import alignment as annotation_alignment
+from voxdelta.annotation import audio as annotation_audio
+from voxdelta.annotation import emotion_candidates as annotation_emotion_candidates
+from voxdelta.annotation import (
+    gemini_emotion_overlay as annotation_gemini_emotion_overlay,
+)
+from voxdelta.annotation import reference_candidate as annotation_reference_candidate
+from voxdelta.annotation import review as annotation_review
+from voxdelta.annotation.gemini_silver import EMOTION_LABELS
+from voxdelta.api.dependencies import (
+    build_dependencies,
+    default_annotation_audio_root,
+    default_annotation_root,
+)
 from voxdelta.api.schemas import (
+    AlignmentProposal,
+    AlignmentProposalCollection,
+    AlignmentProposalRow,
+    AnnotationAudioOverview,
+    AnnotationReviewIndex,
+    AnnotationReviewState,
+    EmotionOverlayCandidate,
+    ExpertGuidanceRequest,
+    ExpertGuidanceStatus,
+    ExpertGuidanceSubmission,
+    GeminiEmotionOverlayCandidate,
+    GoldPromotionRequest,
+    GoldPromotionResult,
     JobCreated,
     ProviderConfiguration,
     PublicError,
     PublicErrorEnvelope,
     PublicJob,
     PublicStage,
+    ReferenceResegmentationCandidate,
     RetryRequest,
+    ReviewGap,
+    ReviewTurn,
+    ReviewWarning,
     RoleCandidate,
     RoleConfirmation,
+    RoleSample,
+    SilverReviewDraft,
+    TurnClip,
 )
 from voxdelta.audio.service import AudioRejected, PreparedAudio
 from voxdelta.config import Settings
 from voxdelta.domain.models import AnalysisReport, StageName
+from voxdelta.expert_mode import ExpertHandoffRecord, ExpertHandoffStore, build_expert_request
 from voxdelta.jobs._ids import JobAbsenceProof
 from voxdelta.jobs.artifacts import ArtifactStore
 from voxdelta.jobs.repository import JobCapacityExceeded, JobRepository
@@ -60,7 +96,9 @@ UPLOAD_CHUNK_BYTES = 1024 * 1024
 AUDIO_CHUNK_BYTES = 64 * 1024
 # Multipart boundaries and headers are bounded separately from the exact stored-file limit.
 MULTIPART_OVERHEAD_BYTES = 64 * 1024
-_SUPPORTED_SUFFIXES = frozenset({".wav", ".mp3", ".m4a"})
+_SUPPORTED_SUFFIXES = frozenset({".wav", ".mp3", ".m4a", ".mp4"})
+_ROLE_SAMPLE_SECONDS = 8.0
+_ROLE_SAMPLES_PER_SPEAKER = 2
 _PUBLIC_STAGE_ERRORS = {
     "pipeline_failed": "The pipeline stage failed.",
     "audio_rejected": "The uploaded audio was rejected.",
@@ -77,6 +115,38 @@ _CAPABILITY_SECURITY = APIKeyHeader(
     auto_error=False,
 )
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+# Job data and annotation drafts both hold verbatim speech, so both sit behind the
+# per-launch capability. The provider disclosure does not: it is the one thing a client
+# has to be able to read before it decides whether to hand anything over.
+_CAPABILITY_PROTECTED_PREFIXES = ("/api/jobs", "/api/annotations")
+# Every refusal the annotation review path can produce, mapped to the status a client
+# should act on. An unmapped code would be a new refusal nobody chose a status for.
+_REVIEW_ERROR_STATUS = {
+    "invalid_conversation_id": 422,
+    "annotation_not_found": 404,
+    "annotation_unreadable": 409,
+    "reviewer_required": 422,
+    "review_acknowledgement_required": 422,
+    "review_note_too_long": 422,
+    "corrected_turns_required": 422,
+    "too_many_turns": 422,
+    "invalid_turn_speaker": 422,
+    "invalid_turn_transcript": 422,
+    "invalid_turn_rationale": 422,
+    "invalid_turn_emotion": 422,
+    "invalid_turn_interval": 422,
+    "invalid_turn_confidence": 422,
+    # Listening is a read of audio the draft already points at, so a missing or swapped
+    # recording is the draft's state rather than the caller's mistake: 409, not 404.
+    "audio_source_unavailable": 409,
+    "audio_source_mismatch": 409,
+    "audio_source_unreadable": 409,
+    "invalid_clip_range": 422,
+    "clip_too_long": 422,
+    "gold_already_exists": 409,
+    "promotion_refused": 409,
+    "silver_modified": 500,
+}
 
 
 def _error_responses(*statuses: int) -> dict[int | str, dict[str, Any]]:
@@ -167,7 +237,7 @@ class _LocalCapabilityMiddleware:
             )
             return
         path = str(scope.get("path", ""))
-        if path.startswith("/api/jobs"):
+        if path.startswith(_CAPABILITY_PROTECTED_PREFIXES):
             supplied = [value for name, value in headers if name.lower() == _CAPABILITY_HEADER]
             expected = self._token.get_secret_value().encode("utf-8")
             if len(supplied) != 1 or not hmac.compare_digest(supplied[0], expected):
@@ -365,6 +435,7 @@ def _public_job(repository: JobRepository, runner: PipelineRunner, job_id: str) 
             candidate = RoleCandidate(
                 speakers=sorted({item.speaker_id for item in artifact.utterances}),
                 suggested_mapping=artifact.suggestion,
+                samples=_role_samples(artifact),
             )
 
     required_strings = ("status", "created_at", "updated_at")
@@ -378,6 +449,76 @@ def _public_job(repository: JobRepository, runner: PipelineRunner, job_id: str) 
         updated_at=cast(str, raw["updated_at"]),
         stages=stages,
         role_candidate=candidate,
+    )
+
+
+def _role_samples(artifact: Any) -> dict[str, list[RoleSample]]:
+    """Choose a small, deterministic listening set without inferring a role.
+
+    Role confirmation happens *after* ASR in this pipeline. These excerpts let a reviewer
+    listen to the diarized voice while reading already-attributed transcript, but never
+    label SPEAKER_00/01 as customer or agent automatically.
+    """
+
+    by_speaker: dict[str, list[Any]] = {}
+    for utterance in sorted(artifact.utterances, key=lambda item: (item.start, item.end)):
+        if isinstance(utterance.transcript, str) and utterance.transcript.strip():
+            by_speaker.setdefault(utterance.speaker_id, []).append(utterance)
+
+    samples: dict[str, list[RoleSample]] = {}
+    for speaker, utterances in by_speaker.items():
+        rows: list[RoleSample] = []
+        for index, utterance in enumerate(utterances[:_ROLE_SAMPLES_PER_SPEAKER]):
+            clip_end = min(float(utterance.end), float(utterance.start) + _ROLE_SAMPLE_SECONDS)
+            rows.append(
+                RoleSample(
+                    speaker_id=speaker,
+                    index=index,
+                    start=round(float(utterance.start), 3),
+                    end=round(clip_end, 3),
+                    transcript=utterance.transcript.strip(),
+                    clip_truncated=clip_end < float(utterance.end),
+                )
+            )
+        samples[speaker] = rows
+    return samples
+
+
+def _review_error(error: annotation_review.ReviewRejected) -> HTTPException:
+    """Answer with the refusal's own code, never with the store's path-bearing text."""
+
+    status_code = _REVIEW_ERROR_STATUS.get(error.code, 422)
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": error.code, "message": error.message},
+    )
+
+
+def _review_state(state: annotation_review.ReviewState) -> AnnotationReviewState:
+    return AnnotationReviewState(
+        conversation_id=state.conversation_id,
+        review_state=state.review_state,
+        promotable=state.promotable,
+        created_at=state.created_at,
+        model=state.model,
+        input_sha256=state.input_sha256,
+        content_sha256=state.content_sha256,
+        remote_file_deleted=state.remote_file_deleted,
+        turn_count=state.turn_count,
+        speaker_count=state.speaker_count,
+        uncertain_turns=state.uncertain_turns,
+        mean_confidence=state.mean_confidence,
+        gold_present=state.gold_present,
+        emotion_candidate_count=state.emotion_candidate_count,
+    )
+
+
+def _review_warning(warning: annotation_review.ReviewWarning) -> ReviewWarning:
+    return ReviewWarning(
+        code=warning.code,
+        detail=warning.detail,
+        count=warning.count,
+        by_rule=dict(warning.by_rule) if warning.by_rule is not None else None,
     )
 
 
@@ -487,6 +628,49 @@ async def _audio_chunks(
         closer.close()
 
 
+def _role_sample_wav(opened: BinaryIO, *, start: float, end: float) -> bytes:
+    """Copy a bounded PCM excerpt from a verified job preview into memory.
+
+    ``open_mixed_preview`` deliberately yields a descriptor, not a path. Keeping the
+    slice descriptor-based preserves that containment and avoids a new path-resolution
+    surface just for role confirmation.
+    """
+
+    opened.seek(0)
+    with wave.open(opened, "rb") as source:
+        if (
+            source.getcomptype() != "NONE"
+            or source.getframerate() < 1
+            or source.getnchannels() < 1
+            or source.getsampwidth() < 1
+        ):
+            raise ValueError("normalized preview is not PCM WAV")
+        frame_rate = source.getframerate()
+        start_frame = int(start * frame_rate)
+        end_frame = min(int(round(end * frame_rate)), source.getnframes())
+        if start_frame < 0 or end_frame <= start_frame:
+            raise ValueError("role sample bounds are invalid")
+        source.setpos(start_frame)
+        frames = source.readframes(end_frame - start_frame)
+        expected_bytes = (end_frame - start_frame) * source.getnchannels() * source.getsampwidth()
+        if len(frames) != expected_bytes:
+            raise ValueError("normalized preview ended before role sample")
+        output = io.BytesIO()
+        with wave.open(output, "wb") as clipped:
+            clipped.setparams(
+                (
+                    source.getnchannels(),
+                    source.getsampwidth(),
+                    frame_rate,
+                    end_frame - start_frame,
+                    "NONE",
+                    "not compressed",
+                )
+            )
+            clipped.writeframes(frames)
+        return output.getvalue()
+
+
 def reconcile_local_state(
     repository: JobRepository,
     artifacts: ArtifactStore,
@@ -544,6 +728,8 @@ def create_app(
     reconciliation_lease_seconds: float | None = None,
     api_capability_token: SecretStr | None = None,
     max_active_jobs: int | None = None,
+    annotation_root: Path | None = None,
+    annotation_audio_root: Path | None = None,
 ) -> FastAPI:
     """Create an isolated application, or construct safe local production dependencies."""
 
@@ -562,12 +748,22 @@ def create_app(
             api_capability_token = dependencies.api_capability_token
         if max_active_jobs is None:
             max_active_jobs = dependencies.max_active_jobs
+        if annotation_root is None:
+            annotation_root = dependencies.annotation_root
+        if annotation_audio_root is None:
+            annotation_audio_root = dependencies.annotation_audio_root
     if max_upload_bytes is None:
         max_upload_bytes = Settings().max_upload_bytes
     if reconciliation_lease_seconds is None:
         reconciliation_lease_seconds = Settings().admission_reconciliation_lease_seconds
     if max_active_jobs is None:
         max_active_jobs = Settings().max_active_jobs
+    if annotation_root is None:
+        annotation_root = default_annotation_root(Settings())
+    if annotation_audio_root is None:
+        annotation_audio_root = default_annotation_audio_root(Settings())
+    selected_annotation_root = annotation_root
+    selected_annotation_audio_root = annotation_audio_root
     if api_capability_token is None:
         raise ValueError(
             "VOXDELTA_API_CAPABILITY_TOKEN must configure a per-launch capability token"
@@ -613,6 +809,20 @@ def create_app(
         max_bytes=max_upload_bytes + MULTIPART_OVERHEAD_BYTES,
     )
     app.add_middleware(_LocalCapabilityMiddleware, token=api_capability_token)
+    expert_handoffs = ExpertHandoffStore(artifacts.root)
+
+    def expert_status(record: ExpertHandoffRecord | None) -> ExpertGuidanceStatus:
+        if record is None:
+            return ExpertGuidanceStatus(status="not_requested", evidence_turn_count=0)
+        return ExpertGuidanceStatus(
+            status=record.status,
+            target=record.request.target,
+            transport=record.request.transport,
+            request_sha256=record.request_sha256,
+            transcription_uncertain=record.request.transcription_uncertain,
+            evidence_turn_count=len(record.request.evidence),
+            guidance=record.guidance,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def request_validation_error(
@@ -686,7 +896,7 @@ def create_app(
                 status_code=422,
                 detail={
                     "code": "unsupported_audio_type",
-                    "message": "Upload a WAV, MP3, or M4A audio file.",
+                    "message": "Upload a WAV, MP3, M4A, or MP4 audio file.",
                 },
             )
         job_id = uuid4().hex
@@ -915,6 +1125,91 @@ def create_app(
         return canonical
 
     @app.get(
+        "/api/jobs/{job_id}/expert-guidance",
+        response_model=ExpertGuidanceStatus,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def get_expert_guidance(job_id: str) -> ExpertGuidanceStatus:
+        try:
+            # Fence arbitrary paths and deleted jobs before exposing a status.
+            runner.report(job_id)
+            return expert_status(expert_handoffs.read(job_id))
+        except KeyError:
+            raise _not_found() from None
+        except PipelineStateError as error:
+            raise _pipeline_error(409, error) from None
+        except PipelineValidationError as error:
+            raise _pipeline_error(409, error) from None
+        except ValueError:
+            raise _not_found() from None
+
+    @app.post(
+        "/api/jobs/{job_id}/expert-guidance/request",
+        response_model=ExpertGuidanceStatus,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def request_expert_guidance(
+        job_id: str, request: ExpertGuidanceRequest
+    ) -> ExpertGuidanceStatus:
+        """Queue a text-only ACP handoff; the API never calls a model SDK itself."""
+
+        try:
+            report = runner.report(job_id)
+            target = cast(Literal["claude", "codex"], request.target)
+            record = expert_handoffs.queue(build_expert_request(report, target=target))
+            return expert_status(record)
+        except KeyError:
+            raise _not_found() from None
+        except PipelineStateError as error:
+            raise _pipeline_error(409, error) from None
+        except PipelineValidationError as error:
+            raise _pipeline_error(409, error) from None
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "expert_request_rejected",
+                    "message": "The expert-guidance request could not be created.",
+                },
+            ) from None
+
+    @app.post(
+        "/api/jobs/{job_id}/expert-guidance/response",
+        response_model=ExpertGuidanceStatus,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def submit_expert_guidance(
+        job_id: str, submission: ExpertGuidanceSubmission
+    ) -> ExpertGuidanceStatus:
+        """Accept only ACP output matching the exact queued evidence packet."""
+
+        try:
+            runner.report(job_id)
+            record = expert_handoffs.submit(
+                job_id,
+                request_sha256=submission.request_sha256,
+                guidance=submission.guidance,
+            )
+            return expert_status(record)
+        except KeyError:
+            raise _not_found() from None
+        except PipelineStateError as error:
+            raise _pipeline_error(409, error) from None
+        except PipelineValidationError as error:
+            raise _pipeline_error(409, error) from None
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "expert_guidance_rejected",
+                    "message": "The expert-guidance response did not match the queued evidence.",
+                },
+            ) from None
+
+    @app.get(
         "/api/jobs/{job_id}/audio",
         response_class=StreamingResponse,
         dependencies=[Security(_CAPABILITY_SECURITY)],
@@ -984,6 +1279,495 @@ def create_app(
             media_type="audio/wav",
             background=BackgroundTask(closer.close),
             closer=closer,
+        )
+
+    @app.get(
+        "/api/jobs/{job_id}/role-samples/{speaker_id}/{sample_index}/audio",
+        response_class=Response,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses={
+            200: {"description": "Short role-confirmation WAV clip", "content": _WAV_CONTENT},
+            **_error_responses(400, 401, 403, 404, 409, 422, 500),
+        },
+    )
+    def role_sample_audio(job_id: str, speaker_id: str, sample_index: int) -> Response:
+        """Serve one preselected diarization excerpt for human role confirmation."""
+
+        context: AbstractContextManager[BinaryIO] | None = None
+        try:
+            candidate = runner.role_candidate(job_id)
+            options = _role_samples(candidate).get(speaker_id, [])
+            if sample_index < 0 or sample_index >= len(options):
+                raise PipelineValidationError(
+                    "invalid_role_sample",
+                    "The requested role sample is not available.",
+                )
+            sample = options[sample_index]
+            context = runner.open_mixed_preview(job_id)
+            opened = context.__enter__()
+            # Eight-second clips are small. Materializing them avoids a second descriptor
+            # and never writes an excerpt to disk.
+            return Response(
+                content=_role_sample_wav(opened, start=sample.start, end=sample.end),
+                media_type="audio/wav",
+            )
+        except KeyError:
+            raise _not_found() from None
+        except PipelineStateError as error:
+            raise _pipeline_error(409, error) from None
+        except PipelineValidationError as error:
+            raise _pipeline_error(409, error) from None
+        except annotation_review.ReviewRejected as error:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": error.code, "message": error.message},
+            ) from None
+        except (OSError, ValueError, wave.Error):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "invalid_normalized_audio",
+                    "message": "The normalized audio preview is invalid.",
+                },
+            ) from None
+        finally:
+            if context is not None:
+                context.__exit__(None, None, None)
+
+    @app.get(
+        "/api/annotations",
+        response_model=AnnotationReviewIndex,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 500),
+    )
+    def list_annotations() -> AnnotationReviewIndex:
+        """Counts and digests only. Choosing a draft must not reveal any speech."""
+
+        index = annotation_review.available(selected_annotation_root)
+        return AnnotationReviewIndex(
+            annotations=[_review_state(state) for state in index.annotations],
+            unreadable_count=index.unreadable_count,
+        )
+
+    @app.get(
+        "/api/annotations/{conversation_id}",
+        response_model=SilverReviewDraft,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def silver_draft(conversation_id: str) -> SilverReviewDraft:
+        """Serve one draft in full. Transcript leaves this process only through here."""
+
+        try:
+            draft = annotation_review.load_draft(selected_annotation_root, conversation_id)
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        return SilverReviewDraft(
+            state=_review_state(draft.state),
+            speakers=list(draft.speakers),
+            notes=draft.notes,
+            turns=[
+                ReviewTurn(
+                    start=turn.start,
+                    end=turn.end,
+                    speaker=turn.speaker,
+                    transcript=turn.transcript,
+                    emotion=turn.emotion,
+                    emotion_rationale=turn.emotion_rationale,
+                    confidence=turn.confidence,
+                )
+                for turn in draft.turns
+            ],
+            emotion_labels=list(EMOTION_LABELS),
+            warnings=[_review_warning(warning) for warning in draft.warnings],
+        )
+
+    @app.get(
+        "/api/annotations/{conversation_id}/alignment-proposal",
+        response_model=AlignmentProposal | None,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def alignment_proposal(conversation_id: str) -> AlignmentProposal | None:
+        """Timestamp-only Gemini suggestion, never applied to Silver automatically."""
+
+        try:
+            draft = annotation_review.load_draft(selected_annotation_root, conversation_id)
+            record = annotation_alignment.load_proposal(
+                selected_annotation_root,
+                conversation_id,
+                source_digest=draft.state.content_sha256,
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        except annotation_alignment.AlignmentError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "alignment_proposal_unreadable",
+                    "message": "The timestamp alignment proposal cannot be used for this draft.",
+                },
+            ) from None
+        if record is None:
+            return None
+        content = record.get("content")
+        raw_rows = content.get("rows") if isinstance(content, dict) else []
+        rows = raw_rows if isinstance(raw_rows, list) else []
+        validation = record.get("validation")
+        raw_dropped_rules = (
+            validation.get("dropped_rows_by_rule", {}) if isinstance(validation, dict) else {}
+        )
+        dropped_rules = raw_dropped_rules if isinstance(raw_dropped_rules, dict) else {}
+        target_start = (
+            int(content.get("target_start_position", 0)) if isinstance(content, dict) else 0
+        )
+        dropped_count = (
+            int(validation.get("dropped_row_count", 0)) if isinstance(validation, dict) else 0
+        )
+        safe_rules = {
+            str(key): int(value) for key, value in dropped_rules.items() if isinstance(value, int)
+        }
+        return AlignmentProposal(
+            source_silver_content_sha256=draft.state.content_sha256,
+            target_start_position=target_start,
+            target_end_position=int(content.get("target_end_position", draft.state.turn_count))
+            if isinstance(content, dict)
+            else draft.state.turn_count,
+            rows=[AlignmentProposalRow(**row) for row in rows if isinstance(row, dict)],
+            dropped_row_count=dropped_count,
+            dropped_rows_by_rule=safe_rules,
+        )
+
+    @app.get(
+        "/api/annotations/{conversation_id}/alignment-proposals",
+        response_model=AlignmentProposalCollection,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def alignment_proposals(conversation_id: str) -> AlignmentProposalCollection:
+        """All known range-bound timing suggestions, never applied automatically."""
+
+        try:
+            draft = annotation_review.load_draft(selected_annotation_root, conversation_id)
+            records = annotation_alignment.load_proposals(
+                selected_annotation_root,
+                conversation_id,
+                source_digest=draft.state.content_sha256,
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        except annotation_alignment.AlignmentError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "alignment_proposal_unreadable",
+                    "message": "A timestamp alignment proposal cannot be used for this draft.",
+                },
+            ) from None
+
+        proposals: list[AlignmentProposal] = []
+        for record in records:
+            content = record.get("content")
+            validation = record.get("validation")
+            if not isinstance(content, dict) or not isinstance(validation, dict):
+                continue
+            raw_rows = content.get("rows")
+            raw_dropped_rules = validation.get("dropped_rows_by_rule", {})
+            if not isinstance(raw_rows, list) or not isinstance(raw_dropped_rules, dict):
+                continue
+            proposals.append(
+                AlignmentProposal(
+                    source_silver_content_sha256=draft.state.content_sha256,
+                    target_start_position=int(content["target_start_position"]),
+                    target_end_position=int(
+                        content.get("target_end_position", draft.state.turn_count)
+                    ),
+                    rows=[AlignmentProposalRow(**row) for row in raw_rows if isinstance(row, dict)],
+                    dropped_row_count=int(validation.get("dropped_row_count", 0)),
+                    dropped_rows_by_rule={
+                        str(key): int(value)
+                        for key, value in raw_dropped_rules.items()
+                        if isinstance(value, int)
+                    },
+                )
+            )
+        return AlignmentProposalCollection(proposals=proposals)
+
+    @app.get(
+        "/api/annotations/{conversation_id}/reference-resegmentation-candidate",
+        response_model=ReferenceResegmentationCandidate | None,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def reference_resegmentation_candidate(
+        conversation_id: str,
+    ) -> ReferenceResegmentationCandidate | None:
+        """A KCSC human-reference repair candidate, never applied automatically."""
+
+        try:
+            draft = annotation_review.load_draft(selected_annotation_root, conversation_id)
+            if draft.state.model == "kcsc-human-reference":
+                return None
+            candidate = annotation_reference_candidate.load_candidate(
+                selected_annotation_audio_root.parent / "reference",
+                conversation_id=conversation_id,
+                source_silver_content_sha256=draft.state.content_sha256,
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        except annotation_reference_candidate.ReferenceCandidateError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "reference_candidate_unreadable",
+                    "message": "The local reference candidate cannot be used for this draft.",
+                },
+            ) from None
+        if candidate is None:
+            return None
+        return ReferenceResegmentationCandidate(
+            source_silver_content_sha256=candidate.source_silver_content_sha256,
+            source_reference_sha256=candidate.source_reference_sha256,
+            reference_turn_count=candidate.reference_turn_count,
+            speakers=list(candidate.speakers),
+            notes=candidate.notes,
+            turns=[
+                ReviewTurn(
+                    start=turn.start,
+                    end=turn.end,
+                    speaker=turn.speaker,
+                    transcript=turn.transcript,
+                    emotion=turn.emotion,
+                    emotion_rationale=turn.emotion_rationale,
+                    confidence=turn.confidence,
+                )
+                for turn in candidate.turns
+            ],
+        )
+
+    @app.get(
+        "/api/annotations/{conversation_id}/emotion-overlay-candidate",
+        response_model=EmotionOverlayCandidate | None,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def emotion_overlay_candidate(conversation_id: str) -> EmotionOverlayCandidate | None:
+        """Local XLS-R emotion overlay, never applied to Silver or Gold automatically."""
+
+        try:
+            draft = annotation_review.load_draft(selected_annotation_root, conversation_id)
+            candidate = annotation_emotion_candidates.load_local_candidate(
+                annotation_root=selected_annotation_root,
+                conversation_id=conversation_id,
+                source_silver_content_sha256=draft.state.content_sha256,
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        except annotation_emotion_candidates.EmotionCandidateError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "emotion_candidate_unreadable",
+                    "message": "The local emotion candidate cannot be used for this draft.",
+                },
+            ) from None
+        if candidate is None:
+            return None
+        content = candidate["content"]
+        rows = content["turns"]
+        summary = candidate.get("summary")
+        source = candidate["source"]
+        histogram = summary.get("emotion_histogram", {}) if isinstance(summary, dict) else {}
+        return EmotionOverlayCandidate(
+            source_silver_content_sha256=str(source["silver_content_sha256"]),
+            model=str(source.get("model", "local emotion overlay")),
+            remote_audio_transmitted=bool(source.get("remote_audio_transmitted", False)),
+            emotion_histogram={str(key): int(value) for key, value in histogram.items()},
+            uncertain_turns=(
+                int(summary.get("uncertain_turns", 0)) if isinstance(summary, dict) else 0
+            ),
+            turns=[ReviewTurn(**row) for row in rows if isinstance(row, dict)],
+        )
+
+    @app.get(
+        "/api/annotations/{conversation_id}/gemini-emotion-overlay-candidate",
+        response_model=GeminiEmotionOverlayCandidate | None,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def gemini_emotion_overlay_candidate(
+        conversation_id: str,
+    ) -> GeminiEmotionOverlayCandidate | None:
+        """A remote Gemini emotion overlay; read-only here and never promoted by the API."""
+
+        try:
+            draft = annotation_review.load_draft(selected_annotation_root, conversation_id)
+            candidate = annotation_gemini_emotion_overlay.load_candidate(
+                annotation_root=selected_annotation_root,
+                conversation_id=conversation_id,
+                source_silver_content_sha256=draft.state.content_sha256,
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        except annotation_gemini_emotion_overlay.OverlayCandidateError:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "gemini_emotion_candidate_unreadable",
+                    "message": "The Gemini emotion overlay cannot be used for this draft.",
+                },
+            ) from None
+        if candidate is None:
+            return None
+        content = candidate["content"]
+        rows = content["turns"]
+        summary = candidate.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
+        source = candidate["source"]
+        histogram = summary.get("emotion_histogram", {})
+        mean_confidence = summary.get("mean_confidence")
+        return GeminiEmotionOverlayCandidate(
+            source_silver_content_sha256=str(source["silver_content_sha256"]),
+            model=str(source.get("model", "gemini emotion overlay")),
+            # Read from the artifact rather than hardcoded: an overlay that somehow
+            # recorded otherwise must not be shown to a reviewer as remote anyway.
+            remote_audio_transmitted=bool(source.get("remote_audio_transmitted", True)),
+            review_required=candidate.get("review_state") == "review_required",
+            promotable=bool(candidate.get("promotable", False)),
+            emotion_histogram={
+                str(key): int(value) for key, value in histogram.items() if isinstance(value, int)
+            },
+            uncertain_turns=int(summary.get("uncertain_turns", 0)),
+            mean_confidence=(
+                float(mean_confidence) if isinstance(mean_confidence, (int, float)) else None
+            ),
+            turns=[ReviewTurn(**row) for row in rows if isinstance(row, dict)],
+        )
+
+    @app.get(
+        "/api/annotations/{conversation_id}/audio",
+        response_model=AnnotationAudioOverview,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def annotation_audio_overview(conversation_id: str) -> AnnotationAudioOverview:
+        """What can be listened to for one draft: its turns, and the gaps between them.
+
+        Separate from the draft so a machine that holds the annotation but not the
+        recording still serves a reviewable draft; only listening is unavailable.
+        """
+
+        try:
+            overview = annotation_review.audio_overview(
+                selected_annotation_root,
+                conversation_id,
+                audio_root=selected_annotation_audio_root,
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        return AnnotationAudioOverview(
+            conversation_id=overview.conversation_id,
+            duration_seconds=overview.duration_seconds,
+            sample_rate=overview.sample_rate,
+            max_clip_seconds=overview.max_clip_seconds,
+            min_gap_seconds=overview.min_gap_seconds,
+            turn_clips=[
+                TurnClip(position=clip.position, start=clip.start, end=clip.end)
+                for clip in overview.turn_clips
+            ],
+            gaps=[ReviewGap(start=gap.start, end=gap.end) for gap in overview.gaps],
+        )
+
+    @app.get(
+        "/api/annotations/{conversation_id}/audio/clip",
+        response_class=StreamingResponse,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses={
+            200: {"description": "One clipped range of the source audio", "content": _WAV_CONTENT},
+            **_error_responses(400, 401, 403, 404, 409, 422, 500),
+        },
+    )
+    def annotation_audio_clip(
+        conversation_id: str,
+        start: float,
+        end: float,
+    ) -> Response:
+        """Stream one range of the draft's own recording, synthesized rather than stored.
+
+        The range is explicit in seconds rather than expressed as a byte range: a reviewer
+        asks for a turn, not for an offset, and translating time into frames here is what
+        keeps the caller from ever addressing the file's bytes. The response is a complete
+        small WAV, so a browser can play it without knowing anything about the source.
+        """
+
+        try:
+            plan = annotation_review.plan_audio_clip(
+                selected_annotation_root,
+                conversation_id,
+                audio_root=selected_annotation_audio_root,
+                start=start,
+                end=end,
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+
+        def stream() -> Iterator[bytes]:
+            try:
+                yield from annotation_audio.clip_bytes(plan)
+            except OSError:
+                # The header has already been sent, so the only honest end is a short
+                # body. Raising here would otherwise surface as an unhandled error.
+                return
+
+        return StreamingResponse(
+            stream(),
+            status_code=200,
+            media_type="audio/wav",
+            headers={
+                "Content-Length": str(plan.total_bytes),
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post(
+        "/api/annotations/{conversation_id}/gold",
+        status_code=201,
+        response_model=GoldPromotionResult,
+        dependencies=[Security(_CAPABILITY_SECURITY)],
+        responses=_error_responses(400, 401, 403, 404, 409, 422, 500),
+    )
+    def promote_annotation(
+        conversation_id: str,
+        submission: GoldPromotionRequest,
+    ) -> GoldPromotionResult:
+        """The only route to gold, and it refuses everything a person did not assert."""
+
+        try:
+            promotion = annotation_review.promote_reviewed(
+                selected_annotation_root,
+                conversation_id,
+                reviewer=submission.reviewer,
+                acknowledged=submission.acknowledged,
+                corrected_turns=[turn.model_dump() for turn in submission.turns],
+                review_note=submission.review_note,
+                change_reasons=[reason.model_dump() for reason in submission.change_reasons],
+            )
+        except annotation_review.ReviewRejected as error:
+            raise _review_error(error) from None
+        return GoldPromotionResult(
+            conversation_id=promotion.conversation_id,
+            reviewer=promotion.reviewer,
+            reviewed_at=promotion.reviewed_at,
+            review_note=promotion.review_note,
+            content_sha256=promotion.content_sha256,
+            parent_silver_sha256=promotion.parent_silver_sha256,
+            unchanged_from_silver=promotion.unchanged_from_silver,
+            turn_count=promotion.turn_count,
+            speaker_count=promotion.speaker_count,
+            uncertain_turns=promotion.uncertain_turns,
+            mean_confidence=promotion.mean_confidence,
+            change_reason_count=promotion.change_reason_count,
+            silver_unmodified=promotion.silver_unmodified,
         )
 
     @app.delete(

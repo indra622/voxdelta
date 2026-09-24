@@ -56,6 +56,30 @@ def _checkpoint(path: Path) -> Path:
     return path
 
 
+@pytest.mark.parametrize("class_weighting", ["none", "sqrt-inverse-frequency"])
+def test_provider_accepts_runpod_schema_four_weighting_contracts(
+    tmp_path: Path, class_weighting: str
+) -> None:
+    from voxdelta.providers._emotion_runtime import validate_checkpoint
+
+    checkpoint = _checkpoint(tmp_path / class_weighting)
+    config = json.loads((checkpoint / "config.json").read_text())
+    config["schema_version"] = "4"
+    config["class_weighting"] = class_weighting
+    config["class_weights"] = (
+        [1.0] * 7 if class_weighting == "none" else [0.8, 0.9, 1.0, 1.1, 1.2, 1.0, 1.0]
+    )
+    (checkpoint / "config.json").write_text(json.dumps(config))
+
+    info = validate_checkpoint(
+        checkpoint,
+        architecture="wav2vec-xls-r",
+        model_id="facebook/wav2vec2-xls-r-300m",
+    )
+
+    assert info.path == checkpoint.resolve()
+
+
 class FakePredictor:
     def __init__(self, outputs: list[list[float]] | BaseException) -> None:
         self.outputs = outputs
@@ -199,7 +223,9 @@ def test_short_audio_is_rejected_before_model_loading(tmp_path: Path, seconds: f
     with pytest.raises(ProviderError) as raised:
         provider.analyze("utt", _wav(tmp_path / "short.wav", seconds), "")
 
-    assert raised.value.code == "invalid_audio_asset"
+    # Named by length rather than as a bad asset, so the caller can apply the
+    # unscored-turn policy instead of failing the stage.
+    assert raised.value.code == "audio_too_short"
     assert factory.calls == []
 
 
@@ -659,3 +685,158 @@ def test_transformers_predictor_loads_verified_base_local_only(
     assert calls[0] == ("extractor", str(tmp_path / "base"), {"local_files_only": True})
     assert calls[1][0:2] == ("model", str(tmp_path / "base"))
     assert calls[1][2]["local_files_only"] is True
+
+
+def test_transformers_predictor_binds_the_fixed_seven_class_head_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import voxdelta.providers.wav2vec_emotion as module
+
+    calls: list[tuple[str, str, dict[str, object]]] = []
+    loaded: list[str] = []
+
+    class Loader:
+        def __init__(self, kind: str, result: object) -> None:
+            self.kind = kind
+            self.result = result
+
+        def from_pretrained(self, source: str, **kwargs: object) -> object:
+            calls.append((self.kind, source, kwargs))
+            return self.result
+
+    class Model:
+        def load_state_dict(self, state: object) -> None:
+            assert state == {}
+
+        def to(self, device: str) -> None:
+            assert device == "cpu"
+
+        def eval(self) -> None:
+            pass
+
+    class Transformers:
+        AutoFeatureExtractor = Loader("extractor", object())
+        AutoModelForAudioClassification = Loader("model", Model())
+
+    class Safetensors:
+        @staticmethod
+        def load_file(path: str) -> dict[str, object]:
+            loaded.append(path)
+            return {}
+
+    modules = {
+        "torch": object(),
+        "transformers": Transformers(),
+        "safetensors.torch": Safetensors(),
+    }
+    monkeypatch.setattr(module, "import_module", lambda name: modules[name])
+    bundle = tmp_path / "release"
+    checkpoint = bundle / "checkpoint"
+    checkpoint.mkdir(parents=True)
+    base = bundle / "base-model"
+    base.mkdir()
+
+    module._TransformersPredictor(checkpoint, base, "cpu")
+
+    assert [call[0:2] for call in calls] == [
+        ("extractor", str(base)),
+        ("model", str(base)),
+    ]
+    assert all(call[2]["local_files_only"] is True for call in calls)
+    head = calls[1][2]
+    assert head["num_labels"] == 7
+    assert head["id2label"] == dict(enumerate(LABELS))
+    assert head["label2id"] == {label: index for index, label in enumerate(LABELS)}
+    assert loaded == [str(checkpoint / "model.safetensors")]
+
+
+# --- clips below the model's 0.5 s floor are refused by name, not as a bad asset ---
+
+
+@contextmanager
+def _null_inference_context():
+    yield
+
+
+def _null_context():
+    return _null_inference_context()
+
+
+def _write_clip(path: Path, seconds: float) -> Path:
+    """One valid 16 kHz mono PCM16 WAV of the requested length, generated locally."""
+
+    import wave
+
+    frames = int(round(16_000 * seconds))
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16_000)
+        handle.writeframes(b"\x00\x01" * frames)
+    return path
+
+
+@pytest.mark.parametrize("seconds", [0.1, 0.25, 0.49])
+def test_a_clip_under_the_half_second_floor_is_reported_as_too_short(
+    tmp_path: Path, seconds: float
+) -> None:
+    """The distinguishing evidence: length, not format, is what these clips fail on."""
+
+    from voxdelta.domain.models import ProviderProvenance
+    from voxdelta.providers._emotion_runtime import analyze_local_emotion
+
+    with pytest.raises(ProviderError) as raised:
+        analyze_local_emotion(
+            utterance_id="utt-0001",
+            audio_path=_write_clip(tmp_path / "short.wav", seconds),
+            transcript="",
+            provenance=ProviderProvenance(name="n", model="m", remote=False),
+            load_predictor=lambda: FakePredictor([[0.0] * 7]),
+            inference_context=_null_context,
+        )
+
+    assert raised.value.code == "audio_too_short"
+
+
+def test_a_clip_at_the_floor_is_still_analyzed_normally(tmp_path: Path) -> None:
+    from voxdelta.domain.models import ProviderProvenance
+    from voxdelta.providers._emotion_runtime import analyze_local_emotion
+
+    result = analyze_local_emotion(
+        utterance_id="utt-0001",
+        audio_path=_write_clip(tmp_path / "ok.wav", 0.5),
+        transcript="",
+        provenance=ProviderProvenance(name="n", model="m", remote=False),
+        load_predictor=lambda: FakePredictor([[0.0] * 7]),
+        inference_context=_null_context,
+    )
+
+    assert result.utterance_id == "utt-0001"
+
+
+def test_a_malformed_clip_is_still_an_invalid_asset_not_a_short_one(tmp_path: Path) -> None:
+    """Only the length branch changes; every other format failure keeps its code."""
+
+    import wave
+
+    from voxdelta.domain.models import ProviderProvenance
+    from voxdelta.providers._emotion_runtime import analyze_local_emotion
+
+    stereo = tmp_path / "stereo.wav"
+    with wave.open(str(stereo), "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(16_000)
+        handle.writeframes(b"\x00\x01\x00\x01" * 16_000)
+
+    with pytest.raises(ProviderError) as raised:
+        analyze_local_emotion(
+            utterance_id="utt-0001",
+            audio_path=stereo,
+            transcript="",
+            provenance=ProviderProvenance(name="n", model="m", remote=False),
+            load_predictor=lambda: FakePredictor([[0.0] * 7]),
+            inference_context=_null_context,
+        )
+
+    assert raised.value.code == "invalid_audio_asset"

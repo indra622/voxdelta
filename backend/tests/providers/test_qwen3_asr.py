@@ -131,6 +131,24 @@ def test_low_memory_profile_is_only_explicit() -> None:
     assert provider.provenance.model == "Qwen3-ASR-0.6B"
 
 
+def test_single_speaker_transcription_is_explicitly_unattributed() -> None:
+    from voxdelta.providers.qwen3_asr import Qwen3AsrProvider
+
+    units = [FakeUnit("안녕", 0.0, 0.8), FakeUnit("하세요", 1.0, 1.5)]
+    provider = Qwen3AsrProvider(
+        model_factory=ModelFactory(FakeModel(time_stamps=units)),
+        aligner_factory=AlignerFactory(FakeAligner(units)),
+        hardware_probe=lambda: (False, False),
+    )
+
+    utterances = provider.transcribe_single_speaker(_asset())
+
+    assert [(item.speaker_id, item.transcript, item.start, item.end) for item in utterances] == [
+        ("SPEAKER_00", "안녕 하세요", 0.0, 1.5)
+    ]
+    assert provider.last_timestamp_coverage is not None
+
+
 @pytest.mark.parametrize(
     ("hardware", "expected"),
     [

@@ -65,6 +65,12 @@ Application settings are read from `VOXDELTA_` process-environment variables. Uv
 - `VOXDELTA_ADMISSION_RECONCILIATION_LEASE_SECONDS`: stale admission recovery lease; default
   `300`.
 - `VOXDELTA_MAX_ACTIVE_JOBS`: maximum incomplete jobs admitted at once; default `8`.
+- `VOXDELTA_ANNOTATION_ROOT`: private silver/gold annotation root; default is
+  `<data root>/annotations`. Artifacts under it hold verbatim transcript, so it is kept out
+  of benchmark output and served only through the capability-fenced review routes.
+- `VOXDELTA_DIARIZATION_PROVIDER`: `fake` (default), `pyannote-community` for the local
+  Community-1 pipeline, or `pyannoteai-precision` for the managed pyannoteAI API. Only the
+  last option sends audio off this machine, and it is never selected implicitly.
 - `VOXDELTA_API_CAPABILITY_TOKEN`: per-launch local API capability. Supply a fresh high-entropy
   value of at least 32 visible HTTP-header ASCII characters (`!` through `~`) in the process
   environment; it is held as a secret in memory and is never logged or persisted by VoxDelta.
@@ -90,6 +96,38 @@ checks block DNS-rebinding and drive-by browser requests; the custom token heade
 not a CORS-simple request header. In Swagger UI, select **Authorize** and enter the same token.
 `GET /api/config/providers`, `/docs`, and `/openapi.json` contain no job data and do not require
 the capability.
+
+## Remote diarization through pyannoteAI
+
+Every other provider runs locally. Selecting `pyannoteai-precision` is the one configuration
+that transmits call audio to a third party, so it is opt-in by name and fails closed rather
+than falling back to a local provider.
+
+```bash
+export VOXDELTA_DIARIZATION_PROVIDER=pyannoteai-precision
+```
+
+Startup additionally requires `PYANNOTEAI_API_KEY` in `backend/.env`; without it the provider
+is refused before any request is built, so nothing is uploaded. The key is read at the moment
+each request is signed, is sent only as an `Authorization: Bearer` header, and never appears
+in provenance, logs, exceptions, or error messages.
+
+Per job the provider uploads the normalized WAV to pyannoteAI temporary storage, submits
+`POST /v1/diarize` with `transcription` disabled and `exclusive` enabled, polls
+`GET /v1/jobs/{id}` until the job settles, and maps `diarization` and `exclusiveDiarization`
+onto the same overlap-aware and alignment timelines the local provider returns. No transcript
+is requested and none is returned. Separate-channel audio is diarized one channel at a time
+with `numSpeakers=1`, which means two uploads and two jobs for that input class.
+
+`GET /api/config/providers` reports this stage as `remote: true` with `transmits: ["audio"]`,
+the pyannoteAI data-retention URL, and `retention_window_hours: 48`, so a consent prompt can
+name the window instead of linking to a policy nobody opens. Read that retention policy before
+sending anything you do not own: uploaded media sits in pyannoteAI temporary storage for up to
+that long and the public API exposes no deletion endpoint.
+
+`retention_window_hours` is optional and stays `null` for every local provider; it is the
+longest window a provider states it may hold transmitted input for, never a guarantee that the
+input is gone sooner.
 
 ## HTTP API
 
@@ -134,12 +172,48 @@ invalid body.
   directory, and returns 204. An interrupted local deletion returns a retryable 409; retry the same
   DELETE. A missing job returns 404.
 
+### Silver annotation review
+
+Silver drafts hold verbatim transcript, so these three routes sit behind the same per-launch
+capability, host, and origin fence as `/api/jobs`. They read the private annotation root
+(`VOXDELTA_ANNOTATION_ROOT`, default `data/annotations/`); they never write silver and never call a
+remote annotation service.
+
+- `GET /api/annotations` lists every silver draft this machine holds as counts and digests only,
+  plus `unreadable_count` for drafts that exist but could not be parsed. No transcript is in this
+  response, so choosing what to open reveals no speech.
+- `GET /api/annotations/{conversation_id}` returns one draft in full: the reviewable turns with
+  transcript, the declared speakers, the model's notes, the emotion labels the backend will accept,
+  and the warnings that make the draft provisional. `review_required` is always present;
+  `salvaged_dropped_turns` carries the count and per-rule breakdown of turns validation rejected,
+  which are absent from the draft and were never recovered. A conversation id that is not a single
+  name matching `[A-Za-z0-9][A-Za-z0-9_-]{0,63}` returns 422; an absent draft returns 404; a stored
+  file that is not a readable silver artifact returns 409.
+- `POST /api/annotations/{conversation_id}/gold` promotes one draft through
+  `voxdelta.annotation.store.promote` and returns 201 with the gold digest, its parent silver
+  digest, and `silver_unmodified`, which reports that silver was byte-identical after the write.
+  The body needs `reviewer`, `acknowledged: true`, and the reviewer's `turns`; an optional
+  `review_note` is recorded with the sign-off. A blank reviewer (`reviewer_required`), a missing
+  acknowledgement (`review_acknowledgement_required`), no turns (`corrected_turns_required`), an
+  emotion outside the allowed set (`invalid_turn_emotion`), a range that does not start at or after
+  zero and end after it starts (`invalid_turn_interval`), a confidence outside 0 to 1
+  (`invalid_turn_confidence`), and a blank speaker or transcript each return 422 and write nothing.
+  A second promotion returns 409 `gold_already_exists`; gold is written once and is immutable.
+  Refusals name the turn's position and never quote its transcript.
+
 ## Runtime files and privacy
 
 With default settings, SQLite metadata is in `data/voxdelta.sqlite3` and each job is under
 `data/jobs/<job_id>/`. A job directory can contain the private source upload, a generated
 `audio-<id>/` directory with normalized WAV media, versioned stage JSON (`<stage>.v1.json`), a
 redacted `pipeline.jsonl`, the canonical report artifact, and optional diagnostics.
+
+Private annotation artifacts live under `data/annotations/<conversation_id>/`. `silver.json` is a
+model's provisional draft and is never rewritten: it stays `review_state: review_required` for its
+whole life, and the review API only reads it. `gold.json` is what a named reviewer asserted, is
+written exactly once, and carries its parent silver's digest plus its own; a second promotion is
+refused and an edited gold file fails `verify_gold`. Both files hold verbatim transcript, so they
+must not be copied into logs, benchmark output, or anything shared.
 
 The runtime parent is private and SQLite database/journal/WAL files are forced to mode `0600` on
 POSIX even under a permissive umask. Startup reschedules pristine pending jobs and expired running

@@ -19,9 +19,9 @@ from voxdelta.providers.asr_alignment import (
     align_separate,
     validate_asset,
     validate_mixed_segments,
-    validated_words,
 )
 from voxdelta.providers.base import ProviderError
+from voxdelta.providers.qwen_timestamps import TimestampCoverage, sanitize_words
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
 LOW_MEMORY_MODEL_ID = "Qwen/Qwen3-ASR-0.6B"
@@ -184,6 +184,9 @@ class Qwen3AsrProvider:
         self._aligner: _Aligner | None = None
         self._runtime: tuple[str, str] | None = None
         self.last_warning_count = 0
+        #: Coverage of the most recent transcription under the timestamp sanitation
+        #: contract. Read it to tell a complete transcript from one with holes.
+        self.last_timestamp_coverage: TimestampCoverage | None = None
 
     def _select_runtime(self) -> tuple[str, str]:
         if self._runtime is not None:
@@ -257,7 +260,9 @@ class Qwen3AsrProvider:
             self._release()
             release_candidate(self)
 
-    def _transcribe_path(self, path: str, duration: float) -> list[AlignedWord]:
+    def _transcribe_path(
+        self, path: str, duration: float, segments: list[SpeakerSegment] | None
+    ) -> tuple[list[AlignedWord], TimestampCoverage]:
         try:
             result = _result(
                 self._load().transcribe(
@@ -283,7 +288,9 @@ class Qwen3AsrProvider:
                     raw_times = aligned_results
             if raw_times is None:
                 raise ProviderError("invalid_provider_output")
-            return validated_words(_time_records(raw_times), duration)
+            # The Qwen aligner reports zero-duration instants; the sanitation contract
+            # decides which of them may be attributed, and never invents a span.
+            return sanitize_words(_time_records(raw_times), duration, segments)
         except ProviderError:
             raise
         except Exception as error:
@@ -295,12 +302,43 @@ class Qwen3AsrProvider:
             validate_mixed_segments(segments, duration)
         with LOCAL_ASR_INFERENCE_LOCK:
             if asset.channel_mode == "separate":
-                result, omitted = align_separate(
-                    [self._transcribe_path(path, duration) for path in paths]
-                )
+                channels = [self._transcribe_path(path, duration, None) for path in paths]
+                result, omitted = align_separate([words for words, _ in channels])
+                coverage = channels[0][1]
+                for _words, channel_coverage in channels[1:]:
+                    coverage = coverage.merged(channel_coverage)
             else:
-                result, omitted = align_mixed(
-                    self._transcribe_path(paths[0], duration), segments, duration
-                )
+                words, coverage = self._transcribe_path(paths[0], duration, segments)
+                result, omitted = align_mixed(words, segments, duration)
             self.last_warning_count = omitted
+            self.last_timestamp_coverage = coverage.with_alignment_omissions(omitted)
         return result
+
+    def transcribe_single_speaker(self, asset: AudioAsset) -> list[Utterance]:
+        """Transcribe a known single-speaker recording for offline evaluation only.
+
+        This deliberately bypasses diarization attribution.  The public pipeline still
+        requires two observed speakers before it offers role confirmation; callers of
+        this method must therefore report diarization as unmeasured rather than treating
+        its one synthetic speaker as a diarization result.
+        """
+
+        duration, paths = validate_asset(asset)
+        if asset.channel_mode != "mixed":
+            raise ProviderError("invalid_audio_asset")
+        with LOCAL_ASR_INFERENCE_LOCK:
+            words, coverage = self._transcribe_path(paths[0], duration, None)
+            if not words:
+                raise ProviderError("invalid_provider_output")
+            self.last_warning_count = 0
+            self.last_timestamp_coverage = coverage
+        return [
+            Utterance(
+                id="utt-0001",
+                start=min(word.start for word in words),
+                end=max(word.end for word in words),
+                speaker_id="SPEAKER_00",
+                confidence=1.0,
+                transcript=" ".join(word.text for word in words),
+            )
+        ]

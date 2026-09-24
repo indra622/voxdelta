@@ -726,7 +726,7 @@ class ArtifactStore:
         return self._job_path(job_id, create=True, require_directory=True)
 
     def _validate_upload_suffix(self, suffix: str) -> None:
-        if suffix not in {".wav", ".mp3", ".m4a"}:
+        if suffix not in {".wav", ".mp3", ".m4a", ".mp4"}:
             raise ValueError(_INCOMING_VALIDATION_ERROR)
 
     def _validated_incoming_path(self, path: Path, *, require_file: bool) -> Path:
@@ -878,7 +878,7 @@ class ArtifactStore:
             if not name.startswith(".upload-") or len(name) < 42:
                 continue
             job_id = name[8:40]
-            if name[40] != "-" or candidate.suffix not in {".wav", ".mp3", ".m4a"}:
+            if name[40] != "-" or candidate.suffix not in {".wav", ".mp3", ".m4a", ".mp4"}:
                 continue
             try:
                 validate_canonical_job_id(job_id)

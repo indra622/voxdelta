@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ACP Expert mode 샘플 리포트 — USER_EVAL_20260911_01 v01</title>
+  <style>
+    @page { size: A4; margin: 18mm 17mm 18mm; }
+    * { box-sizing: border-box; }
+    body { color: #172033; font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; font-size: 10.5pt; line-height: 1.65; }
+    h1 { font-size: 22pt; line-height: 1.25; margin: 0 0 7px; letter-spacing: -0.03em; }
+    h2 { font-size: 14pt; margin: 25px 0 8px; padding-top: 8px; border-top: 1px solid #dce3ee; }
+    h3 { font-size: 11.5pt; margin: 14px 0 5px; }
+    p { margin: 7px 0; }
+    ul, ol { margin: 7px 0; padding-left: 22px; }
+    li { margin: 3px 0; }
+    .eyebrow { color: #52657e; font-size: 9pt; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .lead { font-size: 12pt; line-height: 1.65; }
+    .callout { background: #edf5ff; border-left: 4px solid #3678d4; border-radius: 4px; padding: 13px 16px; margin: 12px 0; }
+    blockquote { background: #f5f8fc; border-left: 3px solid #7e99bd; border-radius: 4px; padding: 11px 14px; margin: 9px 0; }
+    blockquote p { margin: 0; }
+    .small { color: #52657e; font-size: 8.8pt; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; overflow-wrap: anywhere; }
+    .badge { display: inline-block; padding: 2px 8px; border: 1px solid #edc76b; border-radius: 99px; background: #fff8e6; color: #765005; font-size: 9pt; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div class="eyebrow">VoxDelta · Expert Mode Sample</div>
+  <h1>ACP Expert mode 샘플 리포트<br>USER_EVAL_20260911_01 v01</h1>
+  <p class="small">입력 Gold 해시: <code>be0774aa164f5aef0da50b13a9f5d2ba3df9f815e75a24ced08df11609588a6d</code></p>
+
+  <h2>목적과 범위</h2>
+  <p>검수 완료 Gold <code>USER_EVAL_20260911_01</code>의 대화 근거를 바탕으로, 연결된 Claude와 Codex가 만든 대응 제안 후보를 로컬 계약으로 검증·합성한 예시다. 상담 품질 개선을 위한 샘플이며, 고객의 심리 상태나 행동 원인을 진단하지 않는다.</p>
+
+  <h2>한 줄 결론</h2>
+  <div class="callout lead">고객의 분노는 절차 자체보다 <strong>구체적 안내를 요청했는데도 답변이 회피·종료로 들린 상호작용</strong>에서 커졌을 가능성이 높다. 지금 필요한 것은 방어가 아니라, 사과 뒤에 대리 처리 가능 여부·필요 서류·기한 내 대안을 순서대로 확인해 주는 것이다.</div>
+
+  <h2>근거로 확인된 흐름</h2>
+  <ul>
+    <li>고객은 <code>g11</code>에서 절차를 알려 달라는 요구를 직접 밝혔다.</li>
+    <li>고객의 분노 신호는 <code>g11</code>(0.95)에서 <code>g13</code>(0.98)으로 높아졌다.</li>
+    <li>상담사의 <code>g10</code>·<code>g20</code> 응답은 고객에게 판단을 넘기거나 통화를 마무리하려는 말로 해석될 수 있다.</li>
+    <li><code>g12</code>는 상담사가 이해한 질문과 고객이 요구한 ‘절차 안내’가 다를 수 있음을 보인다.</li>
+    <li><code>g14</code>·<code>g20</code>에는 앞서 제기된 안내 요구를 다시 풀어 설명하는 내용이 확인되지 않는다.</li>
+  </ul>
+
+  <h2>가능한 원인 가설</h2>
+  <ol>
+    <li><strong>안내 방식 불일치:</strong> 고객은 ‘무엇을 하면 되는지’를 들으려 했지만, 답변은 고객이 스스로 결정해야 하는 것처럼 들렸을 가능성이 있다.</li>
+    <li><strong>질문 해석의 불일치:</strong> 대리 처리 가능 여부, 서류 발급, 제출 절차 중 무엇을 묻는지 상호 이해가 갈렸을 가능성이 있다.</li>
+    <li><strong>종료 신호의 누적:</strong> 추가 질문만 묻거나 통화 종료를 통보하는 표현이 ‘무시당했다’는 인상을 키웠을 가능성이 있다.</li>
+  </ol>
+  <p class="small">위 세 항목은 대화 근거에 기반한 가설이며, 사안 자체의 사실관계나 고객의 심리적 원인을 확정하지 않는다.</p>
+
+  <h2>바로 사용할 대응 문구</h2>
+  <blockquote><p>답변이 충분하지 않아 불편을 드린 점 죄송합니다. ‘알아서 하세요’처럼 들리게 안내드린 것은 제 설명이 부족했습니다. 지금 가장 궁금하신 부분부터 순서대로 확인하겠습니다. 배우자분이 대신 처리할 수 있는지, 필요한 서류가 무엇인지, 기한 안에 가능한 방법이 무엇인지 확인해서 구체적으로 안내드리겠습니다.</p></blockquote>
+  <h3>확인 질문</h3>
+  <blockquote><p>지금 가장 먼저 확인할 부분이 <strong>배우자분의 대리 처리 가능 여부</strong>인지, 아니면 <strong>기한 안에 제출하는 방법</strong>인지 말씀해 주실 수 있을까요?</p></blockquote>
+
+  <h2>상담사 실행 순서</h2>
+  <ol>
+    <li>고객의 항의 내용과 안내 부족을 구체적으로 인정하고 사과한다.</li>
+    <li>고객의 질문을 한 문장으로 재확인한다. 추측해 되받아치지 않는다.</li>
+    <li>답할 수 있는 사실은 서류·방법·기한 순서로 짧게 설명한다.</li>
+    <li>대리 처리처럼 권한 확인이 필요한 사항은 ‘확인 후 안내’로 명확히 구분하고, 가능한 경우 담당자·상급 확인 경로를 제시한다.</li>
+    <li>질문 해결 전에는 추가 문의를 끊어내는 표현이나 ‘알아서 하라’는 표현을 피한다.</li>
+  </ol>
+
+  <h2>안전 수준과 한계 <span class="badge">watch</span></h2>
+  <ul>
+    <li>강한 언어적 분노와 민원 확대 가능성은 보이지만, 제공된 근거에는 자해·타해·학대·즉각적 긴급위험 표현이 없다.</li>
+    <li>이 제안은 실제 업무 규정·권한·제출 절차를 대신하지 않는다.</li>
+    <li>단일 Gold case 샘플이므로 일반 상담 품질이나 모델 성능의 결론으로 확대 해석하지 않는다.</li>
+  </ul>
+
+  <h2>Claude·Codex 교차 검토</h2>
+  <ul>
+    <li><strong>공통 결론:</strong> 절차 안내 요구와 응답 방식의 간극, 그리고 종료로 들릴 수 있는 표현이 분노 상승과 연결될 수 있다는 점.</li>
+    <li><strong>Claude의 기여:</strong> 질문 해석의 불일치와 재민원 가능성을 더 세밀하게 지적했다.</li>
+    <li><strong>Codex의 기여:</strong> 현장용 문구와 재확인 질문을 더 간결하게 정리했다.</li>
+    <li><strong>합성 시 수정:</strong> ‘질문이 해결될 때까지 통화를 끊지 않겠다’는 표현은 상담사가 보장할 수 없는 운영 약속이므로 채택하지 않았다.</li>
+  </ul>
+
+  <h2>재현 경계</h2>
+  <ul>
+    <li>Claude 결과는 ACP를 통해 생성했고, Codex는 동일 근거·동일 JSON 계약으로 별도 검토했다.</li>
+    <li>두 결과는 허용된 evidence ID만 인용하고, 가설의 불확실성 표기·안전 수준 규칙을 로컬에서 검증한 뒤 합성했다.</li>
+    <li>다음 Gold case부터는 같은 기준으로 <code>근거 일치 / 과단정 여부 / 문구 실행성 / 안전 수준</code>을 누적 비교한다.</li>
+  </ul>
+</body>
+</html>

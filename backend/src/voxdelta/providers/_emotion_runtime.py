@@ -18,6 +18,7 @@ from voxdelta.analysis.emotions import map_operational_state
 from voxdelta.domain.models import EmotionLabel, EmotionResult, ProviderProvenance, ProviderUsage
 from voxdelta.evaluation.emotion_training import (
     CANONICAL_LABELS,
+    AudioTooShort,
     evaluation_windows,
     load_audio,
 )
@@ -161,13 +162,22 @@ def validate_checkpoint(
             raise ValueError
         schema_version = config.get("schema_version")
         if architecture == "wav2vec-xls-r":
+            class_weighting = config.get("class_weighting")
             if (
-                schema_version != "3"
+                schema_version not in {"3", "4"}
                 or set(config) != expected_config_keys | {"class_weighting", "class_weights"}
                 or config.get("model_revision") != WAV2VEC_MODEL_REVISION
                 or config.get("base_model_sha256") != WAV2VEC_WEIGHTS_SHA256
-                or config.get("class_weighting") != "inverse-frequency"
                 or not _valid_class_weights(config.get("class_weights"))
+                or (schema_version == "3" and class_weighting != "inverse-frequency")
+                or (
+                    schema_version == "4"
+                    and class_weighting not in {"none", "sqrt-inverse-frequency"}
+                )
+                or (
+                    class_weighting == "none"
+                    and config.get("class_weights") != [1.0] * len(CANONICAL_LABELS)
+                )
             ):
                 raise ValueError
         elif schema_version == "1":
@@ -351,6 +361,10 @@ def analyze_local_emotion(
         raise ProviderError("invalid_provider_output")
     try:
         clip = load_audio(audio_path)
+    except AudioTooShort:
+        # Distinct from an unreadable asset: the file is fine, there is simply not
+        # enough of it to score. The caller decides what to do with an unscored turn.
+        raise ProviderError("audio_too_short") from None
     except ValueError:
         raise ProviderError("invalid_audio_asset") from None
     start = clock()

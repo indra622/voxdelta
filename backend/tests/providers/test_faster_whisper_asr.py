@@ -121,6 +121,72 @@ def test_mixed_words_use_maximum_overlap_and_safe_grouping() -> None:
     assert provider.last_warning_count == 1
 
 
+def test_a_boundary_straddling_word_does_not_stretch_its_turn_into_the_next_one() -> None:
+    """A word is assigned whole, but the turn it lands in must not grow to contain it.
+
+    Recognizer word timing routinely crosses a diarized turn boundary. The word still
+    belongs to whichever turn owns most of it, but reporting the raw hull of a turn's
+    words would make that turn overlap the other speaker's segment, and the pipeline
+    rejects the whole transcribe stage when it does.
+    """
+
+    from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
+
+    model = FakeModel(
+        [
+            FakeSegment(
+                [
+                    # Mostly inside SPEAKER_00's turn, but running past its 1.0 boundary.
+                    FakeWord(0.8, 1.15, "앞"),
+                    # Mostly inside SPEAKER_00's second turn, but starting before its 2.0 edge.
+                    # It is the same speaker as the first word, yet SPEAKER_01 holds the
+                    # turn between them, so the two may not become one utterance.
+                    FakeWord(1.9, 2.4, "뒤"),
+                ]
+            )
+        ]
+    )
+    provider = FasterWhisperProvider(model_factory=FakeFactory(model))
+
+    utterances = provider.transcribe(_asset(), _segments())
+
+    assert [(u.speaker_id, u.start, u.end, u.transcript) for u in utterances] == [
+        ("SPEAKER_00", 0.8, 1.0, "앞"),
+        ("SPEAKER_00", 2.0, 2.4, "뒤"),
+    ]
+
+
+def test_no_utterance_overlaps_a_segment_belonging_to_the_other_speaker() -> None:
+    """The contract the pipeline enforces on this stage, asserted at its source."""
+
+    from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
+
+    model = FakeModel(
+        [
+            FakeSegment(
+                [
+                    FakeWord(0.1, 0.6, "하나"),
+                    FakeWord(0.9, 1.4, "둘"),
+                    FakeWord(1.7, 2.3, "셋"),
+                    FakeWord(2.5, 2.9, "넷"),
+                ]
+            )
+        ]
+    )
+    provider = FasterWhisperProvider(model_factory=FakeFactory(model))
+
+    utterances = provider.transcribe(_asset(), _segments())
+
+    for utterance in utterances:
+        overlapping = [
+            segment
+            for segment in _segments()
+            if utterance.start < segment.end and segment.start < utterance.end
+        ]
+        assert overlapping
+        assert all(segment.speaker_id == utterance.speaker_id for segment in overlapping)
+
+
 def test_exact_overlap_tie_is_deterministic() -> None:
     from voxdelta.providers.faster_whisper_asr import FasterWhisperProvider
 

@@ -31,7 +31,9 @@ from voxdelta.jobs.artifacts import (
 
 ChannelPreference = Literal["auto", "mixed", "separate"]
 
-_ALLOWED_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a"})
+# MP4 is accepted solely as a container: ffmpeg extracts its audio stream into the
+# job-scoped normalized WAV artifact. No video frames become pipeline input.
+_ALLOWED_EXTENSIONS = frozenset({".wav", ".mp3", ".m4a", ".mp4"})
 _PROBE_TIMEOUT_SECONDS = 15
 _NORMALIZE_TIMEOUT_SECONDS = 300
 _HASH_CHUNK_BYTES = 1024 * 1024

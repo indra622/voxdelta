@@ -106,6 +106,7 @@ def build_harness(
     tmp_path: Path,
     *,
     diarizer: FakeDiarizationProvider | None = None,
+    emotion: object | None = None,
     max_upload_bytes: int | None = None,
     artifacts_override: ArtifactStore | None = None,
     repository_override: JobRepository | None = None,
@@ -119,6 +120,7 @@ def build_harness(
         artifacts,
         AudioService(jobs_root, 60, 3600),
         diarization_provider=diarizer,
+        emotion_provider=emotion,
     )
     return (
         create_app(
@@ -235,7 +237,14 @@ async def test_docs_and_provider_disclosures_are_public_and_secret_free(tmp_path
     payload = response.json()
     assert [item["stage"] for item in payload["stages"]] == [stage.value for stage in StageName]
     assert all(
-        set(item) == {"stage", "provenance", "transmits", "retention_policy_url"}
+        set(item)
+        == {
+            "stage",
+            "provenance",
+            "transmits",
+            "retention_policy_url",
+            "retention_window_hours",
+        }
         for item in payload["stages"]
     )
     assert all("api_key" not in json.dumps(item).casefold() for item in payload["stages"])
@@ -539,6 +548,9 @@ async def test_upload_pauses_persists_diagnostic_false_and_never_trusts_filename
     assert status.json()["diagnostic_capture"] is False
     assert status.json()["stages"]["confirm_roles"]["status"] == "paused"
     assert set(status.json()["role_candidate"]["speakers"]) == {"SPEAKER_00", "SPEAKER_01"}
+    samples = status.json()["role_candidate"]["samples"]
+    assert set(samples) == {"SPEAKER_00", "SPEAKER_01"}
+    assert all(sample["transcript"] for rows in samples.values() for sample in rows)
     assert_no_private_paths(status.json(), tmp_path)
     row = repository.get_job(job_id)
     assert row["diagnostic_capture"] == 0
@@ -548,6 +560,68 @@ async def test_upload_pauses_persists_diagnostic_false_and_never_trusts_filename
     assert source.suffix == ".wav"
     assert source.stat().st_mode & 0o777 == 0o600
     assert "private-call" not in source.name
+
+
+@pytest.mark.asyncio
+async def test_role_sample_audio_is_limited_to_public_candidate_excerpt(tmp_path: Path) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        status = await client.get(created.json()["status_url"])
+        candidate = status.json()["role_candidate"]
+        speaker = candidate["speakers"][0]
+        sample = candidate["samples"][speaker][0]
+        clip = await client.get(
+            f"/api/jobs/{job_id}/role-samples/{speaker}/{sample['index']}/audio"
+        )
+        missing = await client.get(f"/api/jobs/{job_id}/role-samples/{speaker}/99/audio")
+
+    assert clip.status_code == 200, clip.text
+    assert clip.headers["content-type"].startswith("audio/wav")
+    assert clip.content[:4] == b"RIFF"
+    assert len(clip.content) < 8 * 60 * 1024
+    assert missing.status_code == 409
+    assert missing.json()["detail"]["code"] == "invalid_role_sample"
+
+
+@pytest.mark.asyncio
+async def test_upload_accepts_mp4_container_and_extracts_audio(tmp_path: Path) -> None:
+    mp4_source = tmp_path / "call.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=65",
+            "-c:a",
+            "aac",
+            str(mp4_source),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    app, repository, artifacts, _ = build_harness(tmp_path)
+
+    async with client_for(app) as client:
+        response = await client.post(
+            "/api/jobs",
+            files={"file": ("call.mp4", mp4_source.read_bytes(), "video/mp4")},
+            data={"diagnostic_capture": "false"},
+        )
+        status = await client.get(response.json()["status_url"])
+
+    assert response.status_code == 202
+    assert status.status_code == 200
+    assert status.json()["status"] == "paused"
+    job_id = response.json()["job_id"]
+    row = repository.get_job(job_id)
+    source = Path(str(row["source_name"]))
+    assert source.suffix == ".mp4"
+    assert source.parent == artifacts.job_dir(job_id)
 
 
 @pytest.mark.asyncio
@@ -1418,6 +1492,56 @@ async def test_role_schema_and_runner_validation_then_completion_report_and_retr
 
 
 @pytest.mark.asyncio
+async def test_expert_guidance_is_explicit_acp_handoff_and_validates_evidence(
+    tmp_path: Path,
+) -> None:
+    app, _, _, _ = build_harness(tmp_path)
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        completed = await client.post(
+            f"/api/jobs/{job_id}/roles",
+            json={"mapping": {"SPEAKER_00": "customer", "SPEAKER_01": "agent"}},
+        )
+        assert completed.status_code == 200
+
+        refused = await client.post(
+            f"/api/jobs/{job_id}/expert-guidance/request",
+            json={"target": "claude", "acknowledge_text_transfer": False},
+        )
+        queued = await client.post(
+            f"/api/jobs/{job_id}/expert-guidance/request",
+            json={"target": "claude", "acknowledge_text_transfer": True},
+        )
+        status = await client.get(f"/api/jobs/{job_id}/expert-guidance")
+
+        evidence_id = "utterance-0001"
+        guidance = {
+            "observations": [
+                {"evidence_turn_ids": [evidence_id], "statement": "근거 발화를 확인했습니다."}
+            ],
+            "hypotheses": [
+                {"statement": "가설: 추가 확인이 필요할 수 있습니다.", "confidence": "low"}
+            ],
+            "suggested_message": "말씀하신 부분을 함께 확인해 보겠습니다.",
+            "next_question": "가장 확인이 필요한 부분은 무엇인가요?",
+            "safety_level": "watch",
+        }
+        submitted = await client.post(
+            f"/api/jobs/{job_id}/expert-guidance/response",
+            json={"request_sha256": queued.json()["request_sha256"], "guidance": guidance},
+        )
+
+    assert refused.status_code == 422
+    assert queued.status_code == 200
+    assert queued.json()["status"] == "queued"
+    assert queued.json()["transport"] == "acp"
+    assert status.json()["status"] == "queued"
+    assert submitted.status_code == 200
+    assert submitted.json()["status"] == "ready"
+
+
+@pytest.mark.asyncio
 async def test_role_state_conflict_and_incomplete_report_are_409(tmp_path: Path) -> None:
     app, repository, artifacts, runner = build_harness(tmp_path)
     job_id = repository.create_job(str(FIXTURE))
@@ -2050,3 +2174,77 @@ def test_audio_stream_descriptor_is_regular_non_link_and_mode_is_private(tmp_pat
         assert stat.S_ISREG(metadata.st_mode)
         assert metadata.st_mode & 0o777 == 0o600
         assert opened.read(32)
+
+
+@pytest.mark.asyncio
+async def test_a_provider_failure_while_resuming_roles_returns_the_failed_job_not_a_500(
+    tmp_path: Path,
+) -> None:
+    """Confirming roles accepts the mapping; a later stage failure is still a job state.
+
+    The mapping is persisted before the pipeline resumes, so the caller must be handed
+    the job as it now stands. Escaping as a 500 leaves the client holding its stale
+    paused object and re-posting a mapping the backend has already accepted.
+    """
+
+    from voxdelta.providers.base import ProviderError
+    from voxdelta.providers.fake import FakeEmotionProvider
+
+    class UnavailableEmotion(FakeEmotionProvider):
+        def analyze(self, utterance_id: str, audio_path: Path, transcript: str) -> object:
+            raise ProviderError("provider_unavailable")
+
+    app, repository, _, _ = build_harness(tmp_path, emotion=UnavailableEmotion())
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        confirmed = await client.post(
+            f"/api/jobs/{job_id}/roles",
+            json={"mapping": {"SPEAKER_00": "customer", "SPEAKER_01": "agent"}},
+        )
+
+    assert confirmed.status_code == 200
+    body = confirmed.json()
+    assert body["status"] == "failed"
+    assert body["stages"]["emotion"]["status"] == "failed"
+    # The gate is closed: the mapping was accepted, so the UI must not offer it again.
+    assert body["stages"]["confirm_roles"]["status"] == "completed"
+    assert body["role_candidate"] is None
+    assert_no_private_paths(body, tmp_path)
+    assert repository.get_job(job_id)["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_turn_too_short_to_score_is_reported_as_a_warning_not_a_failure(
+    tmp_path: Path,
+) -> None:
+    from voxdelta.providers.base import ProviderError
+    from voxdelta.providers.fake import FakeEmotionProvider
+
+    class OneShortTurn(FakeEmotionProvider):
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        def analyze(self, utterance_id: str, audio_path: Path, transcript: str) -> object:
+            self.seen.append(utterance_id)
+            if len(self.seen) == 2:
+                raise ProviderError("audio_too_short")
+            return super().analyze(utterance_id, audio_path, transcript)
+
+    app, _, _, _ = build_harness(tmp_path, emotion=OneShortTurn())
+    async with client_for(app) as client:
+        created = await upload(client)
+        job_id = created.json()["job_id"]
+        confirmed = await client.post(
+            f"/api/jobs/{job_id}/roles",
+            json={"mapping": {"SPEAKER_00": "customer", "SPEAKER_01": "agent"}},
+        )
+        report = await client.get(f"/api/jobs/{job_id}/report")
+
+    # Two of three customer turns remain, which is below the report's coverage floor,
+    # so the honest outcome is the existing public coverage error rather than a crash.
+    assert confirmed.status_code == 200
+    assert confirmed.json()["stages"]["emotion"]["status"] == "completed"
+    assert confirmed.json()["stages"]["report"]["status"] == "failed"
+    assert confirmed.json()["stages"]["report"]["error"]["code"] == "insufficient_emotion_coverage"
+    assert report.status_code == 409

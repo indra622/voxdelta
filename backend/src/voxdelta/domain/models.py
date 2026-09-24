@@ -45,6 +45,9 @@ class ProviderProvenance(BaseModel):
     remote: bool
     transmits: tuple[Literal["audio", "text", "features"], ...] = ()
     retention_policy_url: str | None = None
+    # Longest window the provider states it may hold transmitted input for. A policy URL
+    # alone cannot be read out loud in a consent prompt, so the number is declared here.
+    retention_window_hours: int | None = Field(default=None, gt=0)
     schema_version: str = "1"
     revision: str | None = Field(default=None, min_length=1, max_length=256)
 
@@ -99,6 +102,28 @@ class Utterance(SpeakerSegment):
     transcript: str
 
 
+class EmotionCalibration(BaseModel):
+    """Post-hoc calibration applied to one result, and whether it was abstained on.
+
+    Present only when a verified calibration artifact is enabled. Its absence means the
+    result carries the provider's raw scores, which is the default and unchanged
+    behaviour: nothing downstream may read the confidence as calibrated without this.
+    """
+
+    calibration_id: str = Field(min_length=1)
+    method: Literal["temperature-scaling"]
+    temperature: float = Field(gt=0)
+    abstain_threshold: float = Field(ge=0, le=1)
+    abstained: bool
+    raw_confidence: float = Field(ge=0, le=1)
+
+    @model_validator(mode="after")
+    def finite_calibration(self) -> EmotionCalibration:
+        if not isfinite(self.temperature):
+            raise ValueError("temperature must be finite")
+        return self
+
+
 class EmotionResult(BaseModel):
     utterance_id: str
     probabilities: dict[EmotionLabel, float]
@@ -108,6 +133,7 @@ class EmotionResult(BaseModel):
     confidence: float = Field(ge=0, le=1)
     provider: ProviderProvenance
     usage: ProviderUsage | None = None
+    calibration: EmotionCalibration | None = None
 
     @model_validator(mode="after")
     def valid_distribution(self) -> EmotionResult:
@@ -120,6 +146,14 @@ class EmotionResult(BaseModel):
             raise ValueError("emotion probabilities must be between zero and one")
         if abs(sum(self.probabilities.values()) - 1.0) > 1e-6:
             raise ValueError("emotion probabilities must sum to one")
+        calibration = self.calibration
+        if calibration is not None:
+            # The abstain decision is the threshold comparison, not an independent
+            # claim: a result cannot say it answered while its confidence says otherwise.
+            if calibration.abstained != (self.confidence < calibration.abstain_threshold):
+                raise ValueError("abstained must follow from the calibrated confidence")
+            if calibration.abstained and self.operational_state != "uncertain":
+                raise ValueError("an abstained result must not assert an operational state")
         return self
 
 
@@ -171,6 +205,28 @@ class CallSummary(BaseModel):
     narrative: str | None = None
 
 
+class TranscriptionCoverage(BaseModel):
+    """How much recognized speech reached the transcript, and whether any was lost.
+
+    Present only for a recognizer whose aligner reports word timestamps this pipeline has
+    to sanitize before speaker attribution. Its absence means no sanitation applied, not
+    that coverage was perfect. ``uncertain`` is the single field a reader should branch
+    on: when it is true the transcript is missing words the recognizer did produce.
+    """
+
+    policy: str = Field(min_length=1)
+    attributed_words: int = Field(ge=0)
+    attributed_ratio: float = Field(ge=0, le=1)
+    omitted_words: int = Field(ge=0)
+    uncertain: bool
+
+    @model_validator(mode="after")
+    def uncertainty_matches_omissions(self) -> TranscriptionCoverage:
+        if self.uncertain != (self.omitted_words > 0):
+            raise ValueError("uncertain must be set exactly when words were omitted")
+        return self
+
+
 class AnalysisReport(BaseModel):
     job_id: str
     summary: CallSummary
@@ -179,4 +235,6 @@ class AnalysisReport(BaseModel):
     strategies: list[ResponseStrategyResult]
     transitions: list[EmotionTransition]
     warnings: list[str] = Field(default_factory=list)
+    # Absent unless the recognizer's timestamps required sanitation; see the model.
+    transcription_coverage: TranscriptionCoverage | None = None
     schema_version: str = "1"
