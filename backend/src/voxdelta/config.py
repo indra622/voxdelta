@@ -28,7 +28,15 @@ class Settings(BaseSettings):
     admission_reconciliation_lease_seconds: int = Field(default=300, gt=0)
     max_active_jobs: int = Field(default=8, gt=0)
     api_capability_token: SecretStr | None = None
-    diarization_provider: Literal["fake", "pyannote-community", "pyannoteai-precision"] = "fake"
+    diarization_provider: Literal[
+        "fake", "pyannote-community", "pyannoteai-precision", "nemotron-3-local"
+    ] = "fake"
+    # Opt-in local NVIDIA Nemotron 3 Diarization via an installed NeMo-Speech.cpp CLI.
+    # Both locations are explicit: the provider never downloads a runtime or a model.
+    nemotron_executable_path: Path | None = None
+    nemotron_model_path: Path | None = None
+    nemotron_device: Literal["auto", "metal", "cpu"] = "auto"
+    nemotron_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
     # Canonical PoC recogniser. faster-whisper remains selectable, and remains the
     # bounded fallback below when Qwen cannot run on a given machine.
     asr_provider: Literal["fake", "faster-whisper", "qwen3"] = "qwen3"
@@ -76,6 +84,21 @@ class Settings(BaseSettings):
     def valid_audio_limits(self) -> Settings:
         if self.min_audio_seconds > self.max_audio_seconds:
             raise ValueError("min_audio_seconds must not exceed max_audio_seconds")
+        return self
+
+    @model_validator(mode="after")
+    def valid_nemotron_selection(self) -> Settings:
+        """Require explicit absolute runtime and model locations for Nemotron.
+
+        Messages name settings only; a configured location is never echoed.
+        """
+
+        for name in ("nemotron_executable_path", "nemotron_model_path"):
+            value = getattr(self, name)
+            if value is not None and not value.is_absolute():
+                raise ValueError(f"{name} must be absolute")
+            if self.diarization_provider == "nemotron-3-local" and value is None:
+                raise ValueError(f"diarization_provider=nemotron-3-local requires {name}")
         return self
 
     @model_validator(mode="after")

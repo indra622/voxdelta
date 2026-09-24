@@ -22,6 +22,8 @@ ProviderErrorCode = Literal[
     "invalid_audio_asset",
     "invalid_local_checkpoint",
     "invalid_provider_output",
+    "local_model_missing",
+    "local_runtime_missing",
     "missing_huggingface_token",
     "missing_pyannote_api_key",
     "provider_timeout",
@@ -35,6 +37,14 @@ _PROVIDER_ERROR_MESSAGES: dict[ProviderErrorCode, str] = {
     "invalid_audio_asset": "The normalized audio asset is invalid.",
     "invalid_local_checkpoint": "The local model checkpoint is invalid.",
     "invalid_provider_output": "The provider returned invalid output.",
+    "local_model_missing": (
+        "The local diarization model file is missing or invalid; download it as a "
+        "separate setup step and configure its location."
+    ),
+    "local_runtime_missing": (
+        "The local diarization runtime is not installed or not executable; install it "
+        "and configure its location."
+    ),
     "missing_huggingface_token": "A Hugging Face token is required for this model.",
     "missing_pyannote_api_key": "A pyannoteAI API key is required for this provider.",
     "provider_timeout": "The provider timed out.",

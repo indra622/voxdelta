@@ -16,6 +16,8 @@ from voxdelta.pipeline.runner import PipelineRunner
 from voxdelta.providers.base import (
     DiarizationProvider,
     EmotionProvider,
+    ProviderError,
+    ProviderErrorCode,
     TranscriptionProvider,
 )
 from voxdelta.providers.calibrated_emotion import CalibratedEmotionProvider
@@ -37,6 +39,12 @@ from voxdelta.providers.faster_whisper_asr import (
 )
 from voxdelta.providers.faster_whisper_asr import (
     ModelFactory as FasterWhisperFactory,
+)
+from voxdelta.providers.nemotron_diarization import (
+    NemotronDiarizationProvider,
+)
+from voxdelta.providers.nemotron_diarization import (
+    Runner as NemotronRunner,
 )
 from voxdelta.providers.pyannote_diarization import (
     PipelineFactory,
@@ -65,9 +73,14 @@ from voxdelta.providers.wav2vec_emotion import (
 
 
 class ProviderConfigurationError(RuntimeError):
-    """Fixed, path-free startup failure for invalid provider selection."""
+    """Fixed, path-free startup failure for invalid provider selection.
 
-    def __init__(self) -> None:
+    ``provider_code`` optionally carries the typed provider code (for example
+    ``local_runtime_missing``) so an operator can act on it; the message stays fixed.
+    """
+
+    def __init__(self, provider_code: ProviderErrorCode | None = None) -> None:
+        self.provider_code = provider_code
         super().__init__("provider_configuration_invalid")
 
 
@@ -82,6 +95,7 @@ class ProviderFactories:
     qwen_aligner: AlignerFactory | None = None
     wav2vec_model: Wav2VecFactory | None = None
     emotion2vec_model: Emotion2VecFactory | None = None
+    nemotron_runner: NemotronRunner | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +159,21 @@ def build_dependencies(
                 selected_credentials,
                 client_factory=factories.pyannoteai_client,
             )
+        elif selected.diarization_provider == "nemotron-3-local":
+            # Local-only and opt-in: built solely because it was named, never as a
+            # fallback, and a missing runtime or model is a startup error, not a switch.
+            if selected.nemotron_executable_path is None or selected.nemotron_model_path is None:
+                raise ProviderConfigurationError()
+            try:
+                diarization = NemotronDiarizationProvider(
+                    executable_path=selected.nemotron_executable_path,
+                    model_path=selected.nemotron_model_path,
+                    device=selected.nemotron_device,
+                    timeout_seconds=selected.nemotron_timeout_seconds,
+                    runner=factories.nemotron_runner,
+                )
+            except ProviderError as error:
+                raise ProviderConfigurationError(error.code) from None
         else:
             selected_credentials = credentials
             if selected_credentials is None:

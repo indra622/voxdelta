@@ -69,8 +69,10 @@ Application settings are read from `VOXDELTA_` process-environment variables. Uv
   `<data root>/annotations`. Artifacts under it hold verbatim transcript, so it is kept out
   of benchmark output and served only through the capability-fenced review routes.
 - `VOXDELTA_DIARIZATION_PROVIDER`: `fake` (default), `pyannote-community` for the local
-  Community-1 pipeline, or `pyannoteai-precision` for the managed pyannoteAI API. Only the
-  last option sends audio off this machine, and it is never selected implicitly.
+  Community-1 pipeline, `nemotron-3-local` for NVIDIA Nemotron 3 Diarization through a
+  locally installed NeMo-Speech.cpp CLI, or `pyannoteai-precision` for the managed pyannoteAI
+  API. Only `pyannoteai-precision` sends audio off this machine, and it is never selected
+  implicitly.
 - `VOXDELTA_API_CAPABILITY_TOKEN`: per-launch local API capability. Supply a fresh high-entropy
   value of at least 32 visible HTTP-header ASCII characters (`!` through `~`) in the process
   environment; it is held as a secret in memory and is never logged or persisted by VoxDelta.
@@ -96,6 +98,26 @@ checks block DNS-rebinding and drive-by browser requests; the custom token heade
 not a CORS-simple request header. In Swagger UI, select **Authorize** and enter the same token.
 `GET /api/config/providers`, `/docs`, and `/openapi.json` contain no job data and do not require
 the capability.
+
+## Local diarization through Nemotron 3 (opt-in)
+
+`nemotron-3-local` runs `nvidia/Nemotron-3-Diarization` on this machine by executing a local
+`nemo-speech` binary with an explicit local GGUF; it never downloads a runtime or model and is
+reported as `remote: false`. It needs:
+
+```bash
+export VOXDELTA_DIARIZATION_PROVIDER=nemotron-3-local
+export VOXDELTA_NEMOTRON_EXECUTABLE_PATH=/absolute/path/to/nemo-speech
+export VOXDELTA_NEMOTRON_MODEL_PATH=/absolute/path/to/Nemotron-3-Diarization.q8_0.gguf
+export VOXDELTA_NEMOTRON_DEVICE=metal            # auto | metal | cpu
+export VOXDELTA_NEMOTRON_TIMEOUT_SECONDS=600     # per file, 0 < t <= 3600
+```
+
+A missing or non-executable runtime, or a missing, symlinked or non-GGUF model, refuses startup
+(`provider_configuration_invalid`, with `local_runtime_missing` / `local_model_missing` as the
+operator-facing provider code) instead of falling back to another provider. The adapter always
+uses the model card's 30.4 s offline streaming geometry. Installing the runtime and pulling the
+model are separate setup steps: see `docs/nemotron-3-local-setup.md`.
 
 ## Remote diarization through pyannoteAI
 
