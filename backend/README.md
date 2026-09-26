@@ -68,11 +68,16 @@ Application settings are read from `VOXDELTA_` process-environment variables. Uv
 - `VOXDELTA_ANNOTATION_ROOT`: private silver/gold annotation root; default is
   `<data root>/annotations`. Artifacts under it hold verbatim transcript, so it is kept out
   of benchmark output and served only through the capability-fenced review routes.
-- `VOXDELTA_DIARIZATION_PROVIDER`: `fake` (default), `pyannote-community` for the local
-  Community-1 pipeline, `nemotron-3-local` for NVIDIA Nemotron 3 Diarization through a
-  locally installed NeMo-Speech.cpp CLI, or `pyannoteai-precision` for the managed pyannoteAI
-  API. Only `pyannoteai-precision` sends audio off this machine, and it is never selected
-  implicitly.
+- `VOXDELTA_DIARIZATION_PROVIDER`: `nemotron-3-local` (default) for NVIDIA Nemotron 3
+  Diarization through a locally installed NeMo-Speech.cpp CLI, `pyannoteai-precision` for the
+  managed pyannoteAI API, `pyannote-community` for the local Community-1 pipeline, or `fake` for
+  contract tests. Only `pyannoteai-precision` sends audio off this machine, and it is used only
+  when named here; it is never a fallback for a missing local runtime.
+- `VOXDELTA_NEMOTRON_EXECUTABLE_PATH` / `VOXDELTA_NEMOTRON_MODEL_PATH`: absolute locations of
+  the `nemo-speech` binary and the Nemotron GGUF. They default to the locations
+  `docs/nemotron-3-local-setup.md` installs into, under the current user's home
+  (`~/opt/NeMo-Speech.cpp/build/metal-diar/bin/nemo-speech` and
+  `~/opt/nemo-speech-models/nvidia/Nemotron-3-Diarization/f667ed73aee57d40cc39428eb768b4fd87a0a29e/Nemotron-3-Diarization.q8_0.gguf`).
 - `VOXDELTA_API_CAPABILITY_TOKEN`: per-launch local API capability. Supply a fresh high-entropy
   value of at least 32 visible HTTP-header ASCII characters (`!` through `~`) in the process
   environment; it is held as a secret in memory and is never logged or persisted by VoxDelta.
@@ -99,14 +104,17 @@ not a CORS-simple request header. In Swagger UI, select **Authorize** and enter 
 `GET /api/config/providers`, `/docs`, and `/openapi.json` contain no job data and do not require
 the capability.
 
-## Local diarization through Nemotron 3 (opt-in)
+## Local diarization through Nemotron 3 (PoC default)
 
-`nemotron-3-local` runs `nvidia/Nemotron-3-Diarization` on this machine by executing a local
-`nemo-speech` binary with an explicit local GGUF; it never downloads a runtime or model and is
-reported as `remote: false`. It needs:
+`nemotron-3-local` is the default diarization provider. It runs `nvidia/Nemotron-3-Diarization`
+on this machine by executing a local `nemo-speech` binary with an explicit local GGUF; it never
+downloads a runtime or model, is reported as `remote: false`, and needs no API key.
+
+First run requires the one-time runtime build and model pull in
+`docs/nemotron-3-local-setup.md`. With the runtime and model at that document's locations no
+setting is needed; otherwise point the backend at them:
 
 ```bash
-export VOXDELTA_DIARIZATION_PROVIDER=nemotron-3-local
 export VOXDELTA_NEMOTRON_EXECUTABLE_PATH=/absolute/path/to/nemo-speech
 export VOXDELTA_NEMOTRON_MODEL_PATH=/absolute/path/to/Nemotron-3-Diarization.q8_0.gguf
 export VOXDELTA_NEMOTRON_DEVICE=metal            # auto | metal | cpu
@@ -117,13 +125,15 @@ A missing or non-executable runtime, or a missing, symlinked or non-GGUF model, 
 (`provider_configuration_invalid`, with `local_runtime_missing` / `local_model_missing` as the
 operator-facing provider code) instead of falling back to another provider. The adapter always
 uses the model card's 30.4 s offline streaming geometry. Installing the runtime and pulling the
-model are separate setup steps: see `docs/nemotron-3-local-setup.md`.
+model are separate setup steps: see `docs/nemotron-3-local-setup.md`. An operator `.env` that
+still names another provider in `VOXDELTA_DIARIZATION_PROVIDER` keeps that provider; remove the
+line (or set `nemotron-3-local`) to use the default.
 
 ## Remote diarization through pyannoteAI
 
 Every other provider runs locally. Selecting `pyannoteai-precision` is the one configuration
-that transmits call audio to a third party, so it is opt-in by name and fails closed rather
-than falling back to a local provider.
+that transmits call audio to a third party, so it is an explicit opt-in that replaces the
+default and fails closed rather than falling back to a local provider.
 
 ```bash
 export VOXDELTA_DIARIZATION_PROVIDER=pyannoteai-precision

@@ -1,7 +1,9 @@
 # Nemotron 3 local diarization: runtime and model setup
 
-This is the one-time, separately performed setup for the opt-in `nemotron-3-local`
-diarization provider. Nothing here runs at inference time, and no binaries or model weights
+This is the one-time, separately performed setup for the `nemotron-3-local` diarization
+provider, the PoC default since 2026-09-26. Until it is done, backend startup with the default
+configuration is refused with `provider_configuration_invalid` (`local_runtime_missing` /
+`local_model_missing`); it never falls back to another provider. Nothing here runs at inference time, and no binaries or model weights
 are stored in this repository. Recorded as performed on 2026-09-24 on an Apple M4
 (macOS 26.6.2).
 
@@ -52,8 +54,11 @@ same file at the same revision. The model is licensed under the NVIDIA Open Mode
 
 ## 3. Configure VoxDelta
 
+`nemotron-3-local` is the default provider and its path settings default to the two locations
+above under `$HOME`, so after steps 1 and 2 nothing needs to be set. Only a different install
+location, or a pinned device, needs configuration:
+
 ```bash
-export VOXDELTA_DIARIZATION_PROVIDER=nemotron-3-local
 export VOXDELTA_NEMOTRON_EXECUTABLE_PATH=$HOME/opt/NeMo-Speech.cpp/build/metal-diar/bin/nemo-speech
 export VOXDELTA_NEMOTRON_MODEL_PATH=$HOME/opt/nemo-speech-models/nvidia/Nemotron-3-Diarization/f667ed73aee57d40cc39428eb768b4fd87a0a29e/Nemotron-3-Diarization.q8_0.gguf
 export VOXDELTA_NEMOTRON_DEVICE=metal

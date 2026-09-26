@@ -1,5 +1,9 @@
 # VoxDelta 화자분리 A/B v02: Nemotron 3 local, KCSC 2화자 확장 평가
 
+> **2026-09-26 후속 결정:** 공개·로컬 평가 근거를 검토한 사용자 결정으로 `nemotron-3-local`을
+> PoC 기본 화자 분리 provider로 승격했다. `pyannoteai-precision`은 명시적 원격 opt-in으로 남는다.
+> 아래 본문은 작성 당시(opt-in 유지) 결론을 그대로 보존한다.
+
 > **결론: opt-in 유지.** 기본 provider(`pyannote-community`, `pyannoteai-precision`)는 바꾸지
 > 않는다. 로컬 KCSC 7개 화자쌍 전부에서 Nemotron이 Community-1보다 낫다. 하지만 Precision-2와
 > 비교할 수 있는 독립 표본은 KCSC 3개, 사용자 Gold 2개(한 세션)뿐이다. 실제 통화 도메인

@@ -305,7 +305,8 @@ def _settings(tmp_path: Path, **overrides: object) -> Settings:
         storage_root=tmp_path / "storage",
         database_path=tmp_path / "data" / "db.sqlite3",
         api_capability_token=SecretStr("t" * 43),
-        **overrides,
+        # These tests cover ASR wiring; keep diarization off the local runtime.
+        **{"diarization_provider": "fake", **overrides},
     )
 
 

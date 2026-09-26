@@ -20,7 +20,7 @@ npm run poc
 VOXDELTA_POC_PORT=5199 npm run poc
 ```
 
-provider 선택은 백엔드 설정을 그대로 따릅니다. 화자 분리를 `pyannoteai-precision`으로 두면 이 단계만 원격이 되고 나머지는 로컬로 남습니다. 로컬 모델을 처음 받는 절차는 [`backend/README.md`](../backend/README.md)의 **Local model providers**에 있습니다.
+provider 선택은 백엔드 설정을 그대로 따릅니다. 화자 분리 기본값은 로컬 `nemotron-3-local`이며 첫 실행 전에 [`docs/nemotron-3-local-setup.md`](../docs/nemotron-3-local-setup.md)의 런타임·모델 설치가 필요합니다. `VOXDELTA_DIARIZATION_PROVIDER=pyannoteai-precision`으로 명시하면 화자 분리 단계만 원격이 되고(동의 게이트가 나타남) 나머지는 로컬로 남습니다. 로컬 모델을 처음 받는 절차는 [`backend/README.md`](../backend/README.md)의 **Local model providers**에 있습니다.
 
 같은 네트워크의 다른 기기에서 확인할 때는 UI만 모든 인터페이스에 바인딩합니다. 백엔드는 계속 loopback에 남습니다.
 

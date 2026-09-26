@@ -16,6 +16,14 @@ from voxdelta.credentials import (
 
 _DATA_ROOT = Path(__file__).resolve().parents[3] / "data"
 
+# Where docs/nemotron-3-local-setup.md installs the runtime and pulls the pinned model.
+# Resolved against the operator's home at construction; nothing is downloaded or built here.
+NEMOTRON_DEFAULT_EXECUTABLE = Path("opt/NeMo-Speech.cpp/build/metal-diar/bin/nemo-speech")
+NEMOTRON_DEFAULT_MODEL = Path(
+    "opt/nemo-speech-models/nvidia/Nemotron-3-Diarization/"
+    "f667ed73aee57d40cc39428eb768b4fd87a0a29e/Nemotron-3-Diarization.q8_0.gguf"
+)
+
 
 class Settings(BaseSettings):
     """Runtime paths and audio limits for the local backend."""
@@ -30,11 +38,17 @@ class Settings(BaseSettings):
     api_capability_token: SecretStr | None = None
     diarization_provider: Literal[
         "fake", "pyannote-community", "pyannoteai-precision", "nemotron-3-local"
-    ] = "fake"
-    # Opt-in local NVIDIA Nemotron 3 Diarization via an installed NeMo-Speech.cpp CLI.
-    # Both locations are explicit: the provider never downloads a runtime or a model.
-    nemotron_executable_path: Path | None = None
-    nemotron_model_path: Path | None = None
+    ] = "nemotron-3-local"
+    # PoC default: local NVIDIA Nemotron 3 Diarization via an installed NeMo-Speech.cpp CLI.
+    # The provider never downloads a runtime or a model; both default to the documented
+    # setup location and a missing file refuses startup rather than falling back.
+    # pyannoteai-precision stays available, but only when named explicitly.
+    nemotron_executable_path: Path | None = Field(
+        default_factory=lambda: Path.home() / NEMOTRON_DEFAULT_EXECUTABLE
+    )
+    nemotron_model_path: Path | None = Field(
+        default_factory=lambda: Path.home() / NEMOTRON_DEFAULT_MODEL
+    )
     nemotron_device: Literal["auto", "metal", "cpu"] = "auto"
     nemotron_timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
     # Canonical PoC recogniser. faster-whisper remains selectable, and remains the
@@ -136,4 +150,10 @@ def load_settings(env_file: Path | None = None) -> Settings:
     return Settings(_env_file=selected_env_file, _env_file_encoding="utf-8")
 
 
-__all__ = ["Settings", "UnsafeEnvFilePermissions", "load_settings"]
+__all__ = [
+    "NEMOTRON_DEFAULT_EXECUTABLE",
+    "NEMOTRON_DEFAULT_MODEL",
+    "Settings",
+    "UnsafeEnvFilePermissions",
+    "load_settings",
+]

@@ -182,6 +182,7 @@ def test_missing_local_provider_configuration_fails_with_fixed_safe_error(tmp_pa
     settings = Settings(
         data_root=tmp_path / "data",
         database_path=tmp_path / "data" / "db.sqlite3",
+        diarization_provider="fake",
         emotion_provider="wav2vec",
         emotion_checkpoint_path=private,
     )

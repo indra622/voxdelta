@@ -87,6 +87,8 @@ def _settings(tmp_path: Path, **updates: object) -> Settings:
     base: dict[str, object] = {
         "data_root": tmp_path / "data",
         "database_path": tmp_path / "data" / "db.sqlite3",
+        # These tests cover the emotion stage; keep diarization off the local runtime.
+        "diarization_provider": "fake",
     }
     base.update(updates)
     return Settings(**base)

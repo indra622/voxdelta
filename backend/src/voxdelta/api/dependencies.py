@@ -160,8 +160,8 @@ def build_dependencies(
                 client_factory=factories.pyannoteai_client,
             )
         elif selected.diarization_provider == "nemotron-3-local":
-            # Local-only and opt-in: built solely because it was named, never as a
-            # fallback, and a missing runtime or model is a startup error, not a switch.
+            # Local-only PoC default. It is never a fallback for another provider, and a
+            # missing runtime or model is a startup error, not a switch to another one.
             if selected.nemotron_executable_path is None or selected.nemotron_model_path is None:
                 raise ProviderConfigurationError()
             try:

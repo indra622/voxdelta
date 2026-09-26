@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -11,7 +12,12 @@ from voxdelta.api.dependencies import (
     ProviderFactories,
     build_dependencies,
 )
-from voxdelta.config import Settings, load_settings
+from voxdelta.config import (
+    NEMOTRON_DEFAULT_EXECUTABLE,
+    NEMOTRON_DEFAULT_MODEL,
+    Settings,
+    load_settings,
+)
 from voxdelta.credentials import Credentials
 from voxdelta.providers.fake import FakeDiarizationProvider
 from voxdelta.providers.nemotron_diarization import CommandResult, NemotronDiarizationProvider
@@ -43,6 +49,11 @@ def runtime(tmp_path: Path) -> tuple[Path, Path]:
     return executable, model
 
 
+def _diarization_disclosure(disclosures: list[dict[str, Any]]) -> dict[str, Any]:
+    (selected,) = [entry for entry in disclosures if entry["stage"] == "diarize"]
+    return selected
+
+
 def _settings(tmp_path: Path, **updates: object) -> Settings:
     base: dict[str, object] = {
         "data_root": tmp_path / "data",
@@ -52,12 +63,79 @@ def _settings(tmp_path: Path, **updates: object) -> Settings:
     return Settings(**base)
 
 
-def test_default_diarization_provider_is_unchanged(tmp_path: Path) -> None:
+@pytest.fixture()
+def default_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A synthetic home holding the runtime and model at the documented setup location."""
+
+    home = tmp_path / "home"
+    executable = home / NEMOTRON_DEFAULT_EXECUTABLE
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\nexit 1\n")
+    executable.chmod(0o755)
+    model = home / NEMOTRON_DEFAULT_MODEL
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"synthetic-gguf")
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+def test_default_diarization_provider_is_local_nemotron(tmp_path: Path, default_home: Path) -> None:
     settings = _settings(tmp_path)
-    assert settings.diarization_provider == "fake"
-    assert settings.nemotron_executable_path is None
-    assert settings.nemotron_model_path is None
-    dependencies = build_dependencies(settings, credentials=Credentials())
+    assert settings.diarization_provider == "nemotron-3-local"
+    assert settings.nemotron_executable_path == default_home / NEMOTRON_DEFAULT_EXECUTABLE
+    assert settings.nemotron_model_path == default_home / NEMOTRON_DEFAULT_MODEL
+
+    runner = _VersionOnlyRunner()
+    dependencies = build_dependencies(
+        settings,
+        credentials=Credentials(),
+        provider_factories=ProviderFactories(nemotron_runner=runner),
+    )
+
+    provider = dependencies.runner._diarization
+    assert isinstance(provider, NemotronDiarizationProvider)
+    assert provider.provenance.remote is False
+    diarization = _diarization_disclosure(dependencies.runner.provider_disclosures())
+    assert diarization["provenance"]["remote"] is False
+    assert not diarization["transmits"]
+    # The only subprocess started at build time is the local version probe.
+    assert runner.calls == [
+        [str((default_home / NEMOTRON_DEFAULT_EXECUTABLE).resolve()), "--version"]
+    ]
+
+
+def test_default_needs_no_remote_credentials(tmp_path: Path, default_home: Path) -> None:
+    del default_home
+    dependencies = build_dependencies(
+        _settings(tmp_path),
+        credentials=Credentials(),
+        provider_factories=ProviderFactories(nemotron_runner=_VersionOnlyRunner()),
+    )
+    assert isinstance(dependencies.runner._diarization, NemotronDiarizationProvider)
+
+
+def test_default_without_local_install_refuses_startup_instead_of_falling_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "empty-home"))
+
+    with pytest.raises(ProviderConfigurationError) as failure:
+        build_dependencies(
+            _settings(tmp_path),
+            # A Precision key is present, and must still not be used as a fallback.
+            credentials=Credentials(PYANNOTEAI_API_KEY="pa-test"),
+            provider_factories=ProviderFactories(nemotron_runner=_VersionOnlyRunner()),
+        )
+
+    assert failure.value.provider_code == "local_runtime_missing"
+    assert str(failure.value) == "provider_configuration_invalid"
+    assert str(tmp_path) not in str(failure.value)
+
+
+def test_fake_remains_selectable(tmp_path: Path) -> None:
+    dependencies = build_dependencies(
+        _settings(tmp_path, diarization_provider="fake"), credentials=Credentials()
+    )
     assert isinstance(dependencies.runner._diarization, FakeDiarizationProvider)
 
 
@@ -143,7 +221,7 @@ def test_selection_requires_both_locations(
         "nemotron_executable_path": runtime[0],
         "nemotron_model_path": runtime[1],
     }
-    values.pop(unset)
+    values[unset] = None
     with pytest.raises(ValidationError) as failure:
         _settings(tmp_path, **values)
     assert unset in str(failure.value)
@@ -217,3 +295,44 @@ def test_existing_pyannote_selections_are_unaffected(tmp_path: Path) -> None:
     )
     assert isinstance(remote.runner._diarization, PyannotePrecisionProvider)
     assert remote.runner._diarization.provenance.remote is True
+
+
+def test_precision_is_selected_explicitly_from_the_environment_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("VOXDELTA_DIARIZATION_PROVIDER", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("VOXDELTA_DIARIZATION_PROVIDER=pyannoteai-precision\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    settings = load_settings(env_file)
+    settings = settings.model_copy(
+        update={"data_root": tmp_path / "data", "database_path": tmp_path / "data" / "db.sqlite3"}
+    )
+    runner = _VersionOnlyRunner()
+
+    dependencies = build_dependencies(
+        settings,
+        credentials=Credentials(PYANNOTEAI_API_KEY="pa-test"),
+        provider_factories=ProviderFactories(nemotron_runner=runner),
+    )
+
+    provider = dependencies.runner._diarization
+    assert isinstance(provider, PyannotePrecisionProvider)
+    assert provider.provenance.remote is True
+    diarization = _diarization_disclosure(dependencies.runner.provider_disclosures())
+    assert diarization["provenance"]["remote"] is True
+    assert diarization["transmits"]
+    # Selecting Precision never touches the local runtime.
+    assert runner.calls == []
+
+
+def test_explicit_precision_without_its_key_still_fails_closed(tmp_path: Path) -> None:
+    runner = _VersionOnlyRunner()
+    with pytest.raises(ProviderConfigurationError) as failure:
+        build_dependencies(
+            _settings(tmp_path, diarization_provider="pyannoteai-precision"),
+            credentials=Credentials(),
+            provider_factories=ProviderFactories(nemotron_runner=runner),
+        )
+    assert str(failure.value) == "provider_configuration_invalid"
+    assert runner.calls == []
