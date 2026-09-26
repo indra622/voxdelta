@@ -240,7 +240,7 @@ def test_evaluate_scores_valid_inputs_and_records_exclusions(tmp_path: Path) -> 
 
     result = script.evaluate(
         data_root=tmp_path,
-        provider=provider,  # type: ignore[arg-type]
+        provider=provider,
         repeats=2,
         community_checkpoint=None,
         community_repeats=1,
